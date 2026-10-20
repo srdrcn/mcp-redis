@@ -181,7 +181,7 @@ clusters:
     # tls:                         # or `tls: true` for TLS with the system CAs
     #   caFile: /etc/redis-mcp/tls/ca.crt   # caPath is not supported with mode: cluster
     # options:                     # client tuning; keys and values depend on the mode (README, "Cluster options")
-    #   socket_timeout: 5          # seconds, a number > 0
+    #   socket_timeout: 5          # seconds, > 0 and <= 3600
   # A primary managed by Redis Sentinel. Each Sentinel gets at most 2 s to name the primary. The Sentinels' own
   # password is <name>_sentinel_pass, so no other cluster may be named cbuatrds_sentinel:
   # - name: cbuatrds
@@ -243,12 +243,12 @@ redis-mcp: Invalid config:
 
 The values are checked as well. A value outside the rule in the "Value" column, `null` included (a `null`
 timeout would remove the time bound), stops the server with `options.<key> must be <rule>`, for example
-`clusters[0]: options.socket_timeout must be a number of seconds > 0`.
+`clusters[0]: options.socket_timeout must be a number of seconds > 0 and <= 3600`.
 
 | Option | Modes | Default | Value | Meaning |
 |---|---|---|---|---|
-| `socket_timeout` | all | `10` | a number of seconds > 0 | Seconds to wait for a reply. With `mode: sentinel` the Sentinel connections use it too, but at most 2 s. |
-| `socket_connect_timeout` | all | `5` | a number of seconds > 0 | Seconds to wait for a connection. With `mode: sentinel` the Sentinel connections use it too, but at most 2 s. The host name lookup is not part of it (see [DNS lookups](#dns-lookups)). |
+| `socket_timeout` | all | `10` | a number of seconds > 0 and <= 3600 | Seconds to wait for a reply. With `mode: sentinel` the Sentinel connections use it too, but at most 2 s. |
+| `socket_connect_timeout` | all | `5` | a number of seconds > 0 and <= 3600 | Seconds to wait for a connection. With `mode: sentinel` the Sentinel connections use it too, but at most 2 s. The host name lookup is not part of it (see [DNS lookups](#dns-lookups)). |
 | `socket_keepalive` | all | off | `true` or `false` | TCP keepalive on the connections to Redis. |
 | `max_connections` | all | `16` | an integer >= 1 | Size of the connection pool of the tools' client (with `mode: cluster`, per node). Keep it above the 8 calls a cluster runs at a time, or calls fail with `Too many connections`. Pub/sub subscriptions have a client of their own with 50 connections, which this option does not change. |
 | `client_name` | all | not set | a name without spaces (not empty) | Connection name set with `CLIENT SETNAME`, shown by `CLIENT LIST`. Kept as text, also when it looks like a number. |
@@ -294,7 +294,7 @@ retry=Retry(NoBackoff(), 0)             # one attempt per command, in every mode
 
 - A cluster has up to three clients: one for the tools, one with `decode_responses=False` for
   `get_vector_from_hash` (which reads raw bytes), and one for pub/sub subscriptions. Each is created on first use
-  and then reused. Each cluster has its own lock, so a cluster that is slow to connect does not hold up calls for
+  and then reused. Each client has its own lock, so a cluster that is slow to connect does not hold up calls for
   the others.
 - A failed creation leaves no client behind, but its error is remembered for 5 s: calls in that time, including
   those that were waiting for the creation, get the same error at once, and the first call after it tries again.
@@ -818,14 +818,15 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey ...` | The key from `--api-key` or `REDIS_MCP_API_KEY` is a `<...>`/`${...}` placeholder, or starts or ends with whitespace, typically the line break of a Secret created with `--from-file`. Recreate the Secret with `--from-literal`. |
 | `redis-mcp: Invalid config: - clusters[0]...` | Fix the named key, for example `clusters[0]: a standalone cluster takes exactly one host:port in hosts`, `clusters[0]: masterName is required when mode is sentinel`, `clusters[0].hosts: hosts entry 1 is not host:port (or [IPv6 address]:port)` or `clusters[0].password: Extra inputs are not permitted` (passwords go into `<name>_pass`). |
 | `clusters[0]: options <keys> not supported in <mode> mode (supported: ...)` | `options` only takes the keys of [Cluster options](#cluster-options) for the cluster's mode. Addresses, `db`, `username` and `tls` have their own keys; passwords go into `<name>_pass`. |
-| `clusters[0]: options.<key> must be <rule>` | The option's value breaks the rule in the "Value" column of [Cluster options](#cluster-options), for example `options.socket_timeout must be a number of seconds > 0` for `0` or `null`, or `options.client_name must be a name without spaces`. |
+| `clusters[0]: options.<key> must be <rule>` | The option's value breaks the rule in the "Value" column of [Cluster options](#cluster-options), for example `options.socket_timeout must be a number of seconds > 0 and <= 3600` for `0`, `null` or `1e10`, or `options.client_name must be a name without spaces`. |
 | `clusters[0]: tls.caPath is not supported in cluster mode; use caFile` | Put the CA certificates into one PEM bundle and set `caFile`. |
 | `redis-mcp: --ssl-ca-path / REDIS_SSL_CA_PATH is not supported with --cluster-mode ...` | The legacy mode's equivalent of the row above: use `--ssl-ca-certs` / `REDIS_SSL_CA_CERTS` with a CA bundle file instead of the CA directory. |
 | `clusters[0].hosts: hosts takes host:port entries without a scheme or credentials ...` | `hosts` contains `://` or `@`, that is a URL or `user:password@`. Write plain `host:port` entries, put the user into `username` and the password into `<name>_pass`. |
-| `clusters[0].hosts: hosts entry <n> is not host:port (or [IPv6 address]:port)` or `hosts entry <n>: the port must be between 1 and 65535` | Entry `<n>` of `hosts` (1 for the first) is empty (for example after a trailing comma), has no port, has a space inside the host, or its port is outside 1–65535. Write IPv6 addresses in brackets and quote them in YAML (`"[2001:db8::1]:6379"`). |
+| `clusters[0].hosts: hosts entry <n> is not host:port (or [IPv6 address]:port)` or `hosts entry <n>: the port must be between 1 and 65535` | Entry `<n>` of `hosts` (1 for the first) is empty (for example after a trailing comma), has no port (or one not written with the digits 0-9), has a space inside the host, or its port is outside 1–65535. Write IPv6 addresses in brackets and quote them in YAML (`"[2001:db8::1]:6379"`). |
 | `clusters: cluster name <x>_sentinel clashes with the Sentinel password of cluster <x> ...` | Both clusters would read the password file `<x>_sentinel_pass`. Rename one of them. |
 | `redis-mcp: clusters <names> set entraid: true, but no Entra ID auth flow is configured ...` | Set `--entraid-auth-flow` / `REDIS_ENTRAID_AUTH_FLOW` and its settings (see [EntraID Authentication](#entraid-authentication-for-azure-managed-redis)), or remove `entraid: true`. |
 | `redis-mcp: Could not read config file: <path> (not UTF-8: invalid byte on line <n>)` or `Could not read password file <path> (not UTF-8)` | Save the file as UTF-8 (a byte order mark is accepted in config files). The config message names the line of the first byte that is not UTF-8. |
+| `redis-mcp: Could not parse config file: <path> (... line <l>, column <c> ...)` | The file is not valid YAML; fix it at the line and column named. The message does not quote the line. |
 | `redis-mcp: Unknown toolset: [...]` | Valid toolsets are `core`, `data`, `json`, `search`, `pubsub` and `docs`. |
 | `redis-mcp: --host cannot be combined with --config/--config-dir; ...` | The legacy connection flags do not apply to the multi-cluster mode; define the clusters in the config file. |
 | HTTP 401 `X-Authorization header is missing or the API key does not match` | The key does not match the server's key exactly. Check that `REDIS_MCP_KEY` is exported in the shell that starts Claude Code and that it equals the key in the Secret `redis-mcp-api-key` (or `apiKey` in the ConfigMap when there is no Secret): no extra whitespace, no `Bearer` prefix, header name `X-Authorization`. The server log shows `unauthorized request` with `headerPresent`. |

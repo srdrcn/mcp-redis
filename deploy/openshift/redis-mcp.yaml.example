@@ -32,7 +32,7 @@ clusters:
     # tls:                         # or `tls: true` for TLS with the system CAs
     #   caFile: /etc/redis-mcp/tls/ca.crt   # caPath is not supported with mode: cluster
     # options:                     # client tuning; keys and values depend on the mode (README, "Cluster options")
-    #   socket_timeout: 5          # seconds, a number > 0
+    #   socket_timeout: 5          # seconds, > 0 and <= 3600
   # A primary managed by Redis Sentinel. Each Sentinel gets at most 2 s to name the primary. The Sentinels' own
   # password is <name>_sentinel_pass, so no other cluster may be named cbuatrds_sentinel:
   # - name: cbuatrds
