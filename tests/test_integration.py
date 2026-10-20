@@ -229,6 +229,7 @@ class TestMCPServerIntegration:
         # Should have basic Redis operations
         expected_tools = [
             "clusters_list",
+            "cluster_nodes",
             "hset",
             "hget",
             "hdel",
@@ -385,7 +386,7 @@ class TestMCPServerIntegration:
 
         # Verify tool categories are represented
         tool_categories = {
-            "clusters": ["clusters_list"],
+            "clusters": ["clusters_list", "cluster_nodes"],
             "string": ["get", "set"],
             "hash": ["hget", "hset", "hgetall", "hdel", "hexists"],
             "list": ["lpush", "rpush", "lpop", "rpop", "lrange", "llen"],
