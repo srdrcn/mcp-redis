@@ -1,0 +1,48 @@
+# redis-mcp configuration: the clusters and the server settings. Edit the clusters for your environment, then
+# `oc apply -k deploy/openshift` (this file is part of the kustomization) and `oc rollout restart
+# deployment/redis-mcp` (the config is read at startup). Keys: README, "Configuration".
+#
+# No secrets here: the passwords and the API key come from the Secrets in secret.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-mcp-config
+data:
+  redis-mcp.yaml: |
+    port: 8080
+    readOnly: true                 # write tools only on clusters that set readOnly: false
+    disableDestructive: true       # no delete/pop/remove tools on any cluster
+    toolsets: [core, data]         # also: json, search, pubsub, docs
+    passwordsDir: /etc/redis-mcp/passwords   # <cluster>_pass files of the redis-mcp-passwords Secret
+    # The API key comes from the redis-mcp-api-key Secret (REDIS_MCP_API_KEY in deployment.yaml).
+
+    clusters:
+      - name: cbdevrds
+        mode: standalone
+        hosts: cbdevrds.example.com:6379   # host:port only: no redis:// scheme, no user:password@
+        db: 0
+        username: mcp-reader
+      - name: cbtstrds
+        mode: standalone
+        hosts: cbtstrds.example.com:6379
+        username: mcp-reader
+      - name: cbprdrds
+        mode: cluster                      # Redis Cluster: startup nodes, the client discovers the rest
+        hosts: [cbprdrds-1.example.com:6379, cbprdrds-2.example.com:6379, cbprdrds-3.example.com:6379]
+        username: mcp-reader
+      - name: cbsbxrds
+        mode: standalone
+        hosts: cbsbxrds.example.com:6379
+        username: mcp-writer               # an ACL user that may write; the sandbox is the only writable cluster
+        readOnly: false
+        # modules: [json, search]          # lists the json/search tools for this cluster (Redis 8, Redis Stack)
+        # tls:                             # or `tls: true` for TLS with the system CAs
+        #   caFile: /etc/redis-mcp/tls/ca.crt   # the redis-mcp-tls Secret (see deployment.yaml)
+        # options:                         # client tuning (README, "Cluster options")
+        #   socket_timeout: 5
+      # A primary managed by Redis Sentinel; the Sentinels' own password is cbuatrds_sentinel_pass in secret.yaml:
+      # - name: cbuatrds
+      #   mode: sentinel
+      #   hosts: [cbuatrds-s1.example.com:26379, cbuatrds-s2.example.com:26379, cbuatrds-s3.example.com:26379]
+      #   masterName: mymaster
+      #   username: mcp-reader

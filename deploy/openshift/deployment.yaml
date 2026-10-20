@@ -36,17 +36,14 @@ spec:
           imagePullPolicy: Always
           command: ["/app/.venv/bin/redis-mcp"]
           args: ["--config", "/etc/redis-mcp/config/redis-mcp.yaml"]
-          # Recommended: the API key from a Secret instead of apiKey in the ConfigMap. Delete the apiKey line from
-          # redis-mcp.yaml (REDIS_MCP_API_KEY overrides it, but an <api-key> placeholder there still stops the pod),
-          # create the Secret and uncomment env:
-          #   REDIS_MCP_KEY=$(openssl rand -hex 32)
-          #   oc create secret generic redis-mcp-api-key --from-literal=api-key="$REDIS_MCP_KEY"
-          # env:
-          #   - name: REDIS_MCP_API_KEY
-          #     valueFrom:
-          #       secretKeyRef:
-          #         name: redis-mcp-api-key
-          #         key: api-key
+          env:
+            # The X-Authorization key, from the redis-mcp-api-key Secret (secret.yaml). The pod does not start
+            # until that Secret exists (CreateContainerConfigError).
+            - name: REDIS_MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: redis-mcp-api-key
+                  key: api-key
           ports:
             - name: http
               containerPort: 8080
@@ -104,7 +101,7 @@ spec:
               - key: redis-mcp.yaml
                 path: redis-mcp.yaml
         - name: passwords
-          # one file per key of passwords.env: /etc/redis-mcp/passwords/<cluster>_pass
+          # one file per key of the redis-mcp-passwords Secret (secret.yaml): /etc/redis-mcp/passwords/<cluster>_pass
           secret:
             secretName: redis-mcp-passwords
             defaultMode: 0440

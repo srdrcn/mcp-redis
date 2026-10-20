@@ -1,5 +1,6 @@
-# Template for redis-mcp.yaml (the redis-mcp-config ConfigMap on OpenShift). Fill in the <...> fields; never commit
-# real values. Passwords are not part of this file: see deploy/openshift/passwords.env.example.
+# Example redis-mcp.yaml for a local or Docker run (on OpenShift use deploy/openshift/configmap.yaml). Fill in the
+# <...> fields in a copy (redis-mcp.yaml and *.local.yaml are git-ignored). Passwords are not part of this file:
+# one <cluster>_pass file per cluster in passwordsDir, or an environment variable of that name.
 port: 8080
 # X-Authorization value: a long random key (openssl rand -hex 32), or "" for no auth. Better, keep the key out of
 # this file: delete the line and set REDIS_MCP_API_KEY (on OpenShift from a Secret, see deployment.yaml).

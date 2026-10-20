@@ -142,20 +142,19 @@ Notes:
 The short version (each step is explained in [OpenShift deployment](#openshift-deployment)):
 
 ```bash
-oc new-project redis-mcp                                      # or: oc project <namespace>
-cp deploy/openshift/redis-mcp.yaml.example redis-mcp.yaml     # set the clusters, delete the apiKey line (git-ignored)
-cp deploy/openshift/passwords.env.example passwords.env       # one <cluster>_pass=<password> line per cluster (git-ignored)
-oc create configmap redis-mcp-config --from-file=redis-mcp.yaml
-oc create secret generic redis-mcp-passwords --from-env-file=passwords.env
-REDIS_MCP_KEY=$(openssl rand -hex 32)
-oc create secret generic redis-mcp-api-key --from-literal=api-key="$REDIS_MCP_KEY"
-# uncomment the REDIS_MCP_API_KEY env entry in deploy/openshift/deployment.yaml
-oc apply -k deploy/openshift                                  # image: docker.io/chosenwar/redis-mcp:latest
+oc new-project redis-mcp                                             # or: oc project <namespace>
+# set the clusters in deploy/openshift/configmap.yaml (oc apply -k below creates the ConfigMap from it)
+cp deploy/openshift/secret.yaml deploy/openshift/secret.local.yaml   # git-ignored (*.local.yaml)
+openssl rand -hex 32                                                 # a value for api-key
+# in secret.local.yaml: one <cluster>_pass per cluster and api-key, in place of the <...> placeholders
+oc apply -f deploy/openshift/secret.local.yaml                       # Secrets redis-mcp-passwords, redis-mcp-api-key
+oc apply -k deploy/openshift                                         # image: docker.io/chosenwar/redis-mcp:latest
 oc rollout status deployment/redis-mcp
-oc get route redis-mcp                                        # MCP endpoint: https://<route-host>/mcp
+oc get route redis-mcp                                               # MCP endpoint: https://<route-host>/mcp
 ```
 
-Clients send the key in the `X-Authorization` header; see [Claude Code](#claude-code) for the `.mcp.json` entry.
+Clients send the `api-key` value in the `X-Authorization` header; see [Claude Code](#claude-code) for the
+`.mcp.json` entry. After a change to either file, apply it again and run `oc rollout restart deployment/redis-mcp`.
 
 ### Command line
 
@@ -199,9 +198,10 @@ A `.env` file in the repository root is loaded too (python-dotenv); variables th
 
 ## Configuration
 
-This is the content of `redis-mcp.example.yaml` without its header comment
-(`deploy/openshift/redis-mcp.yaml.example` is identical). Never commit real values: keep them in
-`redis-mcp.local.yaml` or `redis-mcp.yaml` (both git-ignored) or in the OpenShift ConfigMap.
+This is the content of `redis-mcp.example.yaml` without its header comment, the example for a local or Docker
+run. On OpenShift, `deploy/openshift/configmap.yaml` holds the same settings and clusters without the `apiKey`
+line: the key comes from the Secret `redis-mcp-api-key` there (see [OpenShift deployment](#openshift-deployment)).
+Never commit real keys: keep a filled-in copy in `redis-mcp.local.yaml` or `redis-mcp.yaml` (both git-ignored).
 
 ```yaml
 port: 8080
@@ -415,17 +415,21 @@ cluster cbdevrds: no password (/etc/redis-mcp/passwords/cbdevrds_pass or env cbd
 The passwords are read only at startup. The `auth` field of `clusters_list` shows `password`, `none` or `entraid`
 instead of the password.
 
-On OpenShift, the Secret `redis-mcp-passwords` is created from a `passwords.env` file
-(template: `deploy/openshift/passwords.env.example`) and mounted at `/etc/redis-mcp/passwords`, one file per key:
+On OpenShift, the passwords are the keys of the Secret `redis-mcp-passwords` in `deploy/openshift/secret.yaml`
+(one `<cluster>_pass` key per cluster, plus `<cluster>_sentinel_pass` for Sentinels that require a password),
+mounted at `/etc/redis-mcp/passwords`, one file per key. `secret.yaml` holds only `<password>` placeholders and is
+not part of the kustomization; fill in a git-ignored copy and apply it:
 
 ```bash
-cp deploy/openshift/passwords.env.example passwords.env    # git-ignored; one <cluster>_pass=<password> line per cluster
-oc create secret generic redis-mcp-passwords --from-env-file=passwords.env
+cp deploy/openshift/secret.yaml deploy/openshift/secret.local.yaml   # git-ignored (*.local.yaml)
+# replace each "<password>" in secret.local.yaml (and the api-key, see OpenShift deployment)
+oc apply -f deploy/openshift/secret.local.yaml
+oc rollout restart deployment/redis-mcp                              # when the pod already runs
 ```
 
-In an env file the value is everything after the first `=`: quotes are kept as part of the value, and so is a
-`# comment` at the end of a line. Lines that start with `#` are ignored. A key must not start with a digit; for
-such a cluster name use `--from-literal=<name>_pass=<password>` instead. For a local run, `export
+The values are YAML strings under `stringData`: keep the quotes, so that a password such as `0123`, `yes` or one
+with ` #` stays text as written. Inside double quotes, write `\\` for a backslash and `\"` for a double quote; inside
+single quotes, only `'` changes (written `''`). The value gets no trailing line break. For a local run, `export
 cbdevrds_pass=...` works in bash (names with `-` or `.` cannot be exported from a shell; use files then).
 
 ## Redis ACL user per cluster
@@ -727,7 +731,7 @@ Security:
   The header is `X-Authorization`, not `Authorization`, and takes the raw key (no `Bearer` prefix). An empty or
   missing `apiKey` without a `REDIS_MCP_API_KEY` turns the check off. The startup log says `API key authentication
   enabled for /mcp (header X-Authorization)`, or warns `API key authentication DISABLED (apiKey is empty): anyone
-  who can reach /mcp can call the tools`. On OpenShift, keep the key in a Secret (see
+  who can reach /mcp can call the tools`. On OpenShift, the key comes from the Secret `redis-mcp-api-key` (see
   [OpenShift deployment](#openshift-deployment)).
 - **Browser requests are refused**: a request to `/mcp` with an `Origin` header (that is, one sent by a web page)
   gets **HTTP 403**
@@ -739,9 +743,10 @@ Security:
 - On the Redis side, the server can do what its ACL user can do (see
   [Redis ACL user per cluster](#redis-acl-user-per-cluster)). `readOnly` controls which tools are listed; it does
   not replace ACLs.
-- Keep secrets out of the repository. `redis-mcp.yaml` in the repository root, `*.local.yaml`, `passwords.env`,
-  `conf.d/`, and `deploy/openshift/redis-mcp.yaml`/`passwords.env` are git-ignored, and the image build context
-  contains only `src/`, `pyproject.toml`, `uv.lock`, `README.md` and `LICENSE`. Examples use `<...>` placeholders.
+- Keep secrets out of the repository. `redis-mcp.yaml` in the repository root, `*.local.yaml` (such as
+  `deploy/openshift/secret.local.yaml`) and `conf.d/` are git-ignored, and the image build context contains only
+  `src/`, `pyproject.toml`, `uv.lock`, `README.md` and `LICENSE`. Examples use `<...>` placeholders;
+  `deploy/openshift/configmap.yaml` holds no secrets, and `deploy/openshift/secret.yaml` only placeholders.
 - The pod does not mount a service account token (`automountServiceAccountToken: false`), because the server never
   calls the Kubernetes API.
 
@@ -817,15 +822,16 @@ To release a version, set it in `pyproject.toml` and `src/version.py`, then tag 
 
 | File | Content |
 |---|---|
-| `deployment.yaml` | 1 replica (`Recreate`: pub/sub subscriptions and the client caches live in the process). Startup, liveness and readiness probes on `/healthz`. A restricted-v2 security context (non-root, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, read-only root filesystem). No service account token is mounted. A `/tmp` `emptyDir` (64Mi). Requests of 50m CPU and 128Mi memory, with a 256Mi memory limit (the server uses under 100 MB at idle). The command is `/app/.venv/bin/redis-mcp --config /etc/redis-mcp/config/redis-mcp.yaml`. The config is mounted at `/etc/redis-mcp/config`, the passwords at `/etc/redis-mcp/passwords` (mode `0440`); an optional CA Secret mount at `/etc/redis-mcp/tls`, the `REDIS_MCP_API_KEY` variable from the Secret `redis-mcp-api-key` and a `dnsConfig` with `ndots: "2"` (see [DNS lookups](#dns-lookups)) are commented out. |
+| `configmap.yaml` | The ConfigMap `redis-mcp-config`: the config under the key `redis-mcp.yaml`, with the settings and the example clusters of [Configuration](#configuration) (`cbdevrds`, `cbtstrds`, the Redis Cluster `cbprdrds`, and `cbsbxrds` with `readOnly: false`) but no `apiKey` line. Set the clusters for your environment; it holds no secrets. |
+| `deployment.yaml` | 1 replica (`Recreate`: pub/sub subscriptions and the client caches live in the process). Startup, liveness and readiness probes on `/healthz`. A restricted-v2 security context (non-root, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, read-only root filesystem). No service account token is mounted. A `/tmp` `emptyDir` (64Mi). Requests of 50m CPU and 128Mi memory, with a 256Mi memory limit (the server uses under 100 MB at idle). The command is `/app/.venv/bin/redis-mcp --config /etc/redis-mcp/config/redis-mcp.yaml`. The config is mounted at `/etc/redis-mcp/config`, the passwords (Secret `redis-mcp-passwords`) at `/etc/redis-mcp/passwords` (mode `0440`). `REDIS_MCP_API_KEY` comes from the key `api-key` of the Secret `redis-mcp-api-key`; the entry is active and required, so the pod does not start until that Secret exists (`CreateContainerConfigError`). An optional CA Secret mount at `/etc/redis-mcp/tls` and a `dnsConfig` with `ndots: "2"` (see [DNS lookups](#dns-lookups)) are commented out. |
 | `service.yaml` | `redis-mcp` Service on port 8080 (`http`). |
 | `route.yaml` | Edge TLS (HTTP redirects to HTTPS), `haproxy.router.openshift.io/timeout: 60s`. |
-| `kustomization.yaml` | The resources above, labels, and the `images:` entry that sets the image. |
-| `redis-mcp.yaml.example`, `passwords.env.example` | Templates for the ConfigMap and the Secret. |
+| `secret.yaml` | The Secrets `redis-mcp-passwords` (one `<cluster>_pass` key per cluster of `configmap.yaml`, plus commented keys for a Sentinel cluster) and `redis-mcp-api-key` (key `api-key`), with `"<password>"`/`"<api-key>"` placeholders. Not part of the kustomization: copy it to `secret.local.yaml` (git-ignored), fill it in and `oc apply -f` it. |
+| `kustomization.yaml` | `configmap.yaml`, `deployment.yaml`, `service.yaml` and `route.yaml` (not `secret.yaml`), labels, and the `images:` entry that sets the image. |
 
-The ConfigMap `redis-mcp-config` (key `redis-mcp.yaml`), the Secret `redis-mcp-passwords` (one `<cluster>_pass`
-key per cluster) and the recommended Secret `redis-mcp-api-key` (key `api-key`) hold environment-specific data, so
-`oc apply -k` does not create them. You create them with `oc create`.
+`oc apply -k deploy/openshift` creates the ConfigMap `redis-mcp-config` with the Deployment, the Service and the
+Route. The two Secrets hold the passwords and the API key, so the repository has only the template `secret.yaml`:
+you apply a filled-in copy with `oc apply -f`.
 
 **0. Select the project** the server runs in. The commands below use the current project:
 
@@ -861,43 +867,40 @@ images:
     newTag: latest                           # or a release, e.g. 0.1.0
 ```
 
-**3. Prepare the config and the passwords** from the templates. Keep `port: 8080` and
-`passwordsDir: /etc/redis-mcp/passwords`, which match the Deployment. Add one `<cluster>_pass` line per cluster to
-`passwords.env`.
+**3. Set the clusters** in `deploy/openshift/configmap.yaml` (keys: [Configuration](#configuration)). Keep
+`port: 8080` and `passwordsDir: /etc/redis-mcp/passwords`, which match the Deployment, and leave `apiKey` out: the
+key comes from the Secret (`REDIS_MCP_API_KEY` overrides `apiKey`, but the config is checked first, so an
+`apiKey: <api-key>` placeholder would still stop the pod). `oc apply -k` writes this file over an existing
+`redis-mcp-config` ConfigMap, also one made earlier with `oc create configmap`.
+
+**4. Fill in the Secrets.** Copy the template to a git-ignored file, replace every `<...>` and apply it:
 
 ```bash
-cp deploy/openshift/redis-mcp.yaml.example redis-mcp.yaml   # set the clusters (git-ignored)
-cp deploy/openshift/passwords.env.example passwords.env     # set the passwords (git-ignored)
+cp deploy/openshift/secret.yaml deploy/openshift/secret.local.yaml   # git-ignored (*.local.yaml)
+openssl rand -hex 32                                                 # a value for api-key
+# in secret.local.yaml: one <cluster>_pass per cluster of configmap.yaml, and api-key
+oc apply -f deploy/openshift/secret.local.yaml
+oc extract secret/redis-mcp-api-key --keys=api-key --to=-            # shows the key again later
 ```
 
-**The API key** belongs in a Secret of its own (recommended): delete the `apiKey` line from `redis-mcp.yaml`,
-uncomment the `env` entry `REDIS_MCP_API_KEY` in `deployment.yaml`, and create the Secret:
-
-```bash
-REDIS_MCP_KEY=$(openssl rand -hex 32)
-oc create secret generic redis-mcp-api-key --from-literal=api-key="$REDIS_MCP_KEY"
-oc extract secret/redis-mcp-api-key --keys=api-key --to=-   # shows the key again later
-```
-
-- `REDIS_MCP_API_KEY` overrides `apiKey`, but the config is checked first: a leftover `apiKey: <api-key>`
-  placeholder still stops the pod.
-- Use `--from-literal` (or a file without a final line break): a key with a trailing line break stops the pod with
-  `redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey has leading or trailing whitespace ...`.
-- While the `env` entry is uncommented and the Secret does not exist, the pod does not start
-  (`CreateContainerConfigError`).
-- Without the Secret, set `apiKey` in `redis-mcp.yaml` to the generated key instead. It then sits in the
-  ConfigMap, which anyone who can read ConfigMaps in the namespace can read. With neither, authentication is off
+- `redis-mcp-passwords` needs one `<cluster>_pass` key per cluster (see [Passwords](#passwords), also for quoting
+  the values). A cluster without a key connects without AUTH, with a warning in the log.
+- `api-key` is required: while the Secret `redis-mcp-api-key` does not exist, the pod does not start
+  (`CreateContainerConfigError`), and while `api-key` is still the `<api-key>` placeholder or starts or ends with
+  whitespace, the server stops (`redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey ...`).
+- An empty `api-key: ""` is ignored, and with no `apiKey` in the ConfigMap authentication is then off
   (`API key authentication DISABLED` in the log).
 
-**4. Create the ConfigMap and the Secret, then apply the manifests:**
+**5. Apply the manifests** (the ConfigMap, the Deployment, the Service and the Route):
 
 ```bash
-oc create configmap redis-mcp-config --from-file=redis-mcp.yaml
-oc create secret generic redis-mcp-passwords --from-env-file=passwords.env
 oc apply -k deploy/openshift
 oc rollout status deployment/redis-mcp
 oc get route redis-mcp
 ```
+
+Applied before the Secrets, the pod waits (`CreateContainerConfigError`, or `ContainerCreating` with a failed mount
+of `redis-mcp-passwords`) and starts once they exist.
 
 For clusters with TLS and a private CA, create a Secret with the CA, uncomment the `tls-ca` volume and its mount in
 `deployment.yaml`, and set `tls: {caFile: /etc/redis-mcp/tls/ca.crt}` on those clusters:
@@ -919,17 +922,17 @@ curl -s https://redis-mcp.<apps-domain>/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"clusters_list","arguments":{}}}'
 ```
 
-**Updating the config, the passwords or the API key.** They are read only at startup, so replace the object and
-restart the pod:
+**Updating the config, the passwords or the API key.** They are read only at startup, so edit
+`deploy/openshift/configmap.yaml` or `deploy/openshift/secret.local.yaml`, apply it again and restart the pod:
 
 ```bash
-oc create configmap redis-mcp-config --from-file=redis-mcp.yaml --dry-run=client -o yaml | oc replace -f -
-oc create secret generic redis-mcp-passwords --from-env-file=passwords.env --dry-run=client -o yaml | oc replace -f -
-REDIS_MCP_KEY=$(openssl rand -hex 32)   # only to change the API key; clients then need the new key
-oc create secret generic redis-mcp-api-key --from-literal=api-key="$REDIS_MCP_KEY" \
-  --dry-run=client -o yaml | oc replace -f -
+oc apply -k deploy/openshift                         # after a change to configmap.yaml
+oc apply -f deploy/openshift/secret.local.yaml       # after a change to the passwords or api-key
 oc rollout restart deployment/redis-mcp
 ```
+
+A new `api-key` (`openssl rand -hex 32`) means the clients need the new key too. A key deleted from `stringData`
+stays in the Secret after `oc apply`; `oc replace -f deploy/openshift/secret.local.yaml` removes it.
 
 With `Recreate`, the old pod stops before the new one starts, so there is a short gap, and open pub/sub
 subscriptions are lost.
@@ -1075,8 +1078,9 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | Symptom | Cause and fix |
 |---|---|
 | `redis-mcp: Invalid config:` then `- apiKey: apiKey still holds a placeholder ...` | `apiKey` was not filled in. Set a real key (`openssl rand -hex 32`), `""` to turn authentication off, or delete the line when the key comes from `REDIS_MCP_API_KEY` (the config is checked even then). |
-| `redis-mcp: --api-key / REDIS_MCP_API_KEY is blank; ...` | The key from `--api-key` or `REDIS_MCP_API_KEY` (on OpenShift: the Secret `redis-mcp-api-key`) holds only whitespace. Set a key, or leave the value empty or unset to keep `apiKey` from the config. |
-| `redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey ...` | The key from `--api-key` or `REDIS_MCP_API_KEY` is a `<...>`/`${...}` placeholder, or starts or ends with whitespace, typically the line break of a Secret created with `--from-file`. Recreate the Secret with `--from-literal`. |
+| `redis-mcp: --api-key / REDIS_MCP_API_KEY is blank; ...` | The key from `--api-key` or `REDIS_MCP_API_KEY` (on OpenShift: `api-key` of the Secret `redis-mcp-api-key`) holds only whitespace. Set a key, or leave the value empty or unset to keep `apiKey` from the config. On OpenShift, fix `api-key` in `secret.local.yaml`, `oc apply -f` it and run `oc rollout restart deployment/redis-mcp`. |
+| `redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey ...` | The key from `--api-key` or `REDIS_MCP_API_KEY` is a `<...>`/`${...}` placeholder (on OpenShift: `api-key` in `secret.local.yaml` was not filled in), or starts or ends with whitespace, such as a `\n` or a space inside the quotes of the `stringData` value, or the final line break of a file given to `oc create secret --from-file`. Set the key (`openssl rand -hex 32`), apply the Secret again and restart the deployment. |
+| Pod in `CreateContainerConfigError` (`secret "redis-mcp-api-key" not found`), or in `ContainerCreating` with `MountVolume.SetUp failed for volume "passwords" : secret "redis-mcp-passwords" not found` | The Secrets do not exist in the pod's namespace: `oc apply -f deploy/openshift/secret.local.yaml` in that project (see [OpenShift deployment](#openshift-deployment)). The pod starts once they exist. |
 | `redis-mcp: Invalid config:` then `- clusters[0]...` | Fix the named key, for example `clusters[0]: a standalone cluster takes exactly one host:port in hosts`, `clusters[0]: masterName is required when mode is sentinel`, `clusters[0].hosts: hosts entry 1 is not host:port (or [IPv6 address]:port)` or `clusters[0].password: Extra inputs are not permitted` (passwords go into `<name>_pass`). |
 | `clusters[0]: options <keys> not supported in <mode> mode (supported: ...)` | `options` only takes the keys of [Cluster options](#cluster-options) for the cluster's mode. Addresses, `db`, `username` and `tls` have their own keys; passwords go into `<name>_pass`. |
 | `clusters[0]: options.<key> must be <rule>` | The option's value breaks the rule in the "Value" column of [Cluster options](#cluster-options), for example `options.socket_timeout must be a number of seconds > 0 and <= 3600` for `0`, `null` or `1e10`, or `options.client_name must be a name without spaces`. |
@@ -1090,10 +1094,10 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `redis-mcp: Could not parse config file: <path> (... line <l>, column <c> ...)` | The file is not valid YAML; fix it at the line and column named. The message does not quote the line. |
 | `redis-mcp: Unknown toolset: [...]` | Valid toolsets are `core`, `data`, `json`, `search`, `pubsub` and `docs`. |
 | `redis-mcp: --host cannot be combined with --config/--config-dir; ...` | The connection flags belong to the single-cluster mode; define the clusters in the config file. |
-| HTTP 401 `X-Authorization header is missing or the API key does not match` | The key does not match the server's key exactly. Check that `REDIS_MCP_KEY` is exported in the shell that starts Claude Code and that it equals the key in the Secret `redis-mcp-api-key` (or `apiKey` in the ConfigMap when there is no Secret): no extra whitespace, no `Bearer` prefix, header name `X-Authorization`. The server log shows `unauthorized request` with `headerPresent`. |
+| HTTP 401 `X-Authorization header is missing or the API key does not match` | The key does not match the server's key exactly. Check that `REDIS_MCP_KEY` is exported in the shell that starts Claude Code and that it equals `api-key` in the Secret `redis-mcp-api-key` (`oc extract secret/redis-mcp-api-key --keys=api-key --to=-`; after a change to the Secret, the pod needs `oc rollout restart deployment/redis-mcp`): no extra whitespace, no `Bearer` prefix, header name `X-Authorization`. The server log shows `unauthorized request` with `headerPresent`. |
 | HTTP 403 `Requests with an Origin header (from a web page) are not accepted` | The request came from a web page or a browser-based client. Use a non-browser MCP client such as Claude Code. |
-| Startup warning `cluster <name>: no password (...); connecting without AUTH`, then `Authentication required.` | The Secret has no `<name>_pass` key for this cluster (the name is case-sensitive and must match `name` exactly), or the Secret is not mounted at `passwordsDir`. |
-| `invalid username-password pair or user is disabled.` | Wrong password or `username`, or the ACL user is `off`. Check for quotes or a trailing comment that `--from-env-file` kept in the value. |
+| Startup warning `cluster <name>: no password (...); connecting without AUTH`, then `Authentication required.` | The Secret has no `<name>_pass` key for this cluster (the name is case-sensitive and must match `name` exactly), or the Secret is not mounted at `passwordsDir`. On OpenShift, add the key to `redis-mcp-passwords` in `secret.local.yaml`, `oc apply -f` it and restart the deployment. |
+| `invalid username-password pair or user is disabled.` | Wrong password or `username`, or the ACL user is `off`. On OpenShift, check the value with `oc extract secret/redis-mcp-passwords --keys=<name>_pass --to=-`: inside double quotes YAML reads `\` as an escape, so a backslash is written `\\` (see [Passwords](#passwords)). |
 | `this user has no permissions to run the '<command>' command` | The cluster's ACL user lacks the command. Expected for writes with `mcp-reader`; otherwise add the rule (see [Redis ACL user per cluster](#redis-acl-user-per-cluster)). |
 | `Redis Cluster cannot be connected. Please provide at least one reachable node: Cluster mode is not enabled on this node` | Either the cluster is not a Redis Cluster (use `mode: standalone` or `sentinel`), or its ACL user lacks `+cluster\|slots`. |
 | Results like `Error retrieving key a: 15495 127.0.0.1:17002` (a slot and an address: a `MOVED` redirect) | The cluster is a Redis Cluster but configured with `mode: standalone`. Set `mode: cluster`. |
