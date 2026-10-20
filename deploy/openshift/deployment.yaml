@@ -18,6 +18,14 @@ spec:
     spec:
       # the server never talks to the Kubernetes API
       automountServiceAccountToken: false
+      # Redis host names are resolved outside socket_connect_timeout, on every new connection. With the default
+      # ndots:5, a name such as redis-1.example.com is first tried with each search domain of the pod. For Redis
+      # hosts given by fully qualified names, uncomment to look up names with two or more dots as written first
+      # (short names such as a Service name still use the search domains):
+      # dnsConfig:
+      #   options:
+      #     - name: ndots
+      #       value: "2"
       securityContext:
         runAsNonRoot: true
         seccompProfile:
