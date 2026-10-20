@@ -17,6 +17,7 @@ from src.common.config import (
 from src.common.config_loader import (
     ConfigError,
     ServerConfig,
+    api_key_error,
     from_legacy,
     get_config,
     load_config,
@@ -86,6 +87,22 @@ def _fail(message: str):
     sys.exit(2)
 
 
+def _url_given(url: Optional[str]) -> bool:
+    # gemini-cli passes the raw "${REDIS_URL}" string when the env var is not set
+    return bool(url and url.strip() and url.strip() != "${REDIS_URL}")
+
+
+def apply_api_key(config: ServerConfig, api_key: Optional[str]) -> None:
+    """Sets the HTTP API key from --api-key / REDIS_MCP_API_KEY (e.g. from a Secret), over the config's apiKey.
+    An empty value changes nothing, so an empty variable cannot switch authentication off."""
+    if not api_key:
+        return
+    error = api_key_error(api_key)
+    if error:
+        raise ConfigError(f"--api-key / REDIS_MCP_API_KEY: {error}")
+    config.api_key = api_key
+
+
 @click.command()
 @click.option(
     "--config",
@@ -104,6 +121,11 @@ def _fail(message: str):
     "--transport",
     type=click.Choice(["stdio", "http"]),
     help="Transport (default: http if an HTTP port is set, otherwise stdio)",
+)
+@click.option(
+    "--api-key",
+    envvar="REDIS_MCP_API_KEY",
+    help="API key HTTP clients must send in X-Authorization (overrides apiKey in the config). Env: REDIS_MCP_API_KEY",
 )
 @click.option(
     "--http-port",
@@ -180,6 +202,7 @@ def cli(
     config_file,
     config_dir,
     transport,
+    api_key,
     http_port,
     url,
     host,
@@ -213,6 +236,7 @@ def cli(
             "--" + name.replace("_", "-")
             for name in LEGACY_CONNECTION_OPTIONS
             if ctx.get_parameter_source(name) is ParameterSource.COMMANDLINE
+            and (name != "url" or _url_given(url))
         ]
         if given:
             _fail(
@@ -221,11 +245,10 @@ def cli(
             )
 
     # Handle Redis URI if provided (and not empty)
-    # Note: gemini-cli passes the raw "${REDIS_URL}" string when the env var is not set
 
     if multi_cluster:
         pass
-    elif url and url.strip() and url.strip() != "${REDIS_URL}":
+    elif _url_given(url):
         try:
             uri_config = parse_redis_uri(url)
             set_redis_config_from_cli(uri_config)
@@ -298,6 +321,7 @@ def cli(
             config = load_config(config_file, config_dir)
         else:
             config = from_legacy(REDIS_CFG, entraid=is_entraid_auth_enabled())
+        apply_api_key(config, api_key)
         if http_port is not None:
             config.port = http_port
         if transport == "http" and not config.port:
@@ -310,7 +334,8 @@ def cli(
 
 def main():
     """Entry point without CLI parsing: REDIS_MCP_CONFIG / REDIS_MCP_CONFIG_DIR select the multi-cluster
-    config, otherwise the REDIS_* environment variables describe a single cluster."""
+    config, otherwise the REDIS_* environment variables describe a single cluster. REDIS_MCP_API_KEY sets the
+    HTTP API key."""
     config_file = os.getenv("REDIS_MCP_CONFIG")
     config_dir = os.getenv("REDIS_MCP_CONFIG_DIR")
     try:
@@ -320,6 +345,9 @@ def main():
                 Path(config_file) if config_file else None,
                 Path(config_dir) if config_dir else None,
             )
+        else:
+            config = get_config()
+        apply_api_key(config, os.getenv("REDIS_MCP_API_KEY"))
         server = RedisMCPServer(config=config)
     except ConfigError as e:
         _fail(str(e))

@@ -4,7 +4,10 @@ from contextvars import ContextVar
 from typing import Any, Dict, Optional, Tuple, Union
 
 from redis import Redis
+from redis.backoff import NoBackoff
 from redis.cluster import ClusterNode, RedisCluster
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.retry import Retry
 from redis.sentinel import Sentinel
 
 from src.common.config_loader import ClusterConfig, get_config
@@ -17,11 +20,14 @@ current_cluster: ContextVar[Optional[str]] = ContextVar(
     "redis_mcp_cluster", default=None
 )
 
-# A tool call has 15 s (see src.common.registry); client timeouts stay below that, so a slow or unreachable
-# cluster produces its own error instead of the generic tool timeout. `options` can override them per cluster.
+# A tool call has 15 s (see src.common.registry). With these timeouts and the retry policy below, a slow or
+# unreachable standalone/sentinel cluster produces its own error within that time instead of the generic tool
+# timeout. `options` can override the timeouts per cluster.
 SOCKET_CONNECT_TIMEOUT_SECONDS = 5
 SOCKET_TIMEOUT_SECONDS = 10
-MAX_CONNECTIONS = 10
+# Per cluster (per node for Redis Cluster): room for the concurrent tool calls the registry allows per cluster
+# plus open pub/sub subscriptions.
+MAX_CONNECTIONS = 16
 
 
 class ClusterSelectionError(ValueError):
@@ -94,7 +100,8 @@ class RedisConnectionManager:
         for client in clients:
             try:
                 client.close()
-            except Exception:  # nosec B110 - best effort while discarding clients
+            # best effort while discarding clients
+            except Exception:  # nosec B110
                 pass
 
 
@@ -107,9 +114,18 @@ def client_kwargs(config: ClusterConfig, decode_responses: bool) -> Dict[str, An
         "socket_timeout": SOCKET_TIMEOUT_SECONDS,
     }
     if config.entraid:
-        from src.common.entraid_auth import create_credential_provider
+        from src.common.entraid_auth import (
+            EntraIDAuthenticationError,
+            create_credential_provider,
+        )
 
-        kwargs["credential_provider"] = create_credential_provider()
+        provider = create_credential_provider()
+        if provider is None:
+            # never fall back to an unauthenticated connection
+            raise EntraIDAuthenticationError(
+                f"cluster {config.name} sets entraid: true, but no Entra ID auth flow is configured"
+            )
+        kwargs["credential_provider"] = provider
     else:
         if config.username:
             kwargs["username"] = config.username
@@ -121,29 +137,40 @@ def client_kwargs(config: ClusterConfig, decode_responses: bool) -> Dict[str, An
     return kwargs
 
 
+def _retry() -> Retry:
+    """One immediate retry when a connection drops (e.g. after a Redis restart), none on timeouts: a command
+    that timed out may have run, and sending a write again would apply it twice. redis-py's default (3 retries
+    with backoff, timeouts included) could also outlast the tool's time limit."""
+    return Retry(NoBackoff(), 1, supported_errors=(RedisConnectionError,))
+
+
 def create_client(
     config: ClusterConfig, decode_responses: bool = True
 ) -> Union[Redis, RedisCluster]:
     kwargs = client_kwargs(config, decode_responses)
+    kwargs.setdefault("max_connections", MAX_CONNECTIONS)
     addresses = config.addresses()
     if config.mode == "cluster":
-        kwargs.setdefault("max_connections", MAX_CONNECTIONS)
+        # RedisCluster retries every attempt on connection errors and timeouts alike (with a topology refresh),
+        # so it gets a single attempt; the next call uses the refreshed topology.
         return RedisCluster(
             startup_nodes=[ClusterNode(host, port) for host, port in addresses],
+            retry=Retry(NoBackoff(), 0),
             **kwargs,
         )
     if config.mode == "sentinel":
         sentinel_kwargs: Dict[str, Any] = {
             "socket_connect_timeout": kwargs["socket_connect_timeout"],
             "socket_timeout": kwargs["socket_timeout"],
+            "retry": _retry(),
         }
         if config.tls is not None:
             sentinel_kwargs.update(config.tls.client_kwargs())
         if config.sentinel_password:
             sentinel_kwargs["password"] = config.sentinel_password
-        kwargs.setdefault("max_connections", MAX_CONNECTIONS)
         sentinel = Sentinel(addresses, sentinel_kwargs=sentinel_kwargs)
-        return sentinel.master_for(config.master_name, db=config.db, **kwargs)
+        return sentinel.master_for(
+            config.master_name, db=config.db, retry=_retry(), **kwargs
+        )
     host, port = addresses[0]
-    kwargs.setdefault("max_connections", MAX_CONNECTIONS)
-    return Redis(host=host, port=port, db=config.db, **kwargs)
+    return Redis(host=host, port=port, db=config.db, retry=_retry(), **kwargs)

@@ -13,10 +13,13 @@ the eligible cluster names, so a call naming any other cluster fails schema vali
 """
 
 import asyncio
+import contextvars
 import enum
 import inspect
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -31,6 +34,10 @@ _logger = logging.getLogger(__name__)
 
 # Time limit of a tool call; the client socket timeouts are set below it.
 TOOL_TIMEOUT_SECONDS = 15
+
+# Tool calls run in a small thread pool per cluster (the tools use the blocking redis client). A cluster that
+# hangs ties up only its own workers: its queued calls fail at the time limit while other clusters carry on.
+MAX_CONCURRENT_CALLS_PER_CLUSTER = 8
 
 TOOLSETS: Dict[str, str] = {
     "core": "Clusters, server info and generic key operations (type, scan, expire, rename, delete)",
@@ -163,10 +170,14 @@ def annotations(spec: ToolSpec) -> ToolAnnotations:
     )
 
 
-def wrap(spec: ToolSpec, clusters: List[str]) -> Callable[..., Any]:
+def wrap(
+    spec: ToolSpec, clusters: List[str], single_cluster: bool = False
+) -> Callable[..., Any]:
     """The function FastMCP registers: the tool's own signature plus the ``cluster`` enum parameter. A call
-    runs the tool in a worker thread (the tools use the blocking redis client) with the cluster selected and
-    a time limit."""
+    runs the tool in a worker thread with the cluster selected and a time limit.
+
+    With ``single_cluster`` (only one cluster configured, e.g. the legacy env/CLI mode) the parameter is
+    optional, so calls written before multi-cluster support keep working."""
     signature = inspect.signature(spec.fn)
     parameters = list(signature.parameters.values())
     if spec.cluster != "none":
@@ -175,7 +186,7 @@ def wrap(spec: ToolSpec, clusters: List[str]) -> Callable[..., Any]:
             Literal[tuple(clusters)],  # type: ignore[valid-type]
             WithJsonSchema({"type": "string", "enum": list(clusters)}),
         ]
-        if spec.cluster == "required":
+        if spec.cluster == "required" and not single_cluster:
             parameters.insert(
                 0,
                 inspect.Parameter(
@@ -191,7 +202,11 @@ def wrap(spec: ToolSpec, clusters: List[str]) -> Callable[..., Any]:
                     inspect.Parameter.POSITIONAL_OR_KEYWORD,
                     annotation=Annotated[
                         Optional[names],
-                        Field(description="Cluster name (default: all clusters)"),
+                        Field(
+                            description="Cluster name (default: all clusters)"
+                            if spec.cluster == "optional"
+                            else "Cluster name (default: the only configured cluster)"
+                        ),
                     ],
                     default=None,
                 )
@@ -208,6 +223,24 @@ def wrap(spec: ToolSpec, clusters: List[str]) -> Callable[..., Any]:
     return tool
 
 
+_executors: Dict[str, ThreadPoolExecutor] = {}
+_executors_lock = threading.Lock()
+
+
+def _executor(cluster: Optional[str]) -> ThreadPoolExecutor:
+    """The worker pool of a cluster; calls without a cluster share one pool."""
+    key = cluster or ""
+    with _executors_lock:
+        executor = _executors.get(key)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=MAX_CONCURRENT_CALLS_PER_CLUSTER,
+                thread_name_prefix=f"tool-{key or '-'}",
+            )
+            _executors[key] = executor
+    return executor
+
+
 def _run(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Any:
     result = fn(**kwargs)
     if inspect.isawaitable(result):
@@ -220,17 +253,23 @@ async def call(spec: ToolSpec, cluster: Optional[str], kwargs: Dict[str, Any]) -
     outcome, error = "ok", None
     token = current_cluster.set(cluster)
     try:
-        # asyncio.to_thread copies the context, so the worker sees current_cluster
-        return await asyncio.wait_for(
-            asyncio.to_thread(_run, spec.fn, kwargs), TOOL_TIMEOUT_SECONDS
+        # the worker runs in a copy of this context, so it sees current_cluster
+        context = contextvars.copy_context()
+        future = asyncio.get_running_loop().run_in_executor(
+            _executor(cluster), context.run, _run, spec.fn, kwargs
         )
+        # on timeout the future is cancelled: a call still queued behind a hanging cluster never starts
+        return await asyncio.wait_for(future, TOOL_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         outcome = "error"
         error = (
-            f"Tool did not finish within {TOOL_TIMEOUT_SECONDS} s (timeout)."
-            " Try a narrower pattern or a smaller count."
+            f"Tool did not finish within {TOOL_TIMEOUT_SECONDS} s (timeout). The cluster may be slow or"
+            " unreachable (check clusters_list), or the request too large (narrow the pattern or count)."
         )
         raise ToolError(error) from None
+    except asyncio.CancelledError:
+        outcome, error = "cancelled", "cancelled by the client"
+        raise
     except Exception as e:
         outcome, error = "error", str(e)
         raise

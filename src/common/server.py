@@ -30,7 +30,8 @@ def load_tools():
 
 def build_server(
     config: ServerConfig,
-    host: str = "0.0.0.0",  # nosec B104 - a server in a container listens on all interfaces
+    # a server in a container listens on all interfaces
+    host: str = "0.0.0.0",  # nosec B104
 ) -> FastMCP:
     """FastMCP server with the tools the config enables (see src.common.registry)."""
     load_tools()
@@ -45,9 +46,10 @@ def build_server(
         stateless_http=True,
         json_response=True,
     )
+    single_cluster = len(config.clusters) == 1
     for spec, clusters in registry.select(config):
         mcp.add_tool(
-            registry.wrap(spec, clusters),
+            registry.wrap(spec, clusters, single_cluster),
             name=spec.name,
             description=spec.description,
             annotations=registry.annotations(spec),

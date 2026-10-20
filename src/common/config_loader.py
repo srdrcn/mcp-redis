@@ -33,16 +33,36 @@ _logger = logging.getLogger(__name__)
 
 CLUSTER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 DEFAULT_PASSWORDS_DIR = "/etc/redis-mcp/passwords"
-PASSWORD_SUFFIX = "_pass"
-SENTINEL_PASSWORD_SUFFIX = "_sentinel_pass"
+# file / env variable name suffixes, not passwords
+PASSWORD_SUFFIX = "_pass"  # nosec B105
+SENTINEL_PASSWORD_SUFFIX = "_sentinel_pass"  # nosec B105
 LEGACY_CLUSTER_NAME = "default"
 
 # Recommended minimum length of a non-empty apiKey; shorter keys only produce a startup warning.
 RECOMMENDED_API_KEY_LENGTH = 16
 
-# Client settings the config cannot override through `options`: secrets come from the passwords directory,
-# and the tools rely on the decode_responses setting they ask for.
-FORBIDDEN_OPTIONS = ("password", "credential_provider", "decode_responses")
+# redis-py arguments a cluster may tune through `options`. Everything else is either set from the cluster keys
+# (hosts, db, username, tls), comes from the passwords directory, or is managed by the server (decode_responses,
+# retry), so `options` cannot carry a secret, point the client elsewhere or be silently dropped by redis-py.
+COMMON_OPTIONS = (
+    "socket_timeout",
+    "socket_connect_timeout",
+    "socket_keepalive",
+    "max_connections",
+    "client_name",
+    "protocol",
+)
+MODE_OPTIONS = {
+    "standalone": COMMON_OPTIONS + ("health_check_interval",),
+    "sentinel": COMMON_OPTIONS + ("health_check_interval",),
+    "cluster": COMMON_OPTIONS
+    + (
+        "read_from_replicas",
+        "require_full_coverage",
+        "reinitialize_steps",
+        "dynamic_startup_nodes",
+    ),
+}
 
 _INT = re.compile(r"[-+]?[0-9]+")
 _FLOAT = re.compile(r"[-+]?([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][-+]?[0-9]+)?")
@@ -142,13 +162,7 @@ class ClusterConfig(_Model):
 
     @field_validator("options")
     @classmethod
-    def _check_options(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        forbidden = [key for key in value if key in FORBIDDEN_OPTIONS]
-        if forbidden:
-            raise ValueError(
-                f"{', '.join(forbidden)} cannot be set in options"
-                " (passwords come from the passwords directory)"
-            )
+    def _convert_options(cls, value: Dict[str, Any]) -> Dict[str, Any]:
         return {key: _option_value(v) for key, v in value.items()}
 
     @model_validator(mode="after")
@@ -168,6 +182,17 @@ class ClusterConfig(_Model):
             raise ValueError("db must be 0 or greater")
         if self.entraid and self.username:
             raise ValueError("username cannot be combined with entraid")
+        if self.mode == "cluster" and self.tls is not None and self.tls.ca_path:
+            # redis-py's RedisCluster drops ssl_ca_path, so the nodes would be verified against the system CAs
+            raise ValueError("tls.caPath is not supported in cluster mode; use caFile")
+        allowed = MODE_OPTIONS[self.mode]
+        unsupported = sorted(key for key in self.options if key not in allowed)
+        if unsupported:
+            raise ValueError(
+                f"options {', '.join(unsupported)} not supported in {self.mode} mode"
+                f" (supported: {', '.join(allowed)}; addresses, db, username and tls have their own keys,"
+                " passwords come from the passwords directory)"
+            )
         return self
 
     def addresses(self) -> List[Tuple[str, int]]:
@@ -234,6 +259,13 @@ class ServerConfig(_Model):
         duplicates = sorted({n for n in names if names.count(n) > 1})
         if duplicates:
             raise ValueError(f"duplicate cluster name: {', '.join(duplicates)}")
+        for c in value:
+            # <name>_sentinel_pass would also be the password file of a cluster named <name>_sentinel
+            if c.mode == "sentinel" and c.name + "_sentinel" in names:
+                raise ValueError(
+                    f"cluster name {c.name}_sentinel clashes with the Sentinel password of cluster {c.name}"
+                    f" ({c.name}{SENTINEL_PASSWORD_SUFFIX}); rename one of them"
+                )
         return value
 
     @property
@@ -283,6 +315,12 @@ def parse_hosts(hosts: str) -> List[Tuple[str, int]]:
     addresses = []
     for item in hosts.split(","):
         item = item.strip()
+        if "@" in item or "://" in item:
+            # the item is not echoed: it may hold a password
+            raise ValueError(
+                "hosts takes host:port entries without a scheme or credentials (user:password@);"
+                " passwords come from the passwords directory"
+            )
         host, sep, port = item.rpartition(":")
         if not item or not sep or not host or not port.isdigit():
             raise ValueError(f"'{item}' is not host:port")
@@ -332,9 +370,14 @@ _TextLoader.yaml_implicit_resolvers = {
 def _read(path: Path) -> Dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as f:
-            data = yaml.load(f, Loader=_TextLoader)  # nosec B506 - _TextLoader is a SafeLoader
+            # _TextLoader is a SafeLoader
+            data = yaml.load(f, Loader=_TextLoader)  # nosec B506
     except OSError as e:
         raise ConfigError(f"Could not read config file: {path} ({e.strerror})") from e
+    except UnicodeDecodeError as e:
+        raise ConfigError(
+            f"Could not read config file: {path} (not UTF-8: invalid byte at position {e.start})"
+        ) from e
     except yaml.YAMLError as e:
         raise ConfigError(f"Could not parse config file: {path} ({e})") from e
     if data is None:
@@ -433,12 +476,25 @@ def _read_secret(passwords_dir: str, key: str) -> Optional[str]:
             raise ConfigError(
                 f"Could not read password file {path} ({e.strerror})"
             ) from e
+        except UnicodeDecodeError as e:
+            raise ConfigError(f"Could not read password file {path} (not UTF-8)") from e
     return os.environ.get(key)
 
 
 def resolve_passwords(config: ServerConfig) -> None:
     """Sets each cluster's password from ``<passwordsDir>/<name>_pass`` or the ``<name>_pass`` env variable
-    (and a sentinel's own password from ``<name>_sentinel_pass``)."""
+    (and a sentinel's own password from ``<name>_sentinel_pass``). Clusters with ``entraid: true`` need an
+    Entra ID auth flow (REDIS_ENTRAID_AUTH_FLOW / --entraid-auth-flow); without one they would connect without
+    any authentication, so that is an error."""
+    entraid_clusters = [c.name for c in config.clusters if c.entraid]
+    if entraid_clusters:
+        from src.common.config import is_entraid_auth_enabled
+
+        if not is_entraid_auth_enabled():
+            raise ConfigError(
+                f"clusters {', '.join(entraid_clusters)} set entraid: true, but no Entra ID auth flow is"
+                " configured (REDIS_ENTRAID_AUTH_FLOW or --entraid-auth-flow)"
+            )
     for c in config.clusters:
         c._password = _read_secret(config.passwords_dir, c.name + PASSWORD_SUFFIX)
         if c.mode == "sentinel":
