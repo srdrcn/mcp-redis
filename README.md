@@ -97,15 +97,15 @@ curl -s localhost:8080/mcp -H 'Content-Type: application/json' -H 'Accept: appli
 
 To run over stdio instead (for a local MCP client that starts the process itself), add `--transport stdio`.
 
-**With Docker.** Build the image and mount the config and a directory with one `<cluster>_pass` file per cluster
-(keep it outside the repository):
+**With Docker.** Use the published image `chosenwar/redis-mcp` (see [Container image](#container-image)) or build
+your own with `docker build -t redis-mcp:latest .`, and mount the config and a directory with one `<cluster>_pass`
+file per cluster (keep it outside the repository):
 
 ```bash
-docker build -t redis-mcp:latest .
 docker run --rm -p 8080:8080 --read-only --tmpfs /tmp \
   -v "$PWD/redis-mcp.local.yaml:/etc/redis-mcp/config/redis-mcp.yaml:ro" \
   -v "$HOME/redis-mcp-passwords:/etc/redis-mcp/passwords:ro" \
-  redis-mcp:latest /app/.venv/bin/redis-mcp-server --config /etc/redis-mcp/config/redis-mcp.yaml
+  chosenwar/redis-mcp:latest /app/.venv/bin/redis-mcp-server --config /etc/redis-mcp/config/redis-mcp.yaml
 ```
 
 - The image's default command (`/app/.venv/bin/python src/main.py`) also works: pass
@@ -633,6 +633,20 @@ Over stdio, stdout carries the JSON-RPC stream, so logs go to stderr in the plai
 The image runs with `--user 12345:0 --read-only --tmpfs /tmp` (a random UID in group 0 and a read-only root
 filesystem, as on OpenShift), in both the multi-cluster (HTTP) and the legacy (stdio) mode.
 
+**Published image.** `.github/workflows/docker-push.yml` builds the image and pushes it to Docker Hub as
+[`chosenwar/redis-mcp`](https://hub.docker.com/r/chosenwar/redis-mcp):
+
+| Trigger | Tags |
+|---|---|
+| push to `main` | `latest`, `sha-<short commit>` |
+| tag `vX.Y.Z` | `X.Y.Z`, `sha-<short commit>` |
+| manual run (Actions → Docker push → Run workflow) | `sha-<short commit>` (plus `latest` on `main`) |
+
+Before pushing, the workflow smoke-tests the image the way OpenShift runs it (`--user 12345:0 --read-only --tmpfs
+/tmp`): `--help`, the import, `/healthz`, 401 without the API key and `tools/list` with it. It needs the repository
+secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with Read & Write scope). To release a
+version: `git tag v0.6.0 && git push origin v0.6.0`.
+
 ### OpenShift deployment
 
 `deploy/openshift/` is a kustomize directory:
@@ -655,14 +669,16 @@ key per cluster) and the recommended Secret `redis-mcp-api-key` (key `api-key`) 
 oc new-project redis-mcp      # or switch to an existing one: oc project <namespace>
 ```
 
-**1. Build and push the image**, either to a registry the cluster can pull from:
+**1. Pick the image.** By default `kustomization.yaml` uses the published `docker.io/chosenwar/redis-mcp:latest`
+(see [Container image](#container-image)); pin a release tag (`X.Y.Z`) for production. To build your own instead,
+push it to a registry the cluster can pull from:
 
 ```bash
 docker build -t <registry>/<namespace>/redis-mcp:<tag> .     # or podman build
 docker push <registry>/<namespace>/redis-mcp:<tag>
 ```
 
-or inside the cluster, into the internal registry (the build pod needs access to Docker Hub and PyPI):
+or build it inside the cluster, into the internal registry (the build pod needs access to Docker Hub and PyPI):
 
 ```bash
 oc new-build --name redis-mcp --binary --strategy docker
@@ -672,13 +688,13 @@ oc start-build redis-mcp --from-repo . --follow   # -> image-registry.openshift-
 `--from-repo` uploads the committed files of the clone, so local config and password files are not sent to the
 cluster.
 
-**2. Set the image** in `deploy/openshift/kustomization.yaml`:
+**2. Set the image** in `deploy/openshift/kustomization.yaml` (only needed for a release tag or your own image):
 
 ```yaml
 images:
   - name: redis-mcp
-    newName: image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp   # or <registry>/<namespace>/redis-mcp
-    newTag: latest
+    newName: docker.io/chosenwar/redis-mcp   # or image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp
+    newTag: latest                           # or a release, e.g. 0.6.0
 ```
 
 **3. Prepare the config and the passwords** from the templates. Keep `port: 8080` and
