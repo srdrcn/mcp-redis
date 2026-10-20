@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-mcp
+spec:
+  # One pod, replaced (not rolled): pub/sub subscriptions and the Redis client caches live in the process, so a
+  # second replica would not know the subscription ids handed out by the first.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-mcp
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: redis-mcp
+    spec:
+      # the server never talks to the Kubernetes API
+      automountServiceAccountToken: false
+      # Redis host names are resolved outside socket_connect_timeout, on every new connection. With the default
+      # ndots:5, a name such as redis-1.example.com is first tried with each search domain of the pod. For Redis
+      # hosts given by fully qualified names, uncomment to look up names with two or more dots as written first
+      # (short names such as a Service name still use the search domains):
+      # dnsConfig:
+      #   options:
+      #     - name: ndots
+      #       value: "2"
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis-mcp
+          image: redis-mcp
+          imagePullPolicy: Always
+          command: ["/app/.venv/bin/redis-mcp"]
+          args: ["--config", "/etc/redis-mcp/config/redis-mcp.yaml"]
+          # Recommended: the API key from a Secret instead of apiKey in the ConfigMap. Delete the apiKey line from
+          # redis-mcp.yaml (REDIS_MCP_API_KEY overrides it, but an <api-key> placeholder there still stops the pod),
+          # create the Secret and uncomment env:
+          #   REDIS_MCP_KEY=$(openssl rand -hex 32)
+          #   oc create secret generic redis-mcp-api-key --from-literal=api-key="$REDIS_MCP_KEY"
+          # env:
+          #   - name: REDIS_MCP_API_KEY
+          #     valueFrom:
+          #       secretKeyRef:
+          #         name: redis-mcp-api-key
+          #         key: api-key
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            # Does not depend on Redis: a cluster outage must not restart the pod (clusters_list shows it).
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis-mcp/config
+              readOnly: true
+            - name: passwords
+              mountPath: /etc/redis-mcp/passwords
+              readOnly: true
+            # - name: tls-ca
+            #   mountPath: /etc/redis-mcp/tls
+            #   readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: redis-mcp-config
+            items:
+              - key: redis-mcp.yaml
+                path: redis-mcp.yaml
+        - name: passwords
+          # one file per key of passwords.env: /etc/redis-mcp/passwords/<cluster>_pass
+          secret:
+            secretName: redis-mcp-passwords
+            defaultMode: 0440
+        # CA certificate for clusters with `tls: {caFile: /etc/redis-mcp/tls/ca.crt}`:
+        #   oc create secret generic redis-mcp-tls --from-file=ca.crt=/path/to/ca.crt
+        # - name: tls-ca
+        #   secret:
+        #     secretName: redis-mcp-tls
+        #     defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

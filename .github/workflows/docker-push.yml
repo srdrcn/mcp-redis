@@ -1,0 +1,107 @@
+name: Docker push
+
+# Builds the image and pushes it to Docker Hub (chosenwar/redis-mcp), like kafka-mcp's pipeline:
+#   push to main -> latest + sha-<short>
+#   tag vX.Y.Z   -> X.Y.Z + sha-<short>
+#   manual run   -> sha-<short> (+ latest when run on main)
+# Needs the repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a Docker Hub access token with
+# Read & Write scope).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-push-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: chosenwar/redis-mcp
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build once into the local Docker daemon and check the image before anything is pushed.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: redis-mcp:smoke-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image as OpenShift runs it: a random UID in group 0, read-only root filesystem, /tmp writable.
+      - name: Smoke test
+        run: |
+          docker run --rm --user 12345:0 --read-only --tmpfs /tmp redis-mcp:smoke-test \
+            /app/.venv/bin/redis-mcp --help
+          docker run --rm --user 12345:0 --read-only --tmpfs /tmp redis-mcp:smoke-test \
+            /app/.venv/bin/python -c "import src.main; print('import ok')"
+
+          mkdir -p "$RUNNER_TEMP/redis-mcp"
+          cat > "$RUNNER_TEMP/redis-mcp/redis-mcp.yaml" <<'EOF'
+          port: 8080
+          apiKey: smoke-test-key-0123456789
+          clusters:
+            - name: smoke
+              hosts: 127.0.0.1:6379
+          EOF
+          docker run -d --name redis-mcp-smoke --user 12345:0 --read-only --tmpfs /tmp -p 8080:8080 \
+            -v "$RUNNER_TEMP/redis-mcp:/etc/redis-mcp/config:ro" \
+            redis-mcp:smoke-test /app/.venv/bin/redis-mcp --config /etc/redis-mcp/config/redis-mcp.yaml
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8080/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz
+          echo
+          # without the key: 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" = 401
+          # with the key: the tool list
+          curl -fsS -X POST http://localhost:8080/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -H 'X-Authorization: smoke-test-key-0123456789' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q clusters_list
+          echo "smoke test passed"
+
+      - name: Server log
+        if: always()
+        run: docker logs redis-mcp-smoke 2>&1 | tail -50 || true
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha
+
+      # Same build inputs as above, so this step reuses the cached layers.
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
