@@ -1,6 +1,8 @@
+import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 
 def resolve_log_level() -> int:
@@ -62,4 +64,51 @@ def configure_logging() -> int:
     # Route warnings.warn(...) through logging
     logging.captureWarnings(True)
 
+    return level
+
+
+# Attributes every LogRecord has; anything else on a record came from `extra=` and goes into the JSON line
+# (uvicorn's color_message duplicates the message with terminal colors).
+_RECORD_ATTRIBUTES = set(vars(logging.makeLogRecord({}))) | {
+    "message",
+    "asctime",
+    "color_message",
+}
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line: timestamp, level, logger, message, the `extra=` fields and any exception."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event = {
+            "@timestamp": datetime.fromtimestamp(record.created, timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in vars(record).items():
+            if key not in _RECORD_ATTRIBUTES and not key.startswith("_"):
+                event[key] = value
+        if record.exc_info:
+            event["exception"] = self.formatException(record.exc_info)
+        return json.dumps(event, default=str)
+
+
+def configure_json_logging(stream=None) -> int:
+    """JSON logs for the HTTP transport (to stdout by default), at INFO unless MCP_REDIS_LOG_LEVEL says
+    otherwise, replacing any handlers already installed. In stdio mode stdout carries JSON-RPC, so this is
+    not used there."""
+    level = resolve_log_level() if os.getenv("MCP_REDIS_LOG_LEVEL") else logging.INFO
+    handler = logging.StreamHandler(stream or sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(handler)
+    root.setLevel(level)
+    # the MCP SDK logs every request at INFO; the server logs one line per tool call instead
+    logging.getLogger("mcp").setLevel(max(level, logging.WARNING))
+    logging.captureWarnings(True)
     return level

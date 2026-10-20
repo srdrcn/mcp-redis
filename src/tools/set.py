@@ -3,10 +3,10 @@ from typing import Union, List, Optional
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.WRITE)
 async def sadd(name: str, value: str, expire_seconds: Optional[int] = None) -> str:
     """Add a value to a Redis set with an optional expiration time.
 
@@ -32,7 +32,7 @@ async def sadd(name: str, value: str, expire_seconds: Optional[int] = None) -> s
         return f"Error adding value '{value}' to set '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.DESTRUCTIVE)
 async def srem(name: str, value: str) -> str:
     """Remove a value from a Redis set.
 
@@ -55,7 +55,7 @@ async def srem(name: str, value: str) -> str:
         return f"Error removing value '{value}' from set '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def smembers(name: str) -> Union[str, List[str]]:
     """Get all members of a Redis set.
 

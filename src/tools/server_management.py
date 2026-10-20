@@ -1,10 +1,10 @@
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import redis_tool
 
 
-@mcp.tool()
+@redis_tool("core")
 async def dbsize() -> int:
     """Get the number of keys stored in the Redis database"""
     try:
@@ -14,7 +14,7 @@ async def dbsize() -> int:
         return f"Error getting database size: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("core")
 async def info(section: str = "default") -> dict:
     """Get Redis server information and statistics.
 
@@ -32,7 +32,7 @@ async def info(section: str = "default") -> dict:
         return f"Error retrieving Redis info: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("core")
 async def client_list() -> list:
     """Get a list of connected clients to the Redis server."""
     try:

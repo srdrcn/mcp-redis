@@ -4,14 +4,14 @@ from typing import Any, Dict
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 from src.common.subscription_manager import (
     SubscriptionLimitExceededError,
     SubscriptionManager,
 )
 
 
-@mcp.tool()
+@redis_tool("pubsub", ToolKind.WRITE)
 async def publish(channel: str, message: str) -> str:
     """Publish a message to a Redis channel.
 
@@ -30,7 +30,7 @@ async def publish(channel: str, message: str) -> str:
         return f"Error publishing message to channel '{channel}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("pubsub")
 async def subscribe(channel: str) -> Dict[str, Any]:
     """Subscribe to a Redis channel and return a reusable subscription handle.
 
@@ -54,7 +54,7 @@ async def subscribe(channel: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@redis_tool("pubsub")
 async def psubscribe(pattern: str) -> Dict[str, Any]:
     """Subscribe to Redis channels using a pattern.
 
@@ -80,7 +80,7 @@ async def psubscribe(pattern: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@redis_tool("pubsub", cluster="none")
 async def read_messages(
     subscription_id: str, timeout_ms: int = 1000, max_messages: int = 10
 ) -> Dict[str, Any]:
@@ -120,7 +120,7 @@ async def read_messages(
         }
 
 
-@mcp.tool()
+@redis_tool("pubsub", cluster="none")
 async def unsubscribe(subscription_id: str) -> Dict[str, Any]:
     """Unsubscribe and close an existing pub/sub subscription.
 

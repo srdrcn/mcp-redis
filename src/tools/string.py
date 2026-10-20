@@ -5,10 +5,10 @@ from redis.exceptions import RedisError
 from redis import Redis
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.WRITE)
 async def set(
     key: str,
     value: Union[str, bytes, int, float, dict],
@@ -48,7 +48,7 @@ async def set(
         return f"Error setting key {key}: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def get(key: str) -> Union[str, bytes]:
     """Get a Redis string value.
 

@@ -5,10 +5,10 @@ from redis.exceptions import RedisError
 from redis.typing import FieldT
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.WRITE)
 async def lpush(name: str, value: FieldT, expire: Optional[int] = None) -> str:
     """Push a value onto the left of a Redis list and optionally set an expiration time."""
     try:
@@ -21,7 +21,7 @@ async def lpush(name: str, value: FieldT, expire: Optional[int] = None) -> str:
         return f"Error pushing value to list '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.WRITE)
 async def rpush(name: str, value: FieldT, expire: Optional[int] = None) -> str:
     """Push a value onto the right of a Redis list and optionally set an expiration time."""
     try:
@@ -34,7 +34,7 @@ async def rpush(name: str, value: FieldT, expire: Optional[int] = None) -> str:
         return f"Error pushing value to list '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.DESTRUCTIVE)
 async def lpop(name: str) -> str:
     """Remove and return the first element from a Redis list."""
     try:
@@ -45,7 +45,7 @@ async def lpop(name: str) -> str:
         return f"Error popping value from list '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.DESTRUCTIVE)
 async def rpop(name: str) -> str:
     """Remove and return the last element from a Redis list."""
     try:
@@ -56,7 +56,7 @@ async def rpop(name: str) -> str:
         return f"Error popping value from list '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def lrange(name: str, start: int, stop: int) -> Union[str, List[str]]:
     """Get elements from a Redis list within a specific range.
 
@@ -74,7 +74,7 @@ async def lrange(name: str, start: int, stop: int) -> Union[str, List[str]]:
         return f"Error retrieving values from list '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def llen(name: str) -> int:
     """Get the length of a Redis list."""
     try:
@@ -84,7 +84,7 @@ async def llen(name: str) -> int:
         return f"Error retrieving length of list '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.DESTRUCTIVE)
 async def lrem(name: str, count: int, element: FieldT) -> str:
     """Remove elements from a Redis list.
 

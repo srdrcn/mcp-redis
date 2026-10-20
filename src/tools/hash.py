@@ -4,10 +4,10 @@ import numpy as np
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.WRITE)
 async def hset(
     name: str, key: str, value: str | int | float, expire_seconds: Optional[int] = None
 ) -> str:
@@ -36,7 +36,7 @@ async def hset(
         return f"Error setting field '{key}' in hash '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def hget(name: str, key: str) -> str:
     """Get the value of a field in a Redis hash.
 
@@ -55,7 +55,7 @@ async def hget(name: str, key: str) -> str:
         return f"Error getting field '{key}' from hash '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.DESTRUCTIVE)
 async def hdel(name: str, key: str) -> str:
     """Delete a field from a Redis hash.
 
@@ -78,7 +78,7 @@ async def hdel(name: str, key: str) -> str:
         return f"Error deleting field '{key}' from hash '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def hgetall(name: str) -> dict:
     """Get all fields and values from a Redis hash.
 
@@ -100,7 +100,7 @@ async def hgetall(name: str) -> dict:
         return f"Error getting all fields from hash '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def hexists(name: str, key: str) -> bool:
     """Check if a field exists in a Redis hash.
 
@@ -118,7 +118,7 @@ async def hexists(name: str, key: str) -> bool:
         return f"Error checking existence of field '{key}' in hash '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data", ToolKind.WRITE)
 async def set_vector_in_hash(
     name: str, vector: List[float], vector_field: str = "vector"
 ) -> Union[bool, str]:
@@ -145,7 +145,7 @@ async def set_vector_in_hash(
         return f"Error storing vector in hash '{name}' with field '{vector_field}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("data")
 async def get_vector_from_hash(name: str, vector_field: str = "vector"):
     """Retrieve a vector from a Redis hash and convert it back from binary blob.
 
