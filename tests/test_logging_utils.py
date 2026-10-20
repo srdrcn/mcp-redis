@@ -3,7 +3,7 @@ import json
 import logging
 import sys
 import time
-from pathlib import Path
+from pathlib import PurePosixPath
 from unittest.mock import patch
 
 import pytest
@@ -249,7 +249,10 @@ class TestJsonFormatter:
         assert event["error"] is None
 
     def test_non_serializable_extra_uses_str(self):
-        event = format_event(make_record(extra={"path": Path("/etc/redis-mcp")}))
+        # PurePosixPath: str() of a native Path would use backslashes on Windows
+        event = format_event(
+            make_record(extra={"path": PurePosixPath("/etc/redis-mcp")})
+        )
 
         assert event["path"] == "/etc/redis-mcp"
 

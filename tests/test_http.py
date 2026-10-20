@@ -9,6 +9,7 @@ import warnings
 from unittest.mock import patch
 
 import pytest
+from click.testing import CliRunner
 from starlette.exceptions import StarletteDeprecationWarning
 
 with warnings.catch_warnings():
@@ -16,9 +17,10 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", StarletteDeprecationWarning)
     from starlette.testclient import TestClient
 
-from src.common.config_loader import ServerConfig, parse_config
+from src.common.config_loader import ServerConfig, from_legacy, parse_config
 from src.common.http import API_KEY_HEADER, ApiKeyMiddleware, http_app, run_http
 from src.common.server import HEALTH_PATH, MCP_PATH, build_server
+from src.main import apply_api_key, cli
 
 API_KEY = "0123456789abcdef0123456789abcdef"
 HTTP_LOGGER = "src.common.http"
@@ -565,3 +567,147 @@ class TestRunHttp:
         assert kwargs["port"] == 9123
         assert kwargs["log_config"] is None
         assert kwargs["access_log"] is False
+
+
+def _legacy_config(api_key=None) -> ServerConfig:
+    """The single ``default`` cluster of the env/CLI mode, with --api-key / REDIS_MCP_API_KEY applied."""
+    config = from_legacy({"host": "127.0.0.1", "port": 6379})
+    apply_api_key(config, api_key)
+    return config
+
+
+def _post(client, api_key=None, message=TOOLS_LIST):
+    headers = (
+        _headers() if api_key is None else _headers(**{"X-Authorization": api_key})
+    )
+    return client.post(MCP_PATH, json=message, headers=headers)
+
+
+class TestLegacyModeApiKey:
+    """The legacy single-cluster mode has no config file: --api-key / REDIS_MCP_API_KEY is how its HTTP
+    transport gets an API key, and it is enforced exactly like apiKey."""
+
+    def test_missing_and_wrong_key_are_401(self):
+        with _client(_legacy_config(API_KEY)) as client:
+            missing = _post(client)
+            wrong = _post(client, "not-the-key")
+
+        assert missing.status_code == 401
+        assert missing.json()["error"] == "unauthorized"
+        assert wrong.status_code == 401
+
+    def test_right_key_lists_tools_with_optional_cluster(self):
+        with _client(_legacy_config(API_KEY)) as client:
+            response = _post(client, API_KEY)
+
+        assert response.status_code == 200
+        tools = {t["name"]: t for t in response.json()["result"]["tools"]}
+        schema = tools["get"]["inputSchema"]
+        cluster = schema["properties"]["cluster"]
+        # one cluster: calls written before multi-cluster support (without cluster) keep working
+        assert "cluster" not in schema.get("required", [])
+        assert cluster["default"] is None
+        assert {"type": "string", "enum": ["default"]} in cluster["anyOf"]
+
+    def test_origin_is_403_with_right_key(self):
+        with _client(_legacy_config(API_KEY)) as client:
+            response = client.post(
+                MCP_PATH,
+                json=TOOLS_LIST,
+                headers=_headers(**{"X-Authorization": API_KEY, "Origin": "x"}),
+            )
+
+        assert response.status_code == 403
+
+    @pytest.mark.parametrize("api_key", [None, ""], ids=["unset", "empty"])
+    def test_without_key_is_open(self, api_key):
+        with _client(_legacy_config(api_key)) as client:
+            response = _post(client)
+
+        assert response.status_code == 200
+
+
+class TestCliHttpApiKey:
+    """The CLI end to end up to uvicorn: the app it would serve guards /mcp with the --api-key /
+    REDIS_MCP_API_KEY value, in the legacy mode and over a config file's apiKey."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_cli(self, monkeypatch):
+        for name in ("REDIS_MCP_CONFIG", "REDIS_MCP_CONFIG_DIR", "REDIS_MCP_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        # the CLI writes the legacy settings into the shared REDIS_CFG and sets up logging for HTTP
+        with (
+            patch.dict("src.common.config.REDIS_CFG"),
+            patch("src.main.configure_json_logging"),
+        ):
+            yield
+
+    @staticmethod
+    def served_app(args, env=None):
+        """Runs the CLI and returns the ASGI app and config it hands to uvicorn."""
+        with patch("src.common.http.uvicorn.run") as mock_run:
+            result = CliRunner().invoke(cli, args, env=env)
+
+        assert result.exit_code == 0, result.output
+        mock_run.assert_called_once()
+        app = mock_run.call_args.args[0]
+        assert isinstance(app, ApiKeyMiddleware)
+        return app, mock_run.call_args.kwargs
+
+    @pytest.mark.parametrize(
+        "args, env",
+        [
+            (["--transport", "http", "--api-key", API_KEY], None),
+            (["--transport", "http"], {"REDIS_MCP_API_KEY": API_KEY}),
+            (["--http-port", "9123", "--api-key", API_KEY], None),
+        ],
+        ids=["option", "env", "http-port"],
+    )
+    def test_legacy_mode_enforces_key(self, args, env):
+        app, kwargs = self.served_app(args, env)
+
+        with TestClient(app) as client:
+            missing = _post(client)
+            wrong = _post(client, API_KEY + "x")
+            right = _post(client, API_KEY)
+            health = client.get(HEALTH_PATH)
+
+        assert kwargs["port"] == (9123 if "--http-port" in args else 8080)
+        assert missing.status_code == 401
+        assert wrong.status_code == 401
+        assert right.status_code == 200
+        names = [t["name"] for t in right.json()["result"]["tools"]]
+        assert "get" in names
+        assert health.status_code == 200
+
+    def test_legacy_mode_without_key_is_open(self, caplog):
+        caplog.set_level(logging.WARNING, logger=HTTP_LOGGER)
+
+        app, _ = self.served_app(["--transport", "http"])
+
+        with TestClient(app) as client:
+            response = _post(client)
+
+        assert response.status_code == 200
+        assert any("DISABLED" in r.getMessage() for r in caplog.records)
+
+    def test_env_key_replaces_config_key(self, tmp_path):
+        other = "fedcba9876543210fedcba9876543210"
+        path = tmp_path / "redis-mcp.yaml"
+        path.write_text(
+            f"apiKey: {API_KEY}\npasswordsDir: {tmp_path}\n"
+            "clusters:\n  - name: a\n    hosts: a:6379\n",
+            encoding="utf-8",
+        )
+
+        app, _ = self.served_app(
+            ["--config", str(path), "--transport", "http"],
+            env={"REDIS_MCP_API_KEY": other, "a_pass": None},
+        )
+
+        with TestClient(app) as client:
+            config_key = _post(client, API_KEY)
+            env_key = _post(client, other)
+
+        assert config_key.status_code == 401
+        assert env_key.status_code == 200

@@ -2,18 +2,24 @@
 Unit tests for src/common/config_loader.py
 """
 
+import inspect
 import logging
 import textwrap
+import traceback
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
+from redis import Redis
+from redis.cluster import REDIS_ALLOWED_KEYS, RedisCluster
+from redis.connection import AbstractConnection, Connection, ConnectionPool
 
 from src.common import config_loader
 from src.common.config_loader import (
     DEFAULT_PASSWORDS_DIR,
     LEGACY_CLUSTER_NAME,
+    MODE_OPTIONS,
     ClusterConfig,
     ConfigError,
     ServerConfig,
@@ -53,7 +59,7 @@ def config_error(data) -> str:
 @pytest.fixture
 def clean_password_env(monkeypatch):
     """Removes the <name>_pass variables the password tests use, so the host environment cannot leak in."""
-    for name in ("pw1", "pw2", "pw3", "snt", "ent", "nopw", "bad"):
+    for name in ("pw1", "pw2", "pw3", "snt", "ent", "ent2", "nopw", "bad"):
         monkeypatch.delenv(f"{name}_pass", raising=False)
         monkeypatch.delenv(f"{name}_sentinel_pass", raising=False)
     return monkeypatch
@@ -77,6 +83,11 @@ clusters:
     mode: cluster
     hosts: [h1:6379, h2:6379]
     tls: true
+    options:
+      read_from_replicas: true
+      require_full_coverage: false
+      reinitialize_steps: 5
+      max_connections: 32
   - name: x
     mode: sentinel
     hosts: s1:26379, s2:26379
@@ -95,7 +106,7 @@ clusters:
       socket_connect_timeout: 2.5
       health_check_interval: 1e2
       client_name: mcp
-      retry_on_timeout: true
+      socket_keepalive: true
   - name: v6
     hosts: "[::1]:6379"
 """
@@ -169,10 +180,20 @@ class TestValidConfig:
             "socket_connect_timeout": 2.5,
             "health_check_interval": 100.0,
             "client_name": "mcp",
-            "retry_on_timeout": True,
+            "socket_keepalive": True,
         }
         assert type(options["socket_timeout"]) is int
         assert type(options["socket_connect_timeout"]) is float
+
+    def test_cluster_mode_options(self, config):
+        options = config.cluster("cbprdrds").options
+        assert options == {
+            "read_from_replicas": True,
+            "require_full_coverage": False,
+            "reinitialize_steps": 5,
+            "max_connections": 32,
+        }
+        assert type(options["reinitialize_steps"]) is int
 
     def test_ipv6_host(self, config):
         c = config.cluster("v6")
@@ -361,13 +382,43 @@ class TestYamlNumberTrap:
         ],
     )
     def test_option_values(self, value, expected):
+        # the loader converts numbers but does not check the value types; redis-py does that
         options = (
-            parse_config({"clusters": [cluster(options={"opt": value})]})
+            parse_config({"clusters": [cluster(options={"socket_timeout": value})]})
             .clusters[0]
             .options
         )
-        assert options == {"opt": expected}
-        assert type(options["opt"]) is type(expected)
+        assert options == {"socket_timeout": expected}
+        assert type(options["socket_timeout"]) is type(expected)
+
+    def test_option_values_from_yaml(self, tmp_path):
+        config = load_config(
+            write(
+                tmp_path / "c.yaml",
+                """
+                clusters:
+                  - name: a
+                    hosts: h:6379
+                    options:
+                      socket_timeout: 5
+                      socket_connect_timeout: 0.5
+                      health_check_interval: 1e1
+                      max_connections: 012
+                      client_name: 0x1F
+                      socket_keepalive: true
+                """,
+            )
+        )
+        options = config.clusters[0].options
+        # 012 is decimal 12 (not YAML 1.1 octal); 0x1F is not a decimal number, so it stays text
+        assert options == {
+            "socket_timeout": 5,
+            "socket_connect_timeout": 0.5,
+            "health_check_interval": 10.0,
+            "max_connections": 12,
+            "client_name": "0x1F",
+            "socket_keepalive": True,
+        }
 
 
 class TestValidationErrors:
@@ -535,21 +586,63 @@ class TestValidationErrors:
                 "clusters[0].tls.certReqs",
                 "Input should be 'required', 'optional' or 'none'",
             ),
-            # forbidden options
+            # hosts with credentials or a scheme (the entry is not echoed)
+            (
+                {"clusters": [cluster(hosts="user:pw@h:6379")]},
+                "clusters[0].hosts",
+                "hosts takes host:port entries without a scheme or credentials (user:password@);"
+                " passwords come from the passwords directory",
+            ),
+            (
+                {"clusters": [cluster(hosts="redis://h:6379")]},
+                "clusters[0].hosts",
+                "hosts takes host:port entries without a scheme or credentials",
+            ),
+            # options outside the mode's allowlist
             (
                 {"clusters": [cluster(options={"password": "x"})]},
-                "clusters[0].options",
-                "password cannot be set in options",
+                "clusters[0]",
+                "options password not supported in standalone mode (supported: ",
             ),
             (
                 {"clusters": [cluster(options={"decode_responses": False})]},
-                "clusters[0].options",
-                "decode_responses cannot be set in options",
+                "clusters[0]",
+                "options decode_responses not supported in standalone mode",
             ),
             (
-                {"clusters": [cluster(options={"credential_provider": "x"})]},
+                {
+                    "clusters": [
+                        cluster(),
+                        cluster(name="b", mode="cluster", options={"retry": "x"}),
+                    ]
+                },
+                "clusters[1]",
+                "options retry not supported in cluster mode",
+            ),
+            (
+                {"clusters": [cluster(options=["socket_timeout"])]},
                 "clusters[0].options",
-                "credential_provider cannot be set in options",
+                "Input should be a valid dictionary",
+            ),
+            # tls
+            (
+                {"clusters": [cluster(mode="cluster", tls={"caPath": "/ca"})]},
+                "clusters[0]",
+                "tls.caPath is not supported in cluster mode; use caFile",
+            ),
+            # Sentinel password file clash
+            (
+                {
+                    "clusters": [
+                        cluster(
+                            name="s", mode="sentinel", hosts="s:26379", masterName="m"
+                        ),
+                        cluster(name="s_sentinel"),
+                    ]
+                },
+                "clusters",
+                "cluster name s_sentinel clashes with the Sentinel password of cluster s"
+                " (s_sentinel_pass); rename one of them",
             ),
             # modules
             (
@@ -667,6 +760,461 @@ class TestValidationErrors:
         with pytest.raises(ConfigError) as exc:
             parse_config({"clusters": []})
         assert exc.value.__cause__ is not None
+
+
+def mode_cluster(mode: str, **fields):
+    """A valid cluster of the given mode."""
+    if mode == "sentinel":
+        fields = {"hosts": "s:26379", "masterName": "m", **fields}
+    return cluster(mode=mode, **fields)
+
+
+# The redis-py arguments each mode accepts in `options` (the contract of MODE_OPTIONS).
+ALLOWED_OPTIONS = {
+    "standalone": [
+        "socket_timeout",
+        "socket_connect_timeout",
+        "socket_keepalive",
+        "max_connections",
+        "client_name",
+        "protocol",
+        "health_check_interval",
+    ],
+    "sentinel": [
+        "socket_timeout",
+        "socket_connect_timeout",
+        "socket_keepalive",
+        "max_connections",
+        "client_name",
+        "protocol",
+        "health_check_interval",
+    ],
+    "cluster": [
+        "socket_timeout",
+        "socket_connect_timeout",
+        "socket_keepalive",
+        "max_connections",
+        "client_name",
+        "protocol",
+        "read_from_replicas",
+        "require_full_coverage",
+        "reinitialize_steps",
+        "dynamic_startup_nodes",
+    ],
+}
+
+# A YAML-like (text) value per allowed option, and what the loader turns it into.
+OPTION_SAMPLES = {
+    "socket_timeout": ("5", 5),
+    "socket_connect_timeout": ("2.5", 2.5),
+    "socket_keepalive": (True, True),
+    "max_connections": ("32", 32),
+    "client_name": ("mcp", "mcp"),
+    "protocol": ("3", 3),
+    "health_check_interval": ("30", 30),
+    "read_from_replicas": (True, True),
+    "require_full_coverage": (False, False),
+    "reinitialize_steps": ("5", 5),
+    "dynamic_startup_nodes": (False, False),
+}
+
+# Keys `options` must never carry, in any mode: secrets, the client's address and identity, and settings the
+# server manages itself. Also snake_case variants a user might write and an unknown key.
+REJECTED_OPTIONS = [
+    "password",
+    "credential_provider",
+    "decode_responses",
+    "url",
+    "host",
+    "port",
+    "db",
+    "username",
+    "ssl",
+    "ssl_password",
+    "ssl_ca_certs",
+    "ssl_ca_path",
+    "ssl_cert_reqs",
+    "retry",
+    "retry_on_timeout",
+    "retry_on_error",
+    "connection_pool",
+    "connection_class",
+    "startup_nodes",
+    "sentinel_kwargs",
+    "unix_socket_path",
+    "encoding",
+    "socketTimeout",
+    "SOCKET_TIMEOUT",
+    "bogus",
+]
+
+MODES = ["standalone", "sentinel", "cluster"]
+
+
+def _params(fn) -> set:
+    return set(inspect.signature(fn).parameters)
+
+
+class TestOptions:
+    """`options` is an allowlist of redis-py arguments per mode."""
+
+    def test_mode_options(self):
+        assert {mode: list(keys) for mode, keys in MODE_OPTIONS.items()} == (
+            ALLOWED_OPTIONS
+        )
+
+    @pytest.mark.parametrize(
+        "mode, key",
+        [(mode, key) for mode in MODES for key in ALLOWED_OPTIONS[mode]],
+    )
+    def test_allowed_key_is_accepted(self, mode, key):
+        value, expected = OPTION_SAMPLES[key]
+        config = parse_config({"clusters": [mode_cluster(mode, options={key: value})]})
+        assert config.clusters[0].options == {key: expected}
+
+    @pytest.mark.parametrize("mode", MODES)
+    def test_all_allowed_keys_together(self, mode):
+        options = {key: OPTION_SAMPLES[key][0] for key in ALLOWED_OPTIONS[mode]}
+        config = parse_config({"clusters": [mode_cluster(mode, options=options)]})
+        assert config.clusters[0].options == {
+            key: OPTION_SAMPLES[key][1] for key in ALLOWED_OPTIONS[mode]
+        }
+
+    @pytest.mark.parametrize("mode", MODES)
+    def test_empty_options(self, mode):
+        config = parse_config({"clusters": [mode_cluster(mode, options={})]})
+        assert config.clusters[0].options == {}
+
+    @pytest.mark.parametrize(
+        "mode, key", [(mode, key) for mode in MODES for key in REJECTED_OPTIONS]
+    )
+    def test_rejected_in_every_mode(self, mode, key):
+        error = config_error({"clusters": [mode_cluster(mode, options={key: "x"})]})
+        assert (
+            f" - clusters[0]: options {key} not supported in {mode} mode"
+            f" (supported: {', '.join(ALLOWED_OPTIONS[mode])};"
+        ) in error
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "read_from_replicas",
+            "require_full_coverage",
+            "reinitialize_steps",
+            "dynamic_startup_nodes",
+        ],
+    )
+    @pytest.mark.parametrize("mode", ["standalone", "sentinel"])
+    def test_cluster_only_keys_are_rejected_in_other_modes(self, mode, key):
+        error = config_error({"clusters": [mode_cluster(mode, options={key: True})]})
+        assert f"clusters[0]: options {key} not supported in {mode} mode" in error
+
+    def test_health_check_interval_is_rejected_in_cluster_mode(self):
+        # RedisCluster does not pass health_check_interval to its node connections
+        error = config_error(
+            {
+                "clusters": [
+                    mode_cluster("cluster", options={"health_check_interval": 5})
+                ]
+            }
+        )
+        assert (
+            "clusters[0]: options health_check_interval not supported in cluster mode"
+            in error
+        )
+
+    def test_exact_message(self):
+        error = config_error({"clusters": [cluster(options={"password": "x"})]})
+        assert error == (
+            "Invalid config:\n - clusters[0]: options password not supported in standalone mode"
+            " (supported: socket_timeout, socket_connect_timeout, socket_keepalive, max_connections,"
+            " client_name, protocol, health_check_interval; addresses, db, username and tls have their"
+            " own keys, passwords come from the passwords directory)"
+        )
+
+    def test_every_unsupported_key_is_named_in_sorted_order(self):
+        error = config_error(
+            {
+                "clusters": [
+                    cluster(
+                        options={
+                            "username": "u",
+                            "socket_timeout": "1",
+                            "password": "p",
+                            "db": "1",
+                        }
+                    )
+                ]
+            }
+        )
+        assert "clusters[0]: options db, password, username not supported" in error
+        assert error.count("not supported") == 1
+
+    def test_each_cluster_is_checked(self):
+        error = config_error(
+            {
+                "clusters": [
+                    cluster(options={"socket_timeout": "1"}),
+                    cluster(name="b", options={"password": "x"}),
+                    mode_cluster("cluster", name="c", options={"db": "0"}),
+                ]
+            }
+        )
+        assert "clusters[0]" not in error
+        assert " - clusters[1]: options password not supported in standalone" in error
+        assert " - clusters[2]: options db not supported in cluster mode" in error
+
+    def test_option_value_is_not_echoed(self):
+        secret = "TOPSECRET" + "-option"
+        options = {"password": secret, "ssl_password": secret, "url": secret}
+        with pytest.raises(ConfigError) as exc:
+            parse_config({"clusters": [cluster(options=options)]})
+        assert secret not in str(exc.value)
+
+    def test_unsupported_option_from_yaml(self, tmp_path):
+        path = write(
+            tmp_path / "c.yaml",
+            """
+            clusters:
+              - name: a
+                hosts: h:6379
+                options:
+                  socket_timeout: 5
+                  retry_on_timeout: true
+            """,
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert (
+            "clusters[0]: options retry_on_timeout not supported in standalone mode"
+            in str(exc.value)
+        )
+
+    @pytest.mark.parametrize("key", ALLOWED_OPTIONS["standalone"])
+    def test_standalone_keys_are_redis_arguments(self, key):
+        assert key in _params(Redis.__init__)
+
+    @pytest.mark.parametrize("key", ALLOWED_OPTIONS["sentinel"])
+    def test_sentinel_keys_reach_the_master_connections(self, key):
+        # Sentinel.master_for passes its kwargs to the connection pool and its (TCP) connections
+        accepted = (
+            _params(ConnectionPool.__init__)
+            | _params(Connection.__init__)
+            | _params(AbstractConnection.__init__)
+        )
+        assert key in accepted
+
+    @pytest.mark.parametrize("key", ALLOWED_OPTIONS["cluster"])
+    def test_cluster_keys_are_not_dropped_by_redis_cluster(self, key):
+        # RedisCluster keeps only REDIS_ALLOWED_KEYS for its node connections, plus its own arguments
+        assert key in set(REDIS_ALLOWED_KEYS) | _params(RedisCluster.__init__)
+
+
+class TestTlsCaPath:
+    """RedisCluster drops ssl_ca_path, so caPath is rejected in cluster mode."""
+
+    @pytest.mark.parametrize(
+        "tls",
+        [
+            {"caPath": "/ca"},
+            {"caPath": "/ca", "caFile": "/ca.crt"},
+            {"caPath": "/ca", "certReqs": "none"},
+        ],
+    )
+    def test_rejected_in_cluster_mode(self, tls):
+        error = config_error({"clusters": [mode_cluster("cluster", tls=tls)]})
+        assert (
+            " - clusters[0]: tls.caPath is not supported in cluster mode; use caFile"
+            in error
+        )
+
+    def test_rejected_in_cluster_mode_from_yaml(self, tmp_path):
+        path = write(
+            tmp_path / "c.yaml",
+            """
+            clusters:
+              - name: a
+                hosts: h:6379
+              - name: b
+                mode: cluster
+                hosts: [n1:7000, n2:7001]
+                tls:
+                  caPath: /etc/redis-mcp/tls
+            """,
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert "clusters[1]: tls.caPath is not supported in cluster mode" in str(
+            exc.value
+        )
+
+    @pytest.mark.parametrize("mode", ["standalone", "sentinel"])
+    def test_accepted_in_other_modes(self, mode):
+        c = parse_config(
+            {"clusters": [mode_cluster(mode, tls={"caPath": "/ca"})]}
+        ).clusters[0]
+        assert c.tls.client_kwargs()["ssl_ca_path"] == "/ca"
+
+    def test_ca_file_is_accepted_in_cluster_mode(self):
+        c = parse_config(
+            {"clusters": [mode_cluster("cluster", tls={"caFile": "/ca.crt"})]}
+        ).clusters[0]
+        assert c.tls.client_kwargs()["ssl_ca_certs"] == "/ca.crt"
+
+    def test_tls_true_is_accepted_in_cluster_mode(self):
+        c = parse_config({"clusters": [mode_cluster("cluster", tls=True)]}).clusters[0]
+        assert c.tls == TlsConfig()
+
+
+class TestHostsWithCredentials:
+    """hosts takes plain host:port entries; an entry with credentials or a scheme is rejected without being
+    echoed, since it may hold a password."""
+
+    SECRET = "TOPSECRET" + "pw"
+
+    @pytest.mark.parametrize(
+        "hosts",
+        [
+            "user:{s}@h:6379",
+            ":{s}@h:6379",
+            "{s}@h:6379",
+            "user:{s}@[::1]:6379",
+            "redis://h:6379",
+            "rediss://user:{s}@h:6379",
+            "redis://:{s}@h:6379/0",
+            "unix:///tmp/{s}.sock",
+            "h:1,user:{s}@h:2",
+            "h:1, redis://user:{s}@h:2",
+        ],
+    )
+    def test_parse_hosts_rejects_without_echo(self, hosts):
+        hosts = hosts.format(s=self.SECRET)
+        with pytest.raises(ValueError) as exc:
+            parse_hosts(hosts)
+        message = str(exc.value)
+        assert message == (
+            "hosts takes host:port entries without a scheme or credentials (user:password@);"
+            " passwords come from the passwords directory"
+        )
+        assert self.SECRET not in message
+
+    @pytest.mark.parametrize("mode", MODES)
+    def test_config_error_does_not_echo_the_password(self, mode):
+        hosts = f"user:{self.SECRET}@h:6379"
+        error = config_error({"clusters": [mode_cluster(mode, hosts=hosts)]})
+        assert " - clusters[0].hosts: hosts takes host:port entries" in error
+        assert self.SECRET not in error
+
+    def test_hosts_list_entry(self):
+        hosts = ["n1:7000", f"user:{self.SECRET}@n2:7001"]
+        error = config_error({"clusters": [mode_cluster("cluster", hosts=hosts)]})
+        assert " - clusters[0].hosts: hosts takes host:port entries" in error
+        assert self.SECRET not in error
+
+    def test_from_yaml(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        path.write_text(
+            "clusters:\n  - name: a\n    hosts: redis://default:"
+            + self.SECRET
+            + "@h:6379\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert "clusters[0].hosts: hosts takes host:port entries" in str(exc.value)
+        assert self.SECRET not in str(exc.value)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="bug: parse_hosts checks each comma-separated item for '@', so a password containing a comma "
+        "splits into an item without '@' that is echoed (\"'user:pa' is not host:port\")",
+    )
+    def test_password_with_a_comma_is_not_echoed(self):
+        hosts = "user:TOP,SECRET@h:6379"
+        error = config_error({"clusters": [cluster(hosts=hosts)]})
+        assert "hosts takes host:port entries without a scheme or credentials" in error
+        assert "TOP" not in error
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="bug: the ConfigError is chained to pydantic's ValidationError, whose text includes "
+        "input_value='user:<password>@h:6379', so a traceback of the error prints the password",
+    )
+    def test_traceback_does_not_show_the_password(self):
+        hosts = f"user:{self.SECRET}@h:6379"
+        data = {"clusters": [cluster(hosts=hosts)]}
+        with pytest.raises(ConfigError) as exc:
+            parse_config(data)
+        assert self.SECRET not in "".join(traceback.format_exception(exc.value))
+
+
+class TestSentinelPasswordClash:
+    """<name>_sentinel_pass is both the Sentinel password of a sentinel cluster <name> and the password of a
+    cluster named <name>_sentinel."""
+
+    MESSAGE = (
+        " - clusters: cluster name s_sentinel clashes with the Sentinel password of cluster s"
+        " (s_sentinel_pass); rename one of them"
+    )
+
+    @pytest.mark.parametrize("other_mode", MODES)
+    def test_clash_with_any_mode(self, other_mode):
+        error = config_error(
+            {
+                "clusters": [
+                    mode_cluster("sentinel", name="s"),
+                    mode_cluster(other_mode, name="s_sentinel"),
+                ]
+            }
+        )
+        assert self.MESSAGE in error
+
+    def test_clash_in_either_order(self):
+        error = config_error(
+            {
+                "clusters": [
+                    cluster(name="s_sentinel"),
+                    cluster(name="other", hosts="h:2"),
+                    mode_cluster("sentinel", name="s"),
+                ]
+            }
+        )
+        assert self.MESSAGE in error
+
+    @pytest.mark.parametrize("mode", ["standalone", "cluster"])
+    def test_no_clash_without_sentinel_mode(self, mode):
+        # only a sentinel cluster reads <name>_sentinel_pass
+        config = parse_config(
+            {"clusters": [mode_cluster(mode, name="s"), cluster(name="s_sentinel")]}
+        )
+        assert config.cluster_names() == ["s", "s_sentinel"]
+
+    @pytest.mark.parametrize(
+        "other", ["s_sentinel2", "s-sentinel", "s_sentinel_pass", "xs_sentinel"]
+    )
+    def test_similar_names_do_not_clash(self, other):
+        config = parse_config(
+            {"clusters": [mode_cluster("sentinel", name="s"), cluster(name=other)]}
+        )
+        assert config.cluster_names() == ["s", other]
+
+    def test_clash_from_a_drop_in(self, tmp_path):
+        main = write(
+            tmp_path / "main.yaml",
+            """
+            clusters:
+              - name: s
+                mode: sentinel
+                hosts: s1:26379
+                masterName: mymaster
+            """,
+        )
+        conf_d = tmp_path / "conf.d"
+        conf_d.mkdir()
+        write(conf_d / "10-new.yaml", "clusters: [{name: s_sentinel, hosts: 'h:1'}]\n")
+        with pytest.raises(ConfigError) as exc:
+            load_config(main, conf_d)
+        assert self.MESSAGE in str(exc.value)
 
 
 class TestApiKeyError:
@@ -984,14 +1532,44 @@ class TestDropIns:
         assert config.cluster("b").hosts == "n9:7009"
 
     def test_drop_ins_merge_over_each_other(self, main_file, conf_d):
-        write(conf_d / "10-a.yaml", "clusters: [{name: a, options: {x: 1}}]\n")
-        write(conf_d / "20-a.yaml", "clusters: [{name: a, options: {y: 2}}]\n")
+        write(
+            conf_d / "10-a.yaml",
+            "clusters: [{name: a, options: {client_name: mcp, socket_timeout: 7}}]\n",
+        )
+        write(
+            conf_d / "20-a.yaml",
+            "clusters: [{name: a, options: {health_check_interval: 2, socket_timeout: 8}}]\n",
+        )
         config = load_config(main_file, conf_d)
         assert config.cluster("a").options == {
-            "socket_timeout": 5,
+            "socket_timeout": 8,
             "socket_connect_timeout": 3,
-            "x": 1,
-            "y": 2,
+            "client_name": "mcp",
+            "health_check_interval": 2,
+        }
+
+    def test_options_are_checked_after_the_merge(self, main_file, conf_d):
+        # b is a Redis Cluster, where health_check_interval would be dropped by redis-py
+        write(
+            conf_d / "10-b.yaml",
+            "clusters: [{name: b, options: {health_check_interval: 2}}]\n",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(main_file, conf_d)
+        assert (
+            "clusters[1]: options health_check_interval not supported in cluster mode"
+            in str(exc.value)
+        )
+
+    def test_cluster_options_from_drop_in(self, main_file, conf_d):
+        write(
+            conf_d / "10-b.yaml",
+            "clusters: [{name: b, options: {read_from_replicas: true, reinitialize_steps: 3}}]\n",
+        )
+        config = load_config(main_file, conf_d)
+        assert config.cluster("b").options == {
+            "read_from_replicas": True,
+            "reinitialize_steps": 3,
         }
 
     def test_empty_drop_in_changes_nothing(self, main_file, conf_d):
@@ -1115,16 +1693,63 @@ class TestFileErrors:
             load_config(main, conf_d)
         assert str(exc.value) == f"Config file must be a YAML map: {bad}"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: _read only catches OSError/YAMLError, so a non-UTF-8 config file raises "
-        "UnicodeDecodeError instead of ConfigError (main() then dies with a traceback)",
-    )
     def test_invalid_utf8(self, tmp_path):
         path = tmp_path / "c.yaml"
         path.write_bytes(b"apiKey: \xff\xfe\n")
-        with pytest.raises(ConfigError, match="config file"):
+        with pytest.raises(ConfigError) as exc:
             load_config(path)
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte at position 8)"
+        )
+        assert isinstance(exc.value.__cause__, UnicodeDecodeError)
+
+    def test_latin1_config_file(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        path.write_bytes(
+            "clusters: [{name: a, hosts: 'h:1', username: café}]\n".encode("latin-1")
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value).startswith(
+            f"Could not read config file: {path} (not UTF-8: invalid byte at position "
+        )
+
+    def test_invalid_utf8_drop_in_names_the_file(self, tmp_path):
+        main = write(tmp_path / "main.yaml", MAIN_CONFIG)
+        conf_d = tmp_path / "conf.d"
+        conf_d.mkdir()
+        bad = conf_d / "10-bad.yaml"
+        bad.write_bytes(b"port: 1\n# \xc3\x28\n")
+        with pytest.raises(ConfigError) as exc:
+            load_config(main, conf_d)
+        assert str(exc.value).startswith(
+            f"Could not read config file: {bad} (not UTF-8"
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="bug: _read reports UnicodeDecodeError.start, which is relative to the text decoder's chunk "
+        "(8 KiB in CPython), so the position is wrong in a config file larger than that",
+    )
+    def test_invalid_utf8_position_in_a_large_file(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        head = b"# " + b"x" * 300_000 + b"\napiKey: "
+        path.write_bytes(head + b"\xff\n")
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert f"invalid byte at position {len(head)})" in str(exc.value)
+
+    def test_utf8_with_bom(self, tmp_path):
+        # editors on Windows may save UTF-8 with a byte order mark
+        path = tmp_path / "c.yaml"
+        path.write_bytes(
+            "port: 8080\nclusters: [{name: a, hosts: 'h:1', username: café}]\n".encode(
+                "utf-8-sig"
+            )
+        )
+        config = load_config(path)
+        assert config.port == 8080
+        assert config.clusters[0].username == "café"
 
 
 class TestResolvePasswords:
@@ -1230,11 +1855,71 @@ class TestResolvePasswords:
         assert [r for r in caplog.records if r.name == LOGGER_NAME] == []
 
     def test_no_warning_for_entraid(self, passwords_dir, clean_password_env, caplog):
-        config = self.config(passwords_dir, cluster(name="ent", entraid=True))
-        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        (passwords_dir / "pw1_pass").write_text("pw\n", encoding="utf-8")
+        config = self.config(
+            passwords_dir, cluster(name="ent", entraid=True), cluster(name="pw1")
+        )
+        with (
+            patch("src.common.config.is_entraid_auth_enabled", return_value=True),
+            caplog.at_level(logging.WARNING, logger=LOGGER_NAME),
+        ):
             resolve_passwords(config)
-        assert config.clusters[0].password is None
+        assert config.cluster("ent").password is None
+        assert config.cluster("pw1").password == "pw"
+        assert config.passwords_resolved is True
         assert [r for r in caplog.records if r.name == LOGGER_NAME] == []
+
+    def test_entraid_without_auth_flow_is_an_error(
+        self, passwords_dir, clean_password_env
+    ):
+        # without a flow the client would connect without any authentication
+        (passwords_dir / "pw1_pass").write_text("pw\n", encoding="utf-8")
+        config = self.config(
+            passwords_dir,
+            cluster(name="ent", entraid=True),
+            cluster(name="pw1"),
+            cluster(name="ent2", mode="cluster", entraid=True),
+        )
+        with patch("src.common.config.is_entraid_auth_enabled", return_value=False):
+            with pytest.raises(ConfigError) as exc:
+                resolve_passwords(config)
+        assert str(exc.value) == (
+            "clusters ent, ent2 set entraid: true, but no Entra ID auth flow is configured"
+            " (REDIS_ENTRAID_AUTH_FLOW or --entraid-auth-flow)"
+        )
+        assert config.passwords_resolved is False
+        assert config.cluster("pw1").password is None
+
+    def test_entraid_without_auth_flow_unpatched(
+        self, passwords_dir, clean_password_env
+    ):
+        # the real check reads ENTRAID_CFG (REDIS_ENTRAID_AUTH_FLOW / --entraid-auth-flow)
+        config = self.config(passwords_dir, cluster(name="ent", entraid=True))
+        with patch.dict("src.common.config.ENTRAID_CFG", {"auth_flow": None}):
+            with pytest.raises(
+                ConfigError, match="no Entra ID auth flow is configured"
+            ):
+                resolve_passwords(config)
+
+    def test_entraid_with_auth_flow_unpatched(self, passwords_dir, clean_password_env):
+        config = self.config(passwords_dir, cluster(name="ent", entraid=True))
+        with patch.dict(
+            "src.common.config.ENTRAID_CFG", {"auth_flow": "service_principal"}
+        ):
+            resolve_passwords(config)
+        assert config.passwords_resolved is True
+        assert config.clusters[0].password is None
+
+    def test_auth_flow_is_not_needed_without_entraid(
+        self, passwords_dir, clean_password_env
+    ):
+        config = self.config(passwords_dir, cluster(name="pw1"))
+        with patch(
+            "src.common.config.is_entraid_auth_enabled", return_value=False
+        ) as enabled:
+            resolve_passwords(config)
+        enabled.assert_not_called()
+        assert config.passwords_resolved is True
 
     def test_passwords_resolved_flag(self, passwords_dir, clean_password_env):
         config = self.config(passwords_dir, cluster(name="pw1"))
@@ -1263,16 +1948,46 @@ class TestResolvePasswords:
             f"Could not read password file {passwords_dir / 'pw1_pass'} (Permission denied)"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: _read_secret only catches OSError, so a non-UTF-8 password file raises "
-        "UnicodeDecodeError instead of ConfigError (main() then dies with a traceback)",
-    )
     def test_invalid_utf8_password_file(self, passwords_dir, clean_password_env):
-        (passwords_dir / "bad_pass").write_bytes(b"x\xff\n")
+        (passwords_dir / "bad_pass").write_bytes(b"p\xe4ss-TOPSECRET\n")
         config = self.config(passwords_dir, cluster(name="bad"))
-        with pytest.raises(ConfigError, match="Could not read password file"):
+        with pytest.raises(ConfigError) as exc:
             resolve_passwords(config)
+        assert str(exc.value) == (
+            f"Could not read password file {passwords_dir / 'bad_pass'} (not UTF-8)"
+        )
+        assert "TOPSECRET" not in str(exc.value)
+        assert isinstance(exc.value.__cause__, UnicodeDecodeError)
+
+    def test_invalid_utf8_sentinel_password_file(
+        self, passwords_dir, clean_password_env
+    ):
+        (passwords_dir / "snt_pass").write_text("redis-pw\n", encoding="utf-8")
+        (passwords_dir / "snt_sentinel_pass").write_bytes(b"\xff\xfe\n")
+        config = self.config(
+            passwords_dir,
+            cluster(name="snt", mode="sentinel", hosts="s:26379", masterName="m"),
+        )
+        with pytest.raises(ConfigError) as exc:
+            resolve_passwords(config)
+        assert str(exc.value) == (
+            f"Could not read password file {passwords_dir / 'snt_sentinel_pass'} (not UTF-8)"
+        )
+
+    def test_invalid_utf8_file_does_not_fall_back_to_env(
+        self, passwords_dir, clean_password_env
+    ):
+        clean_password_env.setenv("bad_pass", "from-env")
+        (passwords_dir / "bad_pass").write_bytes(b"\xff\n")
+        config = self.config(passwords_dir, cluster(name="bad"))
+        with pytest.raises(ConfigError, match="not UTF-8"):
+            resolve_passwords(config)
+
+    def test_non_ascii_utf8_password(self, passwords_dir, clean_password_env):
+        (passwords_dir / "pw1_pass").write_bytes("pässwörd\n".encode())
+        config = self.config(passwords_dir, cluster(name="pw1"))
+        resolve_passwords(config)
+        assert config.clusters[0].password == "pässwörd"
 
 
 class TestFromLegacy:
@@ -1376,6 +2091,24 @@ class TestFromLegacy:
         redis_config.update(ssl=True, ssl_cert_reqs="sometimes")
         with pytest.raises(ConfigError, match=r"clusters\[0\]\.tls\.certReqs"):
             from_legacy(redis_config)
+
+    def test_cluster_mode_with_ssl_ca_path_is_an_error(self, redis_config):
+        # RedisCluster would drop ssl_ca_path; failing is better than verifying against the system CAs
+        redis_config.update(cluster_mode=True, ssl=True, ssl_ca_path="/ca")
+        with pytest.raises(ConfigError, match=r"tls\.caPath is not supported"):
+            from_legacy(redis_config)
+
+    def test_cluster_mode_with_ssl_ca_certs(self, redis_config):
+        redis_config.update(cluster_mode=True, ssl=True, ssl_ca_certs="/ca.crt")
+        tls = from_legacy(redis_config).clusters[0].tls
+        assert tls.ca_file == "/ca.crt"
+
+    def test_host_with_credentials_is_rejected(self, redis_config):
+        redis_config["host"] = "user:TOPSECRET@h"
+        with pytest.raises(ConfigError) as exc:
+            from_legacy(redis_config)
+        assert "hosts takes host:port entries" in str(exc.value)
+        assert "TOPSECRET" not in str(exc.value)
 
 
 class TestGetConfig:

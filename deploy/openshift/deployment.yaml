@@ -28,6 +28,17 @@ spec:
           imagePullPolicy: Always
           command: ["/app/.venv/bin/redis-mcp-server"]
           args: ["--config", "/etc/redis-mcp/config/redis-mcp.yaml"]
+          # Recommended: the API key from a Secret instead of apiKey in the ConfigMap. Delete the apiKey line from
+          # redis-mcp.yaml (REDIS_MCP_API_KEY overrides it, but an <api-key> placeholder there still stops the pod),
+          # create the Secret and uncomment env:
+          #   REDIS_MCP_KEY=$(openssl rand -hex 32)
+          #   oc create secret generic redis-mcp-api-key --from-literal=api-key="$REDIS_MCP_KEY"
+          # env:
+          #   - name: REDIS_MCP_API_KEY
+          #     valueFrom:
+          #       secretKeyRef:
+          #         name: redis-mcp-api-key
+          #         key: api-key
           ports:
             - name: http
               containerPort: 8080

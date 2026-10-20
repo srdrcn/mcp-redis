@@ -166,17 +166,19 @@ class TestDescribe:
 
     @pytest.mark.asyncio
     async def test_auth(self, tmp_path, connections):
-        _use_config(
-            tmp_path,
-            [
-                {"name": "pw", "hosts": "a:6379"},
-                {"name": "open", "hosts": "b:6379"},
-                {"name": "entra", "hosts": "c:6379", "entraid": True},
-                # a stray password file does not turn an Entra ID cluster into a password one
-                {"name": "entra-pw", "hosts": "d:6379", "entraid": True},
-            ],
-            passwords={"pw_pass": PASSWORD, "entra-pw_pass": PASSWORD},
-        )
+        # entraid: true needs an Entra ID auth flow, or resolve_passwords refuses the config
+        with patch("src.common.config.is_entraid_auth_enabled", return_value=True):
+            _use_config(
+                tmp_path,
+                [
+                    {"name": "pw", "hosts": "a:6379"},
+                    {"name": "open", "hosts": "b:6379"},
+                    {"name": "entra", "hosts": "c:6379", "entraid": True},
+                    # a stray password file does not turn an Entra ID cluster into a password one
+                    {"name": "entra-pw", "hosts": "d:6379", "entraid": True},
+                ],
+                passwords={"pw_pass": PASSWORD, "entra-pw_pass": PASSWORD},
+            )
 
         rows = _by_name(await clusters_list(check=False))
 

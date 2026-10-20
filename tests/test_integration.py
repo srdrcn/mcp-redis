@@ -9,19 +9,43 @@ import subprocess
 import sys
 import time
 import os
+import uuid
 from pathlib import Path
 
 import pytest
+import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
+
+# What the legacy single-cluster mode describes as its only cluster, named "default".
+LEGACY_CLUSTER = "default"
+
+
+def _redis_client() -> redis.Redis:
+    """A client of the Redis the server process connects to (REDIS_HOST/REDIS_PORT, default localhost:6379)."""
+    env = _legacy_env()
+    return redis.Redis(
+        host=env["REDIS_HOST"],
+        port=int(env["REDIS_PORT"]),
+        db=int(env.get("REDIS_DB") or 0),
+        username=env.get("REDIS_USERNAME") or None,
+        password=env.get("REDIS_PWD") or None,
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=5,
+        # one attempt: where no Redis runs (Windows/macOS CI) the check must fail fast
+        retry=Retry(NoBackoff(), 0),
+    )
 
 
 def _redis_available():
     """Check if Redis is available for testing."""
     try:
-        import redis
-
-        r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-        r.ping()
-        return True
+        client = _redis_client()
+        try:
+            return client.ping()
+        finally:
+            client.close()
     except Exception:
         return False
 
@@ -411,25 +435,131 @@ class TestMCPServerIntegration:
                 )
 
     def test_legacy_mode_has_a_single_default_cluster(self, server_process):
-        """Without a config file the env/CLI settings form one cluster named 'default'."""
+        """Without a config file the env/CLI settings form one cluster named 'default'. With a single cluster
+        the cluster parameter is optional, so clients written before multi-cluster support keep working."""
         self._initialize_server(server_process)
 
-        server_process.stdin.write(
-            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}) + "\n"
-        )
-        server_process.stdin.flush()
-        response = json.loads(server_process.stdout.readline())
-        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        tools = {
+            tool["name"]: tool
+            for tool in self._request(server_process, 4, "tools/list")["tools"]
+        }
 
         get_schema = tools["get"]["inputSchema"]
-        assert get_schema["properties"]["cluster"]["enum"] == ["default"]
-        assert "cluster" in get_schema["required"]
+        cluster = get_schema["properties"]["cluster"]
+        assert {"type": "string", "enum": [LEGACY_CLUSTER]} in cluster["anyOf"]
+        assert {"type": "null"} in cluster["anyOf"]
+        assert cluster["default"] is None
+        assert (
+            cluster["description"]
+            == "Cluster name (default: the only configured cluster)"
+        )
+        assert get_schema["required"] == ["key"]
+
+        for name, tool in tools.items():
+            schema = tool["inputSchema"]
+            if "cluster" not in schema["properties"]:
+                continue
+            # optional everywhere and appended after the tool's own parameters
+            assert "cluster" not in schema.get("required", []), name
+            assert list(schema["properties"])[-1] == "cluster", name
+
+        set_schema = tools["set"]["inputSchema"]
+        assert list(set_schema["properties"]) == [
+            "key",
+            "value",
+            "expiration",
+            "cluster",
+        ]
+        assert set_schema["required"] == ["key", "value"]
 
         clusters_list_schema = tools["clusters_list"]["inputSchema"]
         assert "cluster" not in clusters_list_schema.get("required", [])
+        assert (
+            clusters_list_schema["properties"]["cluster"]["description"]
+            == "Cluster name (default: all clusters)"
+        )
 
         docs_schema = tools["search_redis_documents"]["inputSchema"]
         assert "cluster" not in docs_schema["properties"]
+
+    @pytest.fixture
+    def redis_client(self):
+        """The Redis the legacy server uses; the test is skipped when it does not answer."""
+        if not _redis_available():
+            env = _legacy_env()
+            pytest.skip(
+                f"no Redis at {env['REDIS_HOST']}:{env['REDIS_PORT']} (REDIS_HOST/REDIS_PORT)"
+            )
+        client = _redis_client()
+        yield client
+        client.close()
+
+    def test_legacy_tools_work_without_cluster_argument(
+        self, redis_client, server_process
+    ):
+        """Tool calls of single-cluster clients (no cluster argument) reach the one configured Redis."""
+        key = f"mcp:it:legacy:{uuid.uuid4().hex}"
+        self._initialize_server(server_process)
+
+        try:
+            set_result = self._call_tool(
+                server_process,
+                10,
+                "set",
+                {"key": key, "value": "legacy-value", "expiration": 300},
+            )
+            stored = redis_client.get(key)
+            ttl = redis_client.ttl(key)
+            get_result = self._call_tool(server_process, 11, "get", {"key": key})
+            named = self._call_tool(
+                server_process, 12, "get", {"key": key, "cluster": LEGACY_CLUSTER}
+            )
+            unknown = self._call_tool(
+                server_process, 13, "get", {"key": key, "cluster": "other"}
+            )
+            clusters = self._call_tool(server_process, 14, "clusters_list", {})
+        finally:
+            redis_client.delete(key)
+
+        assert not set_result.get("isError"), set_result
+        assert (
+            _text(set_result) == f"Successfully set {key} with expiration 300 seconds"
+        )
+        assert stored == "legacy-value"
+        assert 0 < ttl <= 300
+
+        assert not get_result.get("isError"), get_result
+        assert _text(get_result) == "legacy-value"
+        assert _text(named) == "legacy-value"
+        assert unknown.get("isError") is True
+
+        rows = clusters["structuredContent"]["result"]
+        assert [row["name"] for row in rows] == [LEGACY_CLUSTER]
+        assert rows[0]["status"] == "ok", rows[0]
+
+    def _request(self, server_process, request_id, method, params=None):
+        """Sends a request and returns the result of the response with its id."""
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        server_process.stdin.write(json.dumps(message) + "\n")
+        server_process.stdin.flush()
+        while True:
+            line = server_process.stdout.readline()
+            if not line:
+                pytest.fail(f"The server exited while waiting for {method}")
+            response = json.loads(line)
+            if response.get("id") == request_id:
+                assert "result" in response, response
+                return response["result"]
+
+    def _call_tool(self, server_process, request_id, name, arguments):
+        return self._request(
+            server_process,
+            request_id,
+            "tools/call",
+            {"name": name, "arguments": arguments},
+        )
 
     def _initialize_server(self, server_process):
         """Helper to initialize the MCP server."""
@@ -456,3 +586,7 @@ class TestMCPServerIntegration:
         }
         server_process.stdin.write(json.dumps(initialized_notification) + "\n")
         server_process.stdin.flush()
+
+
+def _text(result):
+    return "".join(c["text"] for c in result["content"] if c["type"] == "text")

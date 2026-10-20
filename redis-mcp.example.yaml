@@ -1,7 +1,9 @@
 # Template for redis-mcp.yaml (the redis-mcp-config ConfigMap on OpenShift). Fill in the <...> fields; never commit
 # real values. Passwords are not part of this file: see deploy/openshift/passwords.env.example.
 port: 8080
-apiKey: <api-key>                # X-Authorization value; use a long random key (openssl rand -hex 32); "" = no auth
+# X-Authorization value: a long random key (openssl rand -hex 32), or "" for no auth. Better, keep the key out of
+# this file: delete the line and set REDIS_MCP_API_KEY (on OpenShift from a Secret, see deployment.yaml).
+apiKey: <api-key>
 readOnly: true
 disableDestructive: true
 toolsets: [core, data]
@@ -10,7 +12,7 @@ passwordsDir: /etc/redis-mcp/passwords   # <name>_pass files (the redis-mcp-pass
 clusters:
   - name: cbdevrds
     mode: standalone
-    hosts: cbdevrds.example.com:6379
+    hosts: cbdevrds.example.com:6379   # host:port only: no redis:// scheme, no user:password@
     db: 0
     username: mcp-reader
   - name: cbtstrds
@@ -28,10 +30,11 @@ clusters:
     readOnly: false
     # modules: [json, search]      # lists the json/search tools for this cluster (Redis 8, Redis Stack)
     # tls:                         # or `tls: true` for TLS with the system CAs
-    #   caFile: /etc/redis-mcp/tls/ca.crt
-    # options:                     # redis-py client arguments, applied after the defaults
+    #   caFile: /etc/redis-mcp/tls/ca.crt   # caPath is not supported with mode: cluster
+    # options:                     # client tuning; the accepted keys depend on the mode (README, "Cluster options")
     #   socket_timeout: 5
-  # A primary managed by Redis Sentinel (password of the Sentinels themselves: <name>_sentinel_pass):
+  # A primary managed by Redis Sentinel. The Sentinels' own password is <name>_sentinel_pass, so no other cluster
+  # may be named cbuatrds_sentinel:
   # - name: cbuatrds
   #   mode: sentinel
   #   hosts: [cbuatrds-s1.example.com:26379, cbuatrds-s2.example.com:26379, cbuatrds-s3.example.com:26379]

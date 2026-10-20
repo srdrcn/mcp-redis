@@ -4,6 +4,7 @@ Unit tests for src/main.py
 
 import logging
 import textwrap
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -19,10 +20,26 @@ from src.common.config_loader import (
     resolve_passwords,
     set_config,
 )
-from src.main import RedisMCPServer, cli, main
+from src.main import RedisMCPServer, apply_api_key, cli, main
+
+CONFIG_API_KEY = "0123456789abcdef0123456789abcdef"
+# what --api-key / REDIS_MCP_API_KEY set (e.g. from a Secret), different from the config's apiKey
+OVERRIDE_API_KEY = "fedcba9876543210fedcba9876543210"
+
+# values api_key_error refuses: blank, padded (could never match a trimmed header) and template placeholders
+INVALID_API_KEYS = [
+    ("   ", "blank"),
+    (" padded-key-0123456789 ", "whitespace"),
+    ("<api-key-here>", "placeholder"),
+    ("${REDIS_MCP_API_KEY}", "placeholder"),
+]
+
+# --url values that do not count as a URL (gemini-cli passes "${REDIS_URL}" verbatim when it is not set)
+PLACEHOLDER_URLS = ["", "   ", "${REDIS_URL}", " ${REDIS_URL} "]
+PLACEHOLDER_URL_IDS = ["empty", "blank", "placeholder", "padded-placeholder"]
 
 CONFIG_YAML = """
-apiKey: 0123456789abcdef0123456789abcdef
+apiKey: {api_key}
 readOnly: true
 toolsets: [core, data]
 passwordsDir: {passwords_dir}
@@ -44,8 +61,12 @@ def write(path: Path, text: str) -> Path:
     return path
 
 
-def write_config(tmp_path: Path, extra: str = "") -> Path:
-    text = CONFIG_YAML.format(passwords_dir=tmp_path) + textwrap.dedent(extra)
+def write_config(
+    tmp_path: Path, extra: str = "", api_key: str = CONFIG_API_KEY
+) -> Path:
+    text = CONFIG_YAML.format(
+        passwords_dir=tmp_path, api_key=api_key
+    ) + textwrap.dedent(extra)
     return write(tmp_path / "redis-mcp.yaml", text)
 
 
@@ -56,6 +77,19 @@ def make_config(tmp_path: Path, **root) -> ServerConfig:
     }
     data.update(root)
     return parse_config(data)
+
+
+@contextmanager
+def legacy_settings():
+    """REDIS_CFG as the CLI writes it (src.common.config) and reads it (src.main), restored afterwards.
+    tests/test_config.py reloads src.common.config, after which src.main still holds the old dict."""
+    import src.common.config as config_module
+
+    with (
+        patch.dict(config_module.REDIS_CFG),
+        patch("src.main.REDIS_CFG", config_module.REDIS_CFG),
+    ):
+        yield config_module.REDIS_CFG
 
 
 @pytest.fixture(autouse=True)
@@ -79,9 +113,10 @@ def preserve_logging():
 
 @pytest.fixture(autouse=True)
 def no_config_env(monkeypatch):
-    """The host environment must not select a config file for these tests."""
+    """The host environment must not select a config file or an API key for these tests."""
     monkeypatch.delenv("REDIS_MCP_CONFIG", raising=False)
     monkeypatch.delenv("REDIS_MCP_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("REDIS_MCP_API_KEY", raising=False)
 
 
 @pytest.fixture
@@ -459,6 +494,8 @@ class TestCLI:
         assert "--config-dir" in result.output
         assert "--transport" in result.output
         assert "--http-port" in result.output
+        assert "--api-key" in result.output
+        assert "REDIS_MCP_API_KEY" in result.output
 
     @patch("src.main.set_redis_config_from_cli")
     @patch("src.main.RedisMCPServer")
@@ -510,6 +547,52 @@ class TestCLI:
         assert call_args["host"] == "uri-host"
         assert call_args["port"] == 9999
 
+    @patch("src.main.RedisMCPServer")
+    def test_cli_cluster_mode_with_ca_path_is_refused(self, mock_server_class):
+        """RedisCluster ignores ssl_ca_path, so the nodes would be verified against the system CAs instead."""
+        with legacy_settings():
+            result = self.runner.invoke(
+                cli, ["--cluster-mode", "--ssl", "--ssl-ca-path", "/etc/ssl/certs"]
+            )
+
+        assert result.exit_code == 2
+        assert result.stderr.startswith("redis-mcp: Invalid config")
+        mock_server_class.assert_not_called()
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="src bug: in the legacy mode the error names the YAML keys (clusters[0]: tls.caPath, caFile)"
+        " instead of --ssl-ca-path / REDIS_SSL_CA_PATH and --ssl-ca-certs, which the user actually set",
+    )
+    @patch("src.main.RedisMCPServer")
+    def test_cli_cluster_mode_ca_path_error_names_the_flag(self, mock_server_class):
+        with legacy_settings():
+            result = self.runner.invoke(
+                cli, ["--cluster-mode", "--ssl", "--ssl-ca-path", "/etc/ssl/certs"]
+            )
+
+        assert result.exit_code == 2
+        assert "--ssl-ca-path" in result.stderr
+        assert "--ssl-ca-certs" in result.stderr
+
+    @pytest.mark.parametrize("url", PLACEHOLDER_URLS, ids=PLACEHOLDER_URL_IDS)
+    @patch("src.main.parse_redis_uri")
+    @patch("src.main.set_redis_config_from_cli")
+    @patch("src.main.RedisMCPServer")
+    def test_cli_empty_or_placeholder_url_uses_individual_params(
+        self, mock_server_class, mock_set_config, mock_parse_uri, url
+    ):
+        """gemini-cli passes the raw "${REDIS_URL}" when the variable is not set."""
+        result = self.runner.invoke(
+            cli, ["--url", url, "--host", "individual-host", "--port", "6390"]
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_parse_uri.assert_not_called()
+        call_args = mock_set_config.call_args[0][0]
+        assert call_args["host"] == "individual-host"
+        assert call_args["port"] == 6390
+
     @patch("src.main.set_redis_config_from_cli")
     @patch("src.main.RedisMCPServer")
     def test_cli_legacy_mode_builds_default_cluster(
@@ -521,6 +604,7 @@ class TestCLI:
         kwargs = mock_server_class.call_args.kwargs
         assert kwargs["config"].cluster_names() == ["default"]
         assert kwargs["config"].port is None
+        assert kwargs["config"].api_key is None
         assert kwargs["transport"] is None
 
 
@@ -746,6 +830,48 @@ class TestCLIConfig:
         assert result.exit_code == 2
         assert "--host, --port, --cluster-mode cannot be combined" in result.stderr
 
+    @pytest.mark.parametrize("url", PLACEHOLDER_URLS, ids=PLACEHOLDER_URL_IDS)
+    def test_empty_or_placeholder_url_is_accepted_with_config(
+        self, tmp_path, server_class, legacy_setters, url
+    ):
+        """gemini-cli passes the raw "${REDIS_URL}" when the variable is not set; that is no --url."""
+        path = write_config(tmp_path)
+
+        with patch("src.main.parse_redis_uri") as mock_parse_uri:
+            result = self.runner.invoke(cli, ["--config", str(path), "--url", url])
+
+        assert result.exit_code == 0, result.output
+        config = self.server_kwargs(server_class)["config"]
+        assert config.cluster_names() == ["cbtstrds", "cbprdrds"]
+        mock_parse_uri.assert_not_called()
+        legacy_setters.redis.assert_not_called()
+
+    def test_placeholder_url_is_not_named_next_to_a_real_flag(
+        self, tmp_path, server_class
+    ):
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(
+            cli, ["--config", str(path), "--url", "${REDIS_URL}", "--host", "h"]
+        )
+
+        assert result.exit_code == 2
+        assert "--host cannot be combined" in result.stderr
+        assert "--url" not in result.stderr
+        server_class.assert_not_called()
+
+    def test_real_url_is_rejected_without_echoing_it(self, tmp_path, server_class):
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(
+            cli, ["--config", str(path), "--url", "redis://u:url-secret@h:6379/0"]
+        )
+
+        assert result.exit_code == 2
+        assert "--url cannot be combined" in result.stderr
+        assert "url-secret" not in result.output
+        server_class.assert_not_called()
+
     def test_invalid_config_exits_2(self, tmp_path, server_class):
         path = write(tmp_path / "bad.yaml", "clusters: []\n")
 
@@ -807,6 +933,162 @@ class TestCLIConfig:
 
         assert result.exit_code == 2
         assert result.stderr == "redis-mcp: Could not read password file x\n"
+
+    def test_config_api_key_is_kept_without_override(self, tmp_path, server_class):
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(cli, ["--config", str(path)])
+
+        assert result.exit_code == 0, result.output
+        assert self.server_kwargs(server_class)["config"].api_key == CONFIG_API_KEY
+
+    def test_api_key_option_overrides_config(self, tmp_path, server_class):
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(
+            cli, ["--config", str(path), "--api-key", OVERRIDE_API_KEY]
+        )
+
+        assert result.exit_code == 0, result.output
+        config = self.server_kwargs(server_class)["config"]
+        assert config.api_key == OVERRIDE_API_KEY
+        assert config.api_key_enabled
+
+    def test_api_key_env_overrides_config(self, tmp_path, server_class):
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(
+            cli,
+            ["--config", str(path)],
+            env={"REDIS_MCP_API_KEY": OVERRIDE_API_KEY},
+        )
+
+        assert result.exit_code == 0, result.output
+        assert self.server_kwargs(server_class)["config"].api_key == OVERRIDE_API_KEY
+
+    def test_api_key_option_wins_over_env(self, tmp_path, server_class):
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(
+            cli,
+            ["--config", str(path), "--api-key", OVERRIDE_API_KEY],
+            env={"REDIS_MCP_API_KEY": "env-key-0123456789abcdef"},
+        )
+
+        assert result.exit_code == 0, result.output
+        assert self.server_kwargs(server_class)["config"].api_key == OVERRIDE_API_KEY
+
+    @pytest.mark.parametrize("api_key", ["", '""'], ids=["unset", "empty"])
+    def test_api_key_turns_on_authentication_of_a_config_without_one(
+        self, tmp_path, server_class, api_key
+    ):
+        path = write_config(tmp_path, api_key=api_key)
+
+        result = self.runner.invoke(
+            cli, ["--config", str(path)], env={"REDIS_MCP_API_KEY": OVERRIDE_API_KEY}
+        )
+
+        assert result.exit_code == 0, result.output
+        config = self.server_kwargs(server_class)["config"]
+        assert config.api_key == OVERRIDE_API_KEY
+        assert config.api_key_enabled
+
+    @pytest.mark.parametrize(
+        "args, env",
+        [(["--api-key", ""], {}), ([], {"REDIS_MCP_API_KEY": ""})],
+        ids=["option", "env"],
+    )
+    def test_empty_api_key_is_ignored(self, tmp_path, server_class, args, env):
+        """An empty value (e.g. an unset variable in a manifest) cannot switch authentication off."""
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(cli, ["--config", str(path), *args], env=env)
+
+        assert result.exit_code == 0, result.output
+        config = self.server_kwargs(server_class)["config"]
+        assert config.api_key == CONFIG_API_KEY
+        assert config.api_key_enabled
+
+    @pytest.mark.parametrize("source", ["option", "env"])
+    @pytest.mark.parametrize(
+        "api_key",
+        [v for v, _ in INVALID_API_KEYS],
+        ids=[i for _, i in INVALID_API_KEYS],
+    )
+    def test_invalid_api_key_exits_2(self, tmp_path, server_class, source, api_key):
+        path = write_config(tmp_path)
+        if source == "option":
+            args, env = ["--config", str(path), "--api-key", api_key], {}
+        else:
+            args, env = ["--config", str(path)], {"REDIS_MCP_API_KEY": api_key}
+
+        result = self.runner.invoke(cli, args, env=env)
+
+        assert result.exit_code == 2
+        assert result.stderr.startswith("redis-mcp: --api-key / REDIS_MCP_API_KEY: ")
+        assert result.stderr.count("\n") == 1
+        if api_key.strip():
+            # the error explains the problem without repeating the value
+            assert api_key.strip() not in result.output
+        server_class.assert_not_called()
+
+    def test_invalid_api_key_also_fails_in_legacy_mode(self, server_class):
+        result = self.runner.invoke(cli, ["--api-key", " key-with-spaces "])
+
+        assert result.exit_code == 2
+        assert "redis-mcp: --api-key / REDIS_MCP_API_KEY: " in result.stderr
+        assert "whitespace" in result.stderr
+        server_class.assert_not_called()
+
+    def test_api_key_is_not_a_legacy_connection_flag(self, tmp_path, server_class):
+        """--api-key goes with --config (unlike the Redis connection flags)."""
+        path = write_config(tmp_path)
+
+        result = self.runner.invoke(
+            cli,
+            [
+                "--config",
+                str(path),
+                "--api-key",
+                OVERRIDE_API_KEY,
+                "--http-port",
+                "9090",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "cannot be combined" not in result.output
+
+    def test_legacy_mode_api_key_option(self, server_class, legacy_setters):
+        result = self.runner.invoke(cli, ["--api-key", OVERRIDE_API_KEY])
+
+        assert result.exit_code == 0, result.output
+        config = self.server_kwargs(server_class)["config"]
+        assert config.cluster_names() == ["default"]
+        assert config.api_key == OVERRIDE_API_KEY
+        legacy_setters.redis.assert_called_once()
+
+    def test_legacy_mode_transport_http_with_api_key_env(self, server_class):
+        result = self.runner.invoke(
+            cli,
+            ["--transport", "http"],
+            env={"REDIS_MCP_API_KEY": OVERRIDE_API_KEY},
+        )
+
+        assert result.exit_code == 0, result.output
+        kwargs = self.server_kwargs(server_class)
+        assert kwargs["transport"] == "http"
+        assert kwargs["config"].port == 8080
+        assert kwargs["config"].cluster_names() == ["default"]
+        assert kwargs["config"].api_key == OVERRIDE_API_KEY
+
+    def test_legacy_mode_without_api_key_has_none(self, server_class):
+        result = self.runner.invoke(cli, ["--transport", "http"])
+
+        assert result.exit_code == 0, result.output
+        config = self.server_kwargs(server_class)["config"]
+        assert config.api_key is None
+        assert not config.api_key_enabled
 
     def test_http_port_sets_port(self, tmp_path, server_class):
         path = write_config(tmp_path)
@@ -988,18 +1270,96 @@ class TestMain:
         assert config.cluster_names() == ["cbtstrds", "cbprdrds", "more"]
 
     def test_without_env_uses_legacy(self, server_class):
-        main()
+        with patch.dict(
+            "src.common.config.REDIS_CFG",
+            {"host": "legacy-host", "port": 6390, "password": "legacy-pw"},
+        ):
+            main()
 
-        server_class.assert_called_once_with(config=None)
+        server_class.assert_called_once()
+        assert set(server_class.call_args.kwargs) == {"config"}
+        config = server_class.call_args.kwargs["config"]
+        # the config get_config() builds from the REDIS_* settings, which also becomes the active one
+        assert config is get_config()
+        assert config.cluster_names() == ["default"]
+        assert config.cluster("default").hosts == "legacy-host:6390"
+        assert config.cluster("default").password == "legacy-pw"
+        assert config.passwords_resolved
+        assert config.api_key is None
         server_class.return_value.run.assert_called_once_with()
+
+    def test_legacy_config_comes_from_get_config(self, tmp_path, server_class):
+        legacy = make_config(tmp_path)
+
+        with patch("src.main.get_config", return_value=legacy) as mock_get_config:
+            main()
+
+        mock_get_config.assert_called_once_with()
+        server_class.assert_called_once_with(config=legacy)
 
     def test_empty_env_is_ignored(self, monkeypatch, server_class):
         monkeypatch.setenv("REDIS_MCP_CONFIG", "")
         monkeypatch.setenv("REDIS_MCP_CONFIG_DIR", "")
+        monkeypatch.setenv("REDIS_MCP_API_KEY", "")
 
         main()
 
-        server_class.assert_called_once_with(config=None)
+        config = server_class.call_args.kwargs["config"]
+        assert config.cluster_names() == ["default"]
+        assert config.api_key is None
+
+    def test_api_key_env_in_legacy_mode(self, monkeypatch, server_class):
+        monkeypatch.setenv("REDIS_MCP_API_KEY", OVERRIDE_API_KEY)
+
+        main()
+
+        config = server_class.call_args.kwargs["config"]
+        assert config.cluster_names() == ["default"]
+        assert config.api_key == OVERRIDE_API_KEY
+        server_class.return_value.run.assert_called_once_with()
+
+    def test_api_key_env_overrides_config(self, tmp_path, monkeypatch, server_class):
+        monkeypatch.setenv("REDIS_MCP_CONFIG", str(write_config(tmp_path)))
+        monkeypatch.setenv("REDIS_MCP_API_KEY", OVERRIDE_API_KEY)
+
+        main()
+
+        config = server_class.call_args.kwargs["config"]
+        assert config.cluster_names() == ["cbtstrds", "cbprdrds"]
+        assert config.api_key == OVERRIDE_API_KEY
+
+    def test_empty_api_key_env_keeps_config_key(
+        self, tmp_path, monkeypatch, server_class
+    ):
+        monkeypatch.setenv("REDIS_MCP_CONFIG", str(write_config(tmp_path)))
+        monkeypatch.setenv("REDIS_MCP_API_KEY", "")
+
+        main()
+
+        assert server_class.call_args.kwargs["config"].api_key == CONFIG_API_KEY
+
+    @pytest.mark.parametrize("config_file", [False, True], ids=["legacy", "config"])
+    @pytest.mark.parametrize(
+        "api_key",
+        [v for v, _ in INVALID_API_KEYS],
+        ids=[i for _, i in INVALID_API_KEYS],
+    )
+    def test_invalid_api_key_env_exits_2(
+        self, tmp_path, monkeypatch, capsys, server_class, config_file, api_key
+    ):
+        if config_file:
+            monkeypatch.setenv("REDIS_MCP_CONFIG", str(write_config(tmp_path)))
+        monkeypatch.setenv("REDIS_MCP_API_KEY", api_key)
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert err.startswith("redis-mcp: --api-key / REDIS_MCP_API_KEY: ")
+        if api_key.strip():
+            assert api_key.strip() not in err
+        server_class.assert_not_called()
 
     def test_invalid_config_exits_2(self, tmp_path, monkeypatch, capsys, server_class):
         path = write(tmp_path / "bad.yaml", "clusters: []\n")
@@ -1020,3 +1380,77 @@ class TestMain:
 
         assert exc.value.code == 2
         assert "redis-mcp: Unknown toolset" in capsys.readouterr().err
+
+
+class TestApplyApiKey:
+    """apply_api_key(): --api-key / REDIS_MCP_API_KEY over the config's apiKey."""
+
+    @pytest.mark.parametrize("value", [None, ""], ids=["none", "empty"])
+    def test_no_value_changes_nothing(self, tmp_path, value):
+        config = make_config(tmp_path, apiKey=CONFIG_API_KEY)
+
+        apply_api_key(config, value)
+
+        assert config.api_key == CONFIG_API_KEY
+
+    @pytest.mark.parametrize("value", [None, ""], ids=["none", "empty"])
+    def test_no_value_keeps_authentication_off(self, tmp_path, value):
+        config = make_config(tmp_path)
+
+        apply_api_key(config, value)
+
+        assert config.api_key is None
+        assert not config.api_key_enabled
+
+    def test_value_overrides_config_key(self, tmp_path):
+        config = make_config(tmp_path, apiKey=CONFIG_API_KEY)
+
+        apply_api_key(config, OVERRIDE_API_KEY)
+
+        assert config.api_key == OVERRIDE_API_KEY
+        assert config.api_key_enabled
+
+    def test_value_turns_authentication_on(self, tmp_path):
+        config = make_config(tmp_path, apiKey="")
+
+        apply_api_key(config, OVERRIDE_API_KEY)
+
+        assert config.api_key == OVERRIDE_API_KEY
+
+    def test_legacy_config(self):
+        config = from_legacy({"host": "h", "port": 6379})
+
+        apply_api_key(config, OVERRIDE_API_KEY)
+
+        assert config.api_key == OVERRIDE_API_KEY
+
+    def test_short_key_is_accepted(self, tmp_path):
+        """Like apiKey: a short key only produces a warning when the HTTP server starts."""
+        config = make_config(tmp_path)
+
+        apply_api_key(config, "short")
+
+        assert config.api_key == "short"
+
+    @pytest.mark.parametrize(
+        "value, problem",
+        [
+            ("   ", "blank"),
+            (" padded-key-0123456789", "whitespace"),
+            ("padded-key-0123456789\n", "whitespace"),
+            ("<api-key-here>", "placeholder"),
+            ("${REDIS_MCP_API_KEY}", "placeholder"),
+        ],
+    )
+    def test_invalid_value_raises_and_keeps_config_key(self, tmp_path, value, problem):
+        config = make_config(tmp_path, apiKey=CONFIG_API_KEY)
+
+        with pytest.raises(ConfigError) as exc:
+            apply_api_key(config, value)
+
+        message = str(exc.value)
+        assert message.startswith("--api-key / REDIS_MCP_API_KEY: ")
+        assert problem in message
+        if value.strip():
+            assert value.strip() not in message
+        assert config.api_key == CONFIG_API_KEY

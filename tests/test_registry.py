@@ -3,9 +3,12 @@ Unit tests for src/common/registry.py
 """
 
 import asyncio
+import contextvars
+import inspect
 import json
 import logging
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -20,7 +23,11 @@ from src.common.config_loader import (
     parse_config,
     set_config,
 )
-from src.common.connection import SOCKET_TIMEOUT_SECONDS, current_cluster
+from src.common.connection import (
+    SOCKET_TIMEOUT_SECONDS,
+    ClusterSelectionError,
+    current_cluster,
+)
 from src.common.registry import (
     TOOLSETS,
     ToolKind,
@@ -73,6 +80,13 @@ DESTRUCTIVE_TOOLS = {
 }
 NO_CLUSTER_TOOLS = {"search_redis_documents", "read_messages", "unsubscribe"}
 REAL_TOOL_COUNT = 54
+ONLY_CLUSTER_DESCRIPTION = "Cluster name (default: the only configured cluster)"
+ALL_CLUSTERS_DESCRIPTION = "Cluster name (default: all clusters)"
+
+# set by a caller; a tool call must see it in its worker thread
+_REQUEST_ID: contextvars.ContextVar = contextvars.ContextVar(
+    "test_request_id", default=None
+)
 
 
 def _config(**root) -> ServerConfig:
@@ -128,17 +142,67 @@ def _tool_call_records(caplog):
     ]
 
 
-async def _listed(spec: ToolSpec, clusters):
-    """The tool as an MCP client sees it after FastMCP registered ``wrap(spec, clusters)``."""
+def _timeout_message(seconds) -> str:
+    return (
+        f"Tool did not finish within {seconds} s (timeout). The cluster may be slow or unreachable"
+        " (check clusters_list), or the request too large (narrow the pattern or count)."
+    )
+
+
+def _blocking(release: threading.Event, result="released"):
+    """A synthetic tool that waits for ``release``; its ``started`` event is set once it runs."""
+    started = threading.Event()
+
+    def blocked():
+        started.set()
+        release.wait(10)
+        return result
+
+    blocked.started = started
+    return blocked
+
+
+async def _wait(event: threading.Event, timeout: float = 5) -> bool:
+    """Waits for a threading.Event without blocking the event loop."""
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.005)
+    return True
+
+
+async def _listed(spec: ToolSpec, clusters, single_cluster: bool = False):
+    """The tool as an MCP client sees it after FastMCP registered ``wrap(spec, clusters, single_cluster)``."""
     server = FastMCP("test")
     server.add_tool(
-        wrap(spec, clusters),
+        wrap(spec, clusters, single_cluster),
         name=spec.name,
         description=spec.description,
         annotations=annotations(spec),
     )
     (tool,) = await server.list_tools()
     return tool
+
+
+@pytest.fixture(autouse=True)
+def fresh_executors(monkeypatch):
+    """No worker pool is shared between tests: a monkeypatched MAX_CONCURRENT_CALLS_PER_CLUSTER applies to the
+    pools a test creates, and a worker an earlier test left busy is never reused. The pools are shut down
+    afterwards (after the ``release`` fixture let blocked tools return)."""
+    executors = {}
+    monkeypatch.setattr(registry, "_executors", executors)
+    yield executors
+    for executor in executors.values():
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.fixture
+def release():
+    """Lets the tools of :func:`_blocking` return; always set in teardown, so no worker stays blocked."""
+    event = threading.Event()
+    yield event
+    event.set()
 
 
 @pytest.fixture
@@ -608,6 +672,7 @@ class TestWrap:
         assert schema["required"] == ["key"]
         cluster = schema["properties"]["cluster"]
         assert cluster["default"] is None
+        assert cluster["description"] == ALL_CLUSTERS_DESCRIPTION
         assert {"type": "string", "enum": ["a", "b"]} in cluster["anyOf"]
         assert {"type": "null"} in cluster["anyOf"]
 
@@ -627,6 +692,83 @@ class TestWrap:
 
         assert list(schema["properties"]) == ["key", "count"]
         assert schema["required"] == ["key"]
+
+    def test_single_cluster_is_off_by_default(self):
+        assert inspect.signature(wrap).parameters["single_cluster"].default is False
+
+        signature = inspect.signature(wrap(self._tool_spec(), ["only"]))
+
+        assert list(signature.parameters) == ["cluster", "key", "count"]
+        assert signature.parameters["cluster"].default is inspect.Parameter.empty
+
+    @pytest.mark.asyncio
+    async def test_single_cluster_makes_the_cluster_optional_and_last(self):
+        # calls written before multi-cluster support (no cluster argument) keep working
+        tool = await _listed(self._tool_spec(), ["only"], single_cluster=True)
+        schema = tool.inputSchema
+
+        assert list(schema["properties"]) == ["key", "count", "cluster"]
+        assert schema["required"] == ["key"]
+        cluster = schema["properties"]["cluster"]
+        assert cluster["default"] is None
+        assert cluster["description"] == ONLY_CLUSTER_DESCRIPTION
+        assert {"type": "string", "enum": ["only"]} in cluster["anyOf"]
+        assert {"type": "null"} in cluster["anyOf"]
+        assert "const" not in json.dumps(schema)
+
+    @pytest.mark.asyncio
+    async def test_single_cluster_keeps_the_optional_cluster_description(self):
+        tool = await _listed(
+            self._tool_spec(cluster="optional"), ["only"], single_cluster=True
+        )
+        schema = tool.inputSchema
+
+        assert list(schema["properties"]) == ["key", "count", "cluster"]
+        assert schema["required"] == ["key"]
+        assert schema["properties"]["cluster"]["description"] == (
+            ALL_CLUSTERS_DESCRIPTION
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_cluster_adds_nothing_to_clusterless_tools(self):
+        tool = await _listed(self._tool_spec(cluster="none"), [], single_cluster=True)
+
+        assert list(tool.inputSchema["properties"]) == ["key", "count"]
+
+    @pytest.mark.parametrize("kind", list(ToolKind))
+    @pytest.mark.asyncio
+    async def test_single_cluster_for_every_kind(self, kind):
+        tool = await _listed(self._tool_spec(kind=kind), ["only"], single_cluster=True)
+
+        assert "cluster" not in tool.inputSchema["required"]
+        assert tool.annotations == annotations(self._tool_spec(kind=kind))
+
+    @pytest.mark.asyncio
+    async def test_single_cluster_call_without_cluster_passes_none(self):
+        spec = self._tool_spec()
+        server = FastMCP("test")
+        server.add_tool(wrap(spec, ["only"], single_cluster=True), name=spec.name)
+
+        with patch("src.common.registry.call", return_value="done") as mock_call:
+            await server.call_tool("lookup", {"key": "k"})
+            await server.call_tool("lookup", {"key": "k", "cluster": "only"})
+
+        assert [c.args for c in mock_call.call_args_list] == [
+            (spec, None, {"key": "k", "count": 10}),
+            (spec, "only", {"key": "k", "count": 10}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_single_cluster_still_rejects_other_names(self):
+        spec = self._tool_spec()
+        server = FastMCP("test")
+        server.add_tool(wrap(spec, ["only"], single_cluster=True), name=spec.name)
+
+        with patch("src.common.registry.call", return_value="done") as mock_call:
+            with pytest.raises(ToolError, match="cluster"):
+                await server.call_tool("lookup", {"key": "k", "cluster": "other"})
+
+        mock_call.assert_not_called()
 
     @pytest.mark.parametrize(
         "kind, read_only, destructive",
@@ -703,6 +845,48 @@ class TestCall:
 
         assert await call(_spec(probe, cluster="none"), None, {}) is None
 
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.asyncio
+    async def test_caller_context_is_visible_in_the_worker(self, asynchronous):
+        def probe():
+            return _REQUEST_ID.get(), current_cluster.get(), threading.get_ident()
+
+        async def async_probe():
+            return probe()
+
+        token = _REQUEST_ID.set("request-1")
+        try:
+            request_id, cluster, thread = await call(
+                _spec(async_probe if asynchronous else probe), "a", {}
+            )
+        finally:
+            _REQUEST_ID.reset(token)
+
+        assert (request_id, cluster) == ("request-1", "a")
+        assert thread != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_worker_changes_do_not_leak(self, monkeypatch):
+        # one worker, so both calls run on the same thread; each runs in its own copy of the caller's context
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", 1)
+
+        def first():
+            _REQUEST_ID.set("set by the first call")
+            current_cluster.set("changed")
+            return threading.get_ident()
+
+        def second():
+            return threading.get_ident(), _REQUEST_ID.get(), current_cluster.get()
+
+        first_thread = await call(_spec(first), "a", {})
+        second_thread, request_id, cluster = await call(_spec(second), "a", {})
+
+        assert second_thread == first_thread
+        assert request_id is None
+        assert cluster == "a"
+        assert _REQUEST_ID.get() is None
+        assert current_cluster.get() is None
+
     @pytest.mark.asyncio
     async def test_cluster_is_reset_afterwards(self):
         def probe():
@@ -740,26 +924,20 @@ class TestCall:
         assert info.value is error
 
     @pytest.mark.asyncio
-    async def test_timeout(self, monkeypatch, caplog):
+    async def test_timeout(self, monkeypatch, caplog, release):
         monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 0.05)
-        release = threading.Event()
-        started = threading.Event()
-
-        def probe():
-            started.set()
-            release.wait(5)
-            return "late"
-
+        blocked = _blocking(release)
         caplog.set_level(logging.INFO, logger="src.common.registry")
-        try:
-            with pytest.raises(ToolError) as info:
-                await call(_spec(probe), "a", {})
-        finally:
-            release.set()
 
-        assert started.is_set()
+        with pytest.raises(ToolError) as info:
+            await call(_spec(blocked), "a", {})
+
+        assert blocked.started.is_set()
         message = str(info.value)
-        assert "did not finish within 0.05 s (timeout)" in message
+        assert message == _timeout_message(0.05)
+        # no exception chained to the ToolError (it would only show the internal TimeoutError)
+        assert info.value.__cause__ is None
+        assert info.value.__suppress_context__ is True
         assert current_cluster.get() is None
         (record,) = _tool_call_records(caplog)
         assert record.outcome == "error"
@@ -767,19 +945,35 @@ class TestCall:
         assert record.durationMs >= 40
 
     @pytest.mark.asyncio
-    async def test_async_tool_timeout(self, monkeypatch):
+    async def test_async_tool_timeout(self, monkeypatch, release):
         monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 0.05)
-        release = threading.Event()
 
         async def probe():
             while not release.is_set():
                 await asyncio.sleep(0.01)
 
-        try:
-            with pytest.raises(ToolError, match="timeout"):
-                await call(_spec(probe), "a", {})
-        finally:
-            release.set()
+        with pytest.raises(ToolError) as info:
+            await call(_spec(probe), "a", {})
+        assert str(info.value) == _timeout_message(0.05)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_call_is_logged_as_cancelled(self, caplog, release):
+        # e.g. the MCP client cancels the request or disconnects
+        blocked = _blocking(release)
+        caplog.set_level(logging.INFO, logger="src.common.registry")
+        task = asyncio.create_task(call(_spec(blocked, name="blocked"), "a", {}))
+        assert await _wait(blocked.started)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        (record,) = _tool_call_records(caplog)
+        assert (record.tool, record.cluster) == ("blocked", "a")
+        assert record.outcome == "cancelled"
+        assert record.error == "cancelled by the client"
+        assert "outcome=cancelled" in record.getMessage()
+        assert current_cluster.get() is None
 
     @pytest.mark.asyncio
     async def test_logs_one_record_for_a_successful_call(self, caplog):
@@ -824,6 +1018,183 @@ class TestCall:
 
         (record,) = _tool_call_records(caplog)
         assert record.cluster is None
+
+
+class TestWorkerPools:
+    """Tool calls run in a thread pool per cluster, so a hanging cluster ties up only its own workers."""
+
+    def test_pool_size(self):
+        assert registry.MAX_CONCURRENT_CALLS_PER_CLUSTER == 8
+
+    def test_one_pool_per_cluster(self):
+        a = registry._executor("a")
+
+        assert registry._executor("a") is a
+        assert registry._executor("b") is not a
+        assert a._max_workers == registry.MAX_CONCURRENT_CALLS_PER_CLUSTER
+
+    def test_calls_without_cluster_share_one_pool(self):
+        clusterless = registry._executor(None)
+
+        assert registry._executor(None) is clusterless
+        assert registry._executor("") is clusterless
+        assert clusterless is not registry._executor("a")
+        assert set(registry._executors) == {"", "a"}
+
+    def test_pool_size_applies_to_new_pools(self, monkeypatch):
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", 2)
+
+        assert registry._executor("a")._max_workers == 2
+
+    def test_concurrent_first_calls_create_one_pool(self):
+        barrier = threading.Barrier(16)
+        pools = []
+
+        def first_call():
+            barrier.wait(5)
+            pools.append(registry._executor("a"))
+
+        threads = [threading.Thread(target=first_call) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+
+        assert len(pools) == 16
+        assert all(pool is pools[0] for pool in pools)
+        assert list(registry._executors) == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_calls_run_in_the_pool_of_their_cluster(self):
+        def probe():
+            return threading.current_thread().name
+
+        names = {
+            cluster: await call(_spec(probe, cluster=kind), cluster, {})
+            for cluster, kind in (("a", "required"), ("b", "required"), (None, "none"))
+        }
+
+        assert names["a"].startswith("tool-a_")
+        assert names["b"].startswith("tool-b_")
+        assert names[None].startswith("tool--_")
+
+    @pytest.mark.parametrize("workers", [1, 3])
+    @pytest.mark.parametrize("other", ["b", None])
+    @pytest.mark.asyncio
+    async def test_busy_cluster_does_not_delay_other_calls(
+        self, monkeypatch, release, workers, other
+    ):
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", workers)
+        # were the call queued behind cluster a, it would fail at this limit
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 5)
+        blocked = [_blocking(release, result=i) for i in range(workers)]
+        busy = [asyncio.create_task(call(_spec(fn), "a", {})) for fn in blocked]
+        for fn in blocked:
+            assert await _wait(fn.started)
+
+        def probe():
+            return "free", current_cluster.get()
+
+        spec = _spec(probe, cluster="required" if other else "none")
+        assert await call(spec, other, {}) == ("free", other)
+
+        assert not any(task.done() for task in busy)
+        release.set()
+        assert await asyncio.gather(*busy) == list(range(workers))
+
+    @pytest.mark.asyncio
+    async def test_queued_call_times_out_without_starting(
+        self, monkeypatch, release, caplog
+    ):
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", 1)
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 5)
+        caplog.set_level(logging.INFO, logger="src.common.registry")
+        blocked = _blocking(release)
+        first = asyncio.create_task(call(_spec(blocked, name="blocked"), "a", {}))
+        assert await _wait(blocked.started)
+
+        # the first call keeps its 5 s; the queued one gets 0.2 s
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 0.2)
+        queued_ran = threading.Event()
+        with pytest.raises(ToolError) as info:
+            await call(_spec(queued_ran.set, name="queued"), "a", {})
+
+        assert str(info.value) == _timeout_message(0.2)
+        assert not queued_ran.is_set()
+        assert not first.done()
+
+        release.set()
+        assert await first == "released"
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 5)
+        # the single worker takes queued calls in order: once this one ran, the timed-out one was dropped
+        assert await call(_spec(lambda: "next", name="next"), "a", {}) == "next"
+        assert not queued_ran.is_set()
+        records = {r.tool: r for r in _tool_call_records(caplog)}
+        assert set(records) == {"blocked", "queued", "next"}
+        assert records["blocked"].outcome == "ok"
+        assert records["queued"].outcome == "error"
+        assert records["queued"].error == _timeout_message(0.2)
+        assert records["queued"].durationMs >= 150
+        assert records["next"].outcome == "ok"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_queued_call_never_starts(
+        self, monkeypatch, release, caplog
+    ):
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", 1)
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 5)
+        caplog.set_level(logging.INFO, logger="src.common.registry")
+        blocked = _blocking(release)
+        first = asyncio.create_task(call(_spec(blocked, name="blocked"), "a", {}))
+        assert await _wait(blocked.started)
+        queued_ran = threading.Event()
+        queued = asyncio.create_task(
+            call(_spec(queued_ran.set, name="queued"), "a", {})
+        )
+        # one loop iteration submits it to the (busy) pool; give it a few
+        await asyncio.sleep(0.05)
+
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+
+        release.set()
+        assert await first == "released"
+        assert await call(_spec(lambda: "next", name="next"), "a", {}) == "next"
+        assert not queued_ran.is_set()
+        outcomes = {r.tool: r.outcome for r in _tool_call_records(caplog)}
+        assert outcomes == {"blocked": "ok", "queued": "cancelled", "next": "ok"}
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="with one cluster, calls without a cluster run in the clusterless pool '' and calls naming it "
+        "in the cluster's pool, so the only cluster gets 2 x MAX_CONCURRENT_CALLS_PER_CLUSTER concurrent calls "
+        "(more than MAX_CONNECTIONS leaves room for) and a hanging cluster also blocks the clusterless tools",
+    )
+    @pytest.mark.asyncio
+    async def test_implicit_and_explicit_calls_share_the_only_cluster_pool(
+        self, monkeypatch, release
+    ):
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", 1)
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 5)
+        set_config(_config())
+        blocked = _blocking(release)
+        implicit = wrap(_spec(blocked, name="blocked"), ["a"], single_cluster=True)
+        first = asyncio.create_task(implicit())
+        assert await _wait(blocked.started)
+
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 0.2)
+        explicit_ran = threading.Event()
+        explicit = wrap(
+            _spec(explicit_ran.set, name="explicit"), ["a"], single_cluster=True
+        )
+        try:
+            with pytest.raises(ToolError, match="timeout"):
+                await explicit(cluster="a")
+            assert not explicit_ran.is_set()
+        finally:
+            release.set()
+            assert await first == "released"
 
 
 class TestEndToEnd:
@@ -876,9 +1247,16 @@ class TestEndToEnd:
         for tool in tools:
             assert tool.annotations.readOnlyHint is True
             assert not tool.description.startswith("WRITE:")
+            # the only cluster: the parameter is optional
+            assert list(tool.inputSchema["properties"])[-1] == "cluster"
+            assert "cluster" not in tool.inputSchema.get("required", [])
             cluster = tool.inputSchema["properties"]["cluster"]
-            enum = cluster["enum"] if "enum" in cluster else cluster["anyOf"][0]["enum"]
-            assert enum == ["cbtstrds"]
+            assert {"type": "string", "enum": ["cbtstrds"]} in cluster["anyOf"]
+            assert cluster["description"] == (
+                ALL_CLUSTERS_DESCRIPTION
+                if tool.name == "clusters_list"
+                else ONLY_CLUSTER_DESCRIPTION
+            )
 
     @pytest.mark.asyncio
     async def test_cluster_enums_follow_eligibility(self, real_tools, config):
@@ -981,14 +1359,123 @@ class TestEndToEnd:
         redis_client.get_connection.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_tool_timeout(self, real_tools, config, redis_client, monkeypatch):
+    async def test_tool_timeout(
+        self, real_tools, config, redis_client, monkeypatch, release
+    ):
         monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 0.05)
-        release = threading.Event()
         redis_client.get.side_effect = lambda key: release.wait(5) and "late"
         mcp = build_server(config)
 
-        try:
-            with pytest.raises(ToolError, match=r"did not finish within 0\.05 s"):
-                await mcp.call_tool("get", {"cluster": "rw", "key": "k"})
-        finally:
-            release.set()
+        with pytest.raises(ToolError) as info:
+            await mcp.call_tool("get", {"cluster": "rw", "key": "k"})
+
+        assert _timeout_message(0.05) in str(info.value)
+
+    @pytest.mark.asyncio
+    async def test_hanging_cluster_does_not_delay_another(
+        self, real_tools, config, redis_client, monkeypatch, release
+    ):
+        monkeypatch.setattr(registry, "MAX_CONCURRENT_CALLS_PER_CLUSTER", 1)
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 5)
+        hanging = threading.Event()
+
+        def get(key):
+            if current_cluster.get() == "rw":
+                hanging.set()
+                release.wait(10)
+            return f"{current_cluster.get()}:{key}"
+
+        redis_client.get.side_effect = get
+        mcp = build_server(config)
+        stuck = asyncio.create_task(mcp.call_tool("get", {"cluster": "rw", "key": "k"}))
+        assert await _wait(hanging)
+
+        content, _ = await mcp.call_tool("get", {"cluster": "ro", "key": "k"})
+
+        assert content[0].text == "ro:k"
+        assert not stuck.done()
+        release.set()
+        content, _ = await stuck
+        assert content[0].text == "rw:k"
+
+    @pytest.fixture
+    def created_clients(self):
+        """The real RedisConnectionManager with create_client mocked: records the call's cluster (as the
+        worker sees it) and the cluster the manager resolved."""
+        client = Mock()
+        client.get.return_value = "value"
+        client.created_for = []
+
+        def create_client(cluster_config, decode_responses=True):
+            client.created_for.append((current_cluster.get(), cluster_config.name))
+            return client
+
+        with patch("src.common.connection.create_client", side_effect=create_client):
+            yield client
+
+    @staticmethod
+    def _single_cluster(legacy: bool, redis_config):
+        if legacy:
+            return from_legacy(redis_config), "default"
+        return _config(toolsets=["core", "data"]), "a"
+
+    @pytest.mark.parametrize("legacy", [False, True], ids=["yaml", "legacy"])
+    @pytest.mark.asyncio
+    async def test_single_cluster_call_without_cluster(
+        self, real_tools, created_clients, caplog, redis_config, legacy
+    ):
+        config, name = self._single_cluster(legacy, redis_config)
+        set_config(config)
+        mcp = build_server(config)
+        caplog.set_level(logging.INFO, logger="src.common.registry")
+
+        content, structured = await mcp.call_tool("get", {"key": "k"})
+
+        assert content[0].text == "value"
+        assert structured == {"result": "value"}
+        created_clients.get.assert_called_once_with("k")
+        # the tool runs without a selected cluster; the connection manager falls back to the only one
+        assert created_clients.created_for == [(None, name)]
+        (record,) = _tool_call_records(caplog)
+        assert (record.tool, record.cluster, record.outcome) == ("get", None, "ok")
+
+    @pytest.mark.parametrize("legacy", [False, True], ids=["yaml", "legacy"])
+    @pytest.mark.asyncio
+    async def test_single_cluster_call_with_cluster(
+        self, real_tools, created_clients, redis_config, legacy
+    ):
+        config, name = self._single_cluster(legacy, redis_config)
+        set_config(config)
+        mcp = build_server(config)
+
+        content, _ = await mcp.call_tool("get", {"cluster": name, "key": "k"})
+
+        assert content[0].text == "value"
+        assert created_clients.created_for == [(name, name)]
+
+    @pytest.mark.asyncio
+    async def test_single_cluster_rejects_another_name(
+        self, real_tools, created_clients
+    ):
+        config = _config(toolsets=["core", "data"])
+        set_config(config)
+        mcp = build_server(config)
+
+        with pytest.raises(ToolError, match="cluster"):
+            await mcp.call_tool("get", {"cluster": "b", "key": "k"})
+
+        assert created_clients.created_for == []
+
+    @pytest.mark.asyncio
+    async def test_implicit_cluster_needs_a_single_cluster(
+        self, real_tools, created_clients
+    ):
+        # what the optional parameter relies on: without a cluster the manager only picks the only one
+        config = _config(clusters=[_cluster("a"), _cluster("b")])
+        set_config(config)
+        spec = registry._SPECS["get"]
+
+        with pytest.raises(ClusterSelectionError, match="Missing parameter: cluster"):
+            await wrap(spec, ["a", "b"], single_cluster=True)(key="k")
+
+        assert created_clients.created_for == []
