@@ -302,3 +302,45 @@ async def test_search_redis_documents_timeout(monkeypatch):
     assert result["error"] == (
         f"Docs search request timed out after {misc.DOCS_SEARCH_TIMEOUT_SECONDS} seconds"
     )
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_reports_completion(mock_redis_cluster):
+    """RedisCluster.scan returns one cursor per node: the batch is complete when every node is at 0."""
+    mock_redis_cluster.scan.return_value = (
+        {"n1:7000": 0, "n2:7001": 0},
+        [b"user:1", "user:2"],
+    )
+
+    result = await misc.scan_keys("user:*", count=50)
+
+    assert result == {
+        "cursor": 0,
+        "keys": ["user:1", "user:2"],
+        "total_scanned": 2,
+        "scan_complete": True,
+    }
+    mock_redis_cluster.scan.assert_called_once_with(cursor=0, match="user:*", count=50)
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_points_to_scan_all_keys(mock_redis_cluster):
+    mock_redis_cluster.scan.return_value = ({"n1:7000": 12, "n2:7001": 0}, ["user:1"])
+
+    result = await misc.scan_keys("user:*")
+
+    assert result["scan_complete"] is False
+    assert result["cursor"] == 0
+    assert result["keys"] == ["user:1"]
+    assert "scan_all_keys" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_rejects_a_cursor(mock_redis_cluster):
+    result = await misc.scan_keys("user:*", cursor=12)
+
+    assert result.startswith(
+        "Error: scan_keys cannot continue a cursor on a Redis Cluster"
+    )
+    assert "scan_all_keys" in result
+    mock_redis_cluster.scan.assert_not_called()

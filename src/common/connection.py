@@ -80,7 +80,8 @@ class RedisConnectionManager:
                     failure is not None
                     and time.monotonic() - failure[0] < FAILED_CREATION_SECONDS
                 ):
-                    raise failure[1]
+                    # without the traceback of earlier raises, which would grow with every waiter
+                    raise failure[1].with_traceback(None)
                 try:
                     client = create_client(
                         config,

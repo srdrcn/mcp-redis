@@ -45,7 +45,7 @@ config file, tools grouped into toolsets, a read-only switch, and Streamable HTT
 - **Bounded calls**: every tool call has a 15 s limit. The Redis clients use 5 s connect and 10 s socket timeouts
   and send every command once: there are no client retries, so the server never sends a write twice. A
   standalone server, a Sentinel-managed primary or a Redis Cluster node that stops answering therefore reports its
-  own error (`Timeout reading from socket`) after 10 s. Each Sentinel gets at most 2 s to name the primary. Redis
+  own error (`Timeout reading from socket`) after 10 s. A Sentinel that does not answer costs 2 s. Redis
   Cluster startup nodes that do not answer while the client reads the slot map cost one timeout each and can still
   add up to the 15 s limit (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)).
 - **Clusters are isolated**: each cluster has its own 8 workers for tool calls and its own connection pools (16
@@ -182,7 +182,7 @@ clusters:
     #   caFile: /etc/redis-mcp/tls/ca.crt   # caPath is not supported with mode: cluster
     # options:                     # client tuning; keys and values depend on the mode (README, "Cluster options")
     #   socket_timeout: 5          # seconds, > 0 and <= 3600
-  # A primary managed by Redis Sentinel. Each Sentinel gets at most 2 s to name the primary. The Sentinels' own
+  # A primary managed by Redis Sentinel. A Sentinel that does not answer costs 2 s. The Sentinels' own
   # password is <name>_sentinel_pass, so no other cluster may be named cbuatrds_sentinel:
   # - name: cbuatrds
   #   mode: sentinel
@@ -499,8 +499,10 @@ have run, so sending it again could apply a write twice, and retries could outla
   and reads the slot map again from the others before it reports the error, so the next call uses the new
   topology. `MOVED` and `ASK` redirects are still followed.
 - **Sentinel**: each new connection to the primary first asks the Sentinels, in turn, which node is the primary.
-  Each Sentinel gets at most 2 s (`socket_connect_timeout` and `socket_timeout` of the cluster, capped at 2 s), so
-  the lookup ends within 2 s per Sentinel that does not answer.
+  Each Sentinel connection uses connect and reply timeouts of at most 2 s (`socket_connect_timeout` and
+  `socket_timeout` of the cluster, capped at 2 s), so a Sentinel that does not answer costs 2 s. A Sentinel that
+  answers slowly can take longer: the connection waits up to 2 s for each reply (AUTH, client info, the master
+  lookup).
 
 **What a cluster that fails returns.** Measured with the default timeouts, redis-py 6.4 and Redis 7.0, with a
 closed port, with a listener whose backlog is full (connections time out, as with a firewall that drops packets),
@@ -530,7 +532,9 @@ cap, even five Sentinels that do not answer fail after about 10 s.
 a free worker; the wait counts toward their 15 s, and a call still waiting at the limit is dropped without
 running. When only one cluster is configured, a call that leaves out `cluster` runs on that cluster's workers,
 like a call that names it. Calls without a cluster (`clusters_list` without `cluster`, `read_messages`,
-`unsubscribe`, `search_redis_documents`) share another 8 workers. A cluster that hangs ties up only its own
+`unsubscribe`, `search_redis_documents`) share another 8 workers; a `read_messages` call holds its worker for up
+to `timeout_ms` when fewer than `max_messages` arrive, so keep `timeout_ms` short when polling many subscriptions.
+A cluster that hangs ties up only its own
 workers. With 12 simultaneous `get` calls to a standalone cluster that accepted connections but never answered,
 8 returned `Timeout reading from socket` after 10 s and the other 4 (which got a worker only after 10 s) the 15 s
 timeout message, while `get` calls to another cluster made at the same time answered within about 10 ms.

@@ -13,6 +13,7 @@ import secrets
 import select
 import socket
 import threading
+import traceback
 import time
 import uuid
 from types import SimpleNamespace
@@ -1366,6 +1367,21 @@ class TestClientCache:
         assert RedisConnectionManager.get_connection() is created
         assert redis_cls.call_count == 2
         assert RedisConnectionManager._failures == {}
+
+    def test_remembered_failure_traceback_does_not_grow(self, use_config, redis_cls):
+        """Raising the remembered exception again must not pile up the tracebacks of earlier raises."""
+        use_config(cluster("a"))
+        redis_cls.side_effect = ConnectionError("Connection refused")
+
+        lengths = []
+        for _ in range(5):
+            with pytest.raises(ConnectionError) as exc:
+                RedisConnectionManager.get_connection()
+            lengths.append(len(traceback.extract_tb(exc.value.__traceback__)))
+
+        assert redis_cls.call_count == 1
+        assert lengths[1] == lengths[2] == lengths[3] == lengths[4]
+        assert lengths[4] <= lengths[0]
 
     def test_failed_cluster_creation_is_not_kept(self, use_config, cluster_cls, clock):
         use_config(cluster("c", mode="cluster", hosts="h1:7000"))

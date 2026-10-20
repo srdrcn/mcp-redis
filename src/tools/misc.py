@@ -140,9 +140,14 @@ async def scan_keys(
         First call: scan_keys("user:*") -> returns cursor=1234, keys=[...], scan_complete=False
         Next call: scan_keys("user:*", cursor=1234) -> continues from where it left off
         Final call: returns cursor=0, scan_complete=True when done
+
+    On a Redis Cluster each node has its own cursor, so a scan cannot be continued: call it with cursor 0
+    for one batch from every node, or use scan_all_keys().
     """
     try:
         r = RedisConnectionManager.get_connection()
+        if isinstance(r, RedisCluster):
+            return _scan_cluster_batch(r, pattern, count, cursor)
         cursor, keys = r.scan(cursor=cursor, match=pattern, count=count)
 
         # Convert bytes to strings if needed
@@ -158,6 +163,31 @@ async def scan_keys(
         }
     except RedisError as e:
         return f"Error scanning keys with pattern '{pattern}': {str(e)}"
+
+
+def _scan_cluster_batch(
+    r: RedisCluster, pattern: str, count: int, cursor: int
+) -> Union[str, Dict[str, Any]]:
+    if cursor:
+        return (
+            "Error: scan_keys cannot continue a cursor on a Redis Cluster (every node has its own cursor);"
+            " call it with cursor 0, or use scan_all_keys"
+        )
+    cursors, keys = r.scan(cursor=0, match=pattern, count=count)
+    complete = all(c == 0 for c in cursors.values())
+    result: Dict[str, Any] = {
+        "cursor": 0,
+        "keys": [
+            key.decode("utf-8") if isinstance(key, bytes) else key for key in keys
+        ],
+        "total_scanned": len(keys),
+        "scan_complete": complete,
+    }
+    if not complete:
+        result["note"] = (
+            "Redis Cluster: these are the first keys of every node; scan_all_keys returns all matching keys"
+        )
+    return result
 
 
 @redis_tool("core")
