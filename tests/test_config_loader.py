@@ -394,7 +394,7 @@ class TestYamlNumberTrap:
         # converted text is checked like any other value (see TestOptionValues)
         error = config_error({"clusters": [cluster(options={"socket_timeout": value})]})
         assert error == (
-            "Invalid config:\n - clusters[0]: options.socket_timeout must be a number of seconds > 0"
+            "Invalid config:\n - clusters[0]: options.socket_timeout must be a number of seconds > 0 and <= 3600"
         )
 
     @pytest.mark.parametrize("value", ["0123", "0x1F", "1.5", "1e3", "-2", "42"])
@@ -1125,8 +1125,8 @@ class TestOptions:
 
 # What each option's error message says it must be.
 OPTION_EXPECTED = {
-    "socket_timeout": "a number of seconds > 0",
-    "socket_connect_timeout": "a number of seconds > 0",
+    "socket_timeout": "a number of seconds > 0 and <= 3600",
+    "socket_connect_timeout": "a number of seconds > 0 and <= 3600",
     "socket_keepalive": "true or false",
     "max_connections": "an integer >= 1",
     "client_name": "a name without spaces",
@@ -1292,16 +1292,28 @@ class TestOptionValues:
         )
         assert error == (
             "Invalid config:"
-            "\n - clusters[0]: options.socket_timeout must be a number of seconds > 0"
+            "\n - clusters[0]: options.socket_timeout must be a number of seconds > 0 and <= 3600"
             "\n - clusters[2]: options.reinitialize_steps must be an integer >= 0"
         )
 
     @pytest.mark.parametrize(
         "line, key, expected",
         [
-            ("socket_timeout: 0", "socket_timeout", "a number of seconds > 0"),
-            ("socket_timeout:", "socket_timeout", "a number of seconds > 0"),
-            ("socket_timeout: null", "socket_timeout", "a number of seconds > 0"),
+            (
+                "socket_timeout: 0",
+                "socket_timeout",
+                "a number of seconds > 0 and <= 3600",
+            ),
+            (
+                "socket_timeout:",
+                "socket_timeout",
+                "a number of seconds > 0 and <= 3600",
+            ),
+            (
+                "socket_timeout: null",
+                "socket_timeout",
+                "a number of seconds > 0 and <= 3600",
+            ),
             ("socket_connect_timeout: ~", "socket_connect_timeout", "a number"),
             ("socket_keepalive: 'true'", "socket_keepalive", "true or false"),
             ("max_connections: 1.5", "max_connections", "an integer >= 1"),
@@ -1343,15 +1355,9 @@ class TestOptionValues:
         with pytest.raises(ConfigError) as exc:
             load_config(main, conf_d)
         assert str(exc.value) == (
-            "Invalid config:\n - clusters[0]: options.socket_timeout must be a number of seconds > 0"
+            "Invalid config:\n - clusters[0]: options.socket_timeout must be a number of seconds > 0 and <= 3600"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: the timeouts are only checked for > 0, so a value beyond what a socket timeout can hold "
-        "(1e10 s, or 1e400 which becomes inf) is accepted, and then every connection fails with "
-        "OverflowError('timestamp out of range for C PyTime_t') instead of a config error at startup",
-    )
     @pytest.mark.parametrize("key", ["socket_timeout", "socket_connect_timeout"])
     @pytest.mark.parametrize("value", ["1e10", "1e400"])
     def test_timeout_too_large_for_a_socket_is_rejected(self, key, value):
@@ -1697,12 +1703,6 @@ class TestParseHosts:
         with pytest.raises(ValueError, match="without a scheme or credentials"):
             parse_hosts(hosts)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: parse_hosts checks the port with str.isdigit(), which is also true for digits int() "
-        "cannot parse (e.g. superscript '²'); int() then raises its own ValueError \"invalid literal for "
-        "int() with base 10: '²'\", which echoes the entry and has no entry number",
-    )
     def test_port_with_a_digit_int_cannot_parse(self):
         with pytest.raises(ValueError) as exc:
             parse_hosts("h:1,h:\u00b2")
@@ -2237,12 +2237,6 @@ class TestFileErrors:
             f"Could not read config file: {path} (not UTF-8: invalid byte on line 2)"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: utf-8-sig strips the byte order mark before decoding, so UnicodeDecodeError.start counts "
-        "from after the 3 BOM bytes, but _read counts the newlines in raw[:start] (BOM included): a bad "
-        "byte within the first 3 bytes of a line is reported on the line before",
-    )
     @pytest.mark.parametrize(
         "raw, line",
         [
@@ -2261,12 +2255,6 @@ class TestFileErrors:
             f"Could not read config file: {path} (not UTF-8: invalid byte on line {line})"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="regression: _read now passes the decoded text to yaml.load, so the YAMLError marks carry the "
-        "buffer and the message quotes the offending line (with a stream, as before, it gives only "
-        "line/column); a YAML typo on the apiKey line puts the key into the startup error and its traceback",
-    )
     @pytest.mark.parametrize(
         "text", ['apiKey: "TOPSECRET\nclusters: []\n', "apiKey: TOPSECRET: x\n"]
     )

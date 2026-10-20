@@ -12,6 +12,8 @@ Without a config file the server keeps the original behaviour: the REDIS_* envir
 describe a single cluster named ``default``.
 """
 
+import codecs
+import io
 import logging
 import os
 import re
@@ -69,12 +71,23 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+# Upper bound of the socket timeouts: far above the tool time limit, far below what a socket accepts.
+MAX_TIMEOUT_SECONDS = 3600
+
+
+def _is_timeout(value: Any) -> bool:
+    return _is_number(value) and 0 < value <= MAX_TIMEOUT_SECONDS
+
+
 # Value check and its description per option. A null timeout would remove the time bound for good.
 OPTION_VALUES = {
-    "socket_timeout": (lambda v: _is_number(v) and v > 0, "a number of seconds > 0"),
+    "socket_timeout": (
+        _is_timeout,
+        f"a number of seconds > 0 and <= {MAX_TIMEOUT_SECONDS}",
+    ),
     "socket_connect_timeout": (
-        lambda v: _is_number(v) and v > 0,
-        "a number of seconds > 0",
+        _is_timeout,
+        f"a number of seconds > 0 and <= {MAX_TIMEOUT_SECONDS}",
     ),
     "socket_keepalive": (lambda v: isinstance(v, bool), "true or false"),
     "max_connections": (
@@ -100,6 +113,7 @@ OPTION_VALUES = {
 }
 
 _INT = re.compile(r"[-+]?[0-9]+")
+_DIGITS = re.compile(r"[0-9]+")
 _FLOAT = re.compile(r"[-+]?([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][-+]?[0-9]+)?")
 
 
@@ -368,7 +382,12 @@ def parse_hosts(hosts: str) -> List[Tuple[str, int]]:
     for number, item in enumerate(hosts.split(","), start=1):
         item = item.strip()
         host, sep, port = item.rpartition(":")
-        if not sep or not host or not port.isdigit() or any(c.isspace() for c in host):
+        if (
+            not sep
+            or not host
+            or not _DIGITS.fullmatch(port)
+            or any(c.isspace() for c in host)
+        ):
             raise ValueError(
                 f"hosts entry {number} is not host:port (or [IPv6 address]:port)"
             )
@@ -422,16 +441,19 @@ def _read(path: Path) -> Dict[str, Any]:
         raw = path.read_bytes()
     except OSError as e:
         raise ConfigError(f"Could not read config file: {path} ({e.strerror})") from e
+    if raw.startswith(codecs.BOM_UTF8):
+        raw = raw[len(codecs.BOM_UTF8) :]
     try:
-        text = raw.decode("utf-8-sig")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as e:
         line = raw[: e.start].count(b"\n") + 1
         raise ConfigError(
             f"Could not read config file: {path} (not UTF-8: invalid byte on line {line})"
         ) from e
     try:
-        # _TextLoader is a SafeLoader
-        data = yaml.load(text, Loader=_TextLoader)  # nosec B506
+        # A stream, not the string: PyYAML then reports line and column without quoting the line, which
+        # could hold a mistyped secret. _TextLoader is a SafeLoader.
+        data = yaml.load(io.StringIO(text), Loader=_TextLoader)  # nosec B506
     except yaml.YAMLError as e:
         raise ConfigError(f"Could not parse config file: {path} ({e})") from e
     if data is None:
