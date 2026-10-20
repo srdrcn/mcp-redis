@@ -13,7 +13,7 @@ Built with Python 3.10+ (the image uses Python 3.14), FastMCP from the MCP Pytho
 - **Many clusters, one server**: standalone servers, Redis Cluster and Sentinel-managed primaries side by side.
   Every tool that works on Redis takes a `cluster` parameter whose enum lists exactly the clusters the tool may run
   on. When only one cluster is configured, the parameter is optional.
-- **54 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
+- **55 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
 - **Read-only in the example config**: `readOnly: true` hides every write tool (one sandbox cluster opts back in),
   and `disableDestructive: true` hides the delete/pop/remove tools.
 - **Passwords stay out of the config**: each cluster's password comes from a mounted Secret file
@@ -439,14 +439,14 @@ server its own ACL user on every cluster, with only the rights it needs. A read-
 toolsets:
 
 ```
-ACL SETUSER mcp-reader on >REPLACE_ME ~* &* +@read +@connection -@dangerous +info +client|list +cluster|slots
+ACL SETUSER mcp-reader on >REPLACE_ME ~* &* +@read +@connection -@dangerous +info +client|list +cluster|slots +cluster|nodes +cluster|info
 ```
 
 and, on a writable cluster such as the sandbox, a user that may also write but still cannot flush, reconfigure or
 shut down the server:
 
 ```
-ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@dangerous +info +client|list +cluster|slots
+ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@dangerous +info +client|list +cluster|slots +cluster|nodes +cluster|info
 ```
 
 - The rules are applied from left to right. `-@dangerous` must come **before** `+info +client|list`: `INFO` and
@@ -454,7 +454,8 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
   `-@dangerous` at the end would remove them again. `-@dangerous` also removes `KEYS`, `FLUSHALL`, `FLUSHDB`,
   `CONFIG`, `SHUTDOWN` and `CLIENT KILL`.
 - `+cluster|slots` is needed on a Redis Cluster: redis-py reads the slot map when it connects, and without this
-  command the connection fails with `Cluster mode is not enabled on this node`. It does no harm elsewhere.
+  command the connection fails with `Cluster mode is not enabled on this node`. `+cluster|nodes +cluster|info` let
+  `cluster_nodes` read the node list and the cluster state. They do no harm elsewhere.
 - Checked on Redis 7.0 with the server's tools and `ACL DRYRUN`: `mcp-reader` can run `get`, `hgetall`, `scan_keys`,
   `scan_all_keys`, `type`, `dbsize`, `info`, `client_list` and `clusters_list`, and `set`/`delete` fail with
   `this user has no permissions to run the 'set' command`; `mcp-writer` can also run `set`, `delete`, `expire`,
@@ -474,7 +475,7 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
 
 | Toolset | Tools | What it covers | Available on |
 |---|---:|---|---|
-| `core` (enabled by default) | 10 | The cluster list with a connection check, server information (`info`, `dbsize`, `client_list`) and key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`) | Every cluster. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
+| `core` (enabled by default) | 11 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`) and key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`) | Every cluster. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
 | `data` | 29 | Strings, hashes (including vectors stored as binary fields), lists, sets, sorted sets, and streams with consumer groups | Every cluster |
 | `json` | 3 | RedisJSON documents: get, set and delete at a path | Clusters with `modules: [json]` |
 | `search` | 6 | Redis Query Engine: indexes, index information, indexed key count, vector index creation on hashes, vector (KNN) and hybrid search | Clusters with `modules: [search]` |
@@ -514,7 +515,7 @@ cluster is rejected by schema validation (`Input should be 'cbsbxrds'`). With tw
 one cluster (a one-cluster config file or the [single-cluster mode](#single-cluster-mode)), `cluster` is optional
 and comes last, described as `Cluster name (default: the only configured cluster)`: a call without it runs on that
 cluster. `clusters_list` always takes an optional `cluster` (all clusters when omitted), and `read_messages`,
-`unsubscribe` and `search_redis_documents` take none. With the example config, 30 of the 54 tools are listed.
+`unsubscribe` and `search_redis_documents` take none. With the example config, 31 of the 55 tools are listed.
 For example:
 
 | Tool | `cluster` enum |
@@ -537,19 +538,20 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 
 | Toolset | Tools | Read | Write | Destructive |
 |---|---:|---:|---:|---:|
-| [core](#core-10-tools) | 10 | 7 | 2 | 1 |
+| [core](#core-11-tools) | 11 | 8 | 2 | 1 |
 | [data](#data-29-tools) | 29 | 10 | 11 | 8 |
 | [json](#json-3-tools) | 3 | 1 | 1 | 1 |
 | [search](#search-6-tools) | 6 | 5 | 1 | 0 |
 | [pubsub](#pubsub-5-tools) | 5 | 4 | 1 | 0 |
 | [docs](#docs-1-tool) | 1 | 1 | 0 | 0 |
-| **Total** | **54** | **28** | **16** | **10** |
+| **Total** | **55** | **29** | **16** | **10** |
 
-### core (10 tools)
+### core (11 tools)
 
 | Tool | Kind | Needs | Description |
 |---|---|---|---|
 | `clusters_list` | read | `cluster` optional (all clusters when omitted) | List the configured Redis clusters (mode, hosts, readOnly, modules, auth) and, unless check is false, whether each one answers: status, latency, Redis version and role. Start here when a cluster misbehaves |
+| `cluster_nodes` | read | — | Show the nodes of a cluster and their state: on a Redis Cluster the CLUSTER INFO summary and every node (address, id, primary or replica, the primary a replica follows, slot ranges, pfail/fail flags, link); on standalone and Sentinel the replication view (role, primary, connected replicas with lag) |
 | `delete` | destructive | — | Delete a Redis key |
 | `type` | read | — | Returns the string representation of the type of the value stored at key |
 | `expire` | write | — | Set an expiration time for a Redis key |

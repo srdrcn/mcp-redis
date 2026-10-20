@@ -691,3 +691,216 @@ class TestSecrets:
 
         assert "options" not in row
         assert "secret-client-name" not in json.dumps(row)
+
+
+CLUSTER_INFO = {
+    "cluster_state": "ok",
+    "cluster_slots_assigned": "16384",
+    "cluster_slots_ok": "10923",
+    "cluster_slots_pfail": "5461",
+    "cluster_slots_fail": "0",
+    "cluster_known_nodes": "6",
+    "cluster_size": "3",
+}
+
+# CLUSTER NODES as redis-py 6.4 parses it (address -> node), in the order a server may return it.
+CLUSTER_NODES = {
+    "10.0.0.3:6379": {
+        "node_id": "c" * 40,
+        "hostname": "",
+        "flags": "master,fail?",
+        "master_id": "-",
+        "slots": [["10923", "16383"]],
+        "connected": False,
+    },
+    "10.0.0.5:6379": {
+        "node_id": "e" * 40,
+        "hostname": "redis-5.example.com",
+        "flags": "slave",
+        "master_id": "a" * 40,
+        "slots": [],
+        "connected": True,
+    },
+    "10.0.0.1:6379": {
+        "node_id": "a" * 40,
+        "hostname": "",
+        "flags": "myself,master",
+        "master_id": "-",
+        "slots": [["0", "5460"], ["5462"]],
+        "connected": True,
+    },
+    "10.0.0.2:6379": {
+        "node_id": "b" * 40,
+        "hostname": "",
+        "flags": "master",
+        "master_id": "-",
+        "slots": [["5461", "5461"], ["5463", "10922"]],
+        "connected": True,
+    },
+    "10.0.0.6:6379": {
+        "node_id": "f" * 40,
+        "hostname": "",
+        "flags": "slave,fail",
+        "master_id": "9" * 40,
+        "slots": [],
+        "connected": False,
+    },
+}
+
+
+class TestClusterNodes:
+    """cluster_nodes: the node list of a Redis Cluster, the replication view elsewhere."""
+
+    async def _call(self, client, name):
+        with patch.object(
+            clusters_module.RedisConnectionManager,
+            "get_connection",
+            return_value=client,
+        ):
+            token = current_cluster.set(name)
+            try:
+                return await clusters_module.cluster_nodes()
+            finally:
+                current_cluster.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_redis_cluster_summary_and_nodes(self, tmp_path):
+        _use_config(tmp_path, [{"name": "prd", "mode": "cluster", "hosts": "h:6379"}])
+        client = Mock(spec=RedisCluster)
+        client.cluster_info.return_value = CLUSTER_INFO
+        client.cluster_nodes.return_value = CLUSTER_NODES
+
+        result = await self._call(client, "prd")
+
+        assert {k: v for k, v in result.items() if k != "nodes"} == {
+            "cluster": "prd",
+            "mode": "cluster",
+            "state": "ok",
+            "slotsAssigned": 16384,
+            "slotsOk": 10923,
+            "slotsPfail": 5461,
+            "slotsFail": 0,
+            "knownNodes": 6,
+            "size": 3,
+        }
+        nodes = result["nodes"]
+        # primaries in slot order, each followed by its replicas; a replica of an unknown primary comes last
+        assert [n["address"] for n in nodes] == [
+            "10.0.0.1:6379",
+            "10.0.0.5:6379",
+            "10.0.0.2:6379",
+            "10.0.0.3:6379",
+            "10.0.0.6:6379",
+        ]
+        assert nodes[0] == {
+            "address": "10.0.0.1:6379",
+            "id": "a" * 40,
+            "role": "primary",
+            "slots": ["0-5460", "5462"],
+            "connected": True,
+        }
+        assert nodes[1] == {
+            "address": "10.0.0.5:6379",
+            "id": "e" * 40,
+            "role": "replica",
+            "hostname": "redis-5.example.com",
+            "primary": "10.0.0.1:6379",
+            "connected": True,
+        }
+        assert nodes[2]["slots"] == ["5461", "5463-10922"]
+        assert nodes[3]["flags"] == ["pfail"]
+        assert nodes[3]["connected"] is False
+        # the primary id is shown when no listed node has it
+        assert nodes[4]["primary"] == "9" * 40
+        assert nodes[4]["flags"] == ["fail"]
+
+    @pytest.mark.asyncio
+    async def test_standalone_primary_with_replicas(self, tmp_path):
+        _use_config(tmp_path, [{"name": "dev", "hosts": "h:6379"}])
+        client = Mock(spec=redis.Redis)
+        client.info.return_value = {
+            "role": "master",
+            "connected_slaves": 2,
+            "slave0": {
+                "ip": "10.0.0.7",
+                "port": 6379,
+                "state": "online",
+                "offset": 120,
+                "lag": 0,
+            },
+            "slave1": {
+                "ip": "10.0.0.8",
+                "port": 6380,
+                "state": "wait_bgsave",
+                "offset": 0,
+                "lag": 1,
+            },
+        }
+
+        result = await self._call(client, "dev")
+
+        client.info.assert_called_once_with("replication")
+        assert result == {
+            "cluster": "dev",
+            "mode": "standalone",
+            "role": "primary",
+            "replicas": [
+                {
+                    "address": "10.0.0.7:6379",
+                    "state": "online",
+                    "offset": 120,
+                    "lag": 0,
+                },
+                {
+                    "address": "10.0.0.8:6380",
+                    "state": "wait_bgsave",
+                    "offset": 0,
+                    "lag": 1,
+                },
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_replica_shows_its_primary_and_link(self, tmp_path):
+        _use_config(tmp_path, [{"name": "dev", "hosts": "h:6379"}])
+        client = Mock(spec=redis.Redis)
+        client.info.return_value = {
+            "role": "slave",
+            "master_host": "10.0.0.1",
+            "master_port": 6379,
+            "master_link_status": "down",
+            "connected_slaves": 0,
+        }
+
+        result = await self._call(client, "dev")
+
+        assert result == {
+            "cluster": "dev",
+            "mode": "standalone",
+            "role": "replica",
+            "primary": "10.0.0.1:6379",
+            "linkStatus": "down",
+            "replicas": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_redis_error_is_reported(self, tmp_path):
+        _use_config(tmp_path, [{"name": "prd", "mode": "cluster", "hosts": "h:6379"}])
+        client = Mock(spec=RedisCluster)
+        client.cluster_info.side_effect = redis.exceptions.NoPermissionError(
+            "this user has no permissions to run the 'cluster|info' command"
+        )
+
+        result = await self._call(client, "prd")
+
+        assert result == (
+            "Error reading the nodes of cluster prd: this user has no permissions to run the 'cluster|info' command"
+        )
+
+    def test_registered_as_a_core_read_tool(self):
+        spec = registry._SPECS["cluster_nodes"]
+        assert (spec.toolset, spec.kind, spec.cluster) == (
+            "core",
+            registry.ToolKind.READ,
+            "required",
+        )

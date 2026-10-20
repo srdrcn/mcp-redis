@@ -46,6 +46,7 @@ from src.common.server import build_server, load_tools
 # Every tool of src/tools, by toolset. A tool moving to another toolset or kind must show up here.
 CORE_READ = {
     "clusters_list",
+    "cluster_nodes",
     "type",
     "scan_keys",
     "scan_all_keys",
@@ -79,7 +80,7 @@ DESTRUCTIVE_TOOLS = {
     "xgroup_destroy",
 }
 NO_CLUSTER_TOOLS = {"search_redis_documents", "read_messages", "unsubscribe"}
-REAL_TOOL_COUNT = 54
+REAL_TOOL_COUNT = 55
 ONLY_CLUSTER_DESCRIPTION = "Cluster name (default: the only configured cluster)"
 ALL_CLUSTERS_DESCRIPTION = "Cluster name (default: all clusters)"
 
@@ -584,10 +585,12 @@ class TestRealTools:
         toolsets = [spec.toolset for spec, _ in selected]
         names = [spec.name for spec, _ in selected]
 
-        assert toolsets == ["core"] * 7 + ["data"] * 10 + ["json"]
-        assert set(names[:7]) == CORE_READ
-        assert set(names[7:17]) == DATA_READ
-        assert names[17:] == ["json_get"]
+        core = len(CORE_READ)
+        data = len(DATA_READ)
+        assert toolsets == ["core"] * core + ["data"] * data + ["json"]
+        assert set(names[:core]) == CORE_READ
+        assert set(names[core : core + data]) == DATA_READ
+        assert names[core + data :] == ["json_get"]
         assert all(clusters == ["cbtstrds"] for _, clusters in selected)
 
     def test_writable_config_without_destructive_tools(self, real_tools):

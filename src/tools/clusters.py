@@ -2,9 +2,10 @@ import contextvars
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 from redis.cluster import RedisCluster
+from redis.exceptions import RedisError
 
 from src.common.config_loader import ClusterConfig, get_config
 from src.common.connection import RedisConnectionManager, current_cluster
@@ -94,3 +95,123 @@ def _probe(name: str) -> Dict[str, Any]:
         return result
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+@redis_tool("core")
+async def cluster_nodes() -> Union[str, Dict[str, Any]]:
+    """Show the nodes of a cluster and their state.
+
+    Redis Cluster (mode: cluster): the CLUSTER INFO summary (state, slots assigned/ok/pfail/fail, known nodes,
+    size) and every node from CLUSTER NODES: address, node id, role (primary or replica), the primary a replica
+    follows, its slot ranges, extra flags (pfail, fail, handshake, noaddr, nofailover) and whether its link is
+    connected. Primaries are listed in slot order, each followed by its replicas.
+
+    Standalone and Sentinel: the replication view of the node the client uses (INFO replication): its role,
+    its primary and link status if it is a replica, and its connected replicas with state, offset and lag.
+
+    Returns:
+        The node overview, or an error message.
+    """
+    config = RedisConnectionManager.cluster_config()
+    try:
+        r = RedisConnectionManager.get_connection()
+        if isinstance(r, RedisCluster):
+            return _cluster_view(config.name, r)
+        return _replication_view(config, r.info("replication"))
+    except RedisError as e:
+        return f"Error reading the nodes of cluster {config.name}: {e}"
+
+
+_ROLE_FLAGS = {"master": "primary", "slave": "replica"}
+_HIDDEN_FLAGS = {"master", "slave", "myself", "noflags"}
+
+
+def _cluster_view(name: str, r: RedisCluster) -> Dict[str, Any]:
+    info = r.cluster_info()
+    raw = r.cluster_nodes()
+    address_of = {node["node_id"]: address for address, node in raw.items()}
+    nodes = []
+    for address, node in raw.items():
+        flags = node.get("flags", "").split(",")
+        role = next((_ROLE_FLAGS[f] for f in flags if f in _ROLE_FLAGS), "unknown")
+        entry: Dict[str, Any] = {
+            "address": address,
+            "id": node["node_id"],
+            "role": role,
+        }
+        if node.get("hostname"):
+            entry["hostname"] = node["hostname"]
+        if role == "replica":
+            primary_id = node.get("master_id")
+            entry["primary"] = address_of.get(primary_id, primary_id)
+        slots = []
+        for slot_range in node.get("slots", []):
+            start, end = slot_range[0], slot_range[-1]
+            slots.append(start if start == end else f"{start}-{end}")
+        if slots:
+            entry["slots"] = slots
+        extra = [
+            ("pfail" if f == "fail?" else f)
+            for f in flags
+            if f and f not in _HIDDEN_FLAGS
+        ]
+        if extra:
+            entry["flags"] = extra
+        entry["connected"] = bool(node.get("connected"))
+        nodes.append(entry)
+
+    primaries = sorted(
+        (n for n in nodes if n["role"] == "primary"),
+        key=lambda n: int(str(n.get("slots", ["99999"])[0]).split("-")[0]),
+    )
+    ordered = []
+    for primary in primaries:
+        ordered.append(primary)
+        ordered.extend(n for n in nodes if n.get("primary") == primary["address"])
+    ordered.extend(n for n in nodes if n not in ordered)
+
+    def number(key: str) -> Any:
+        value = info.get(key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+    return {
+        "cluster": name,
+        "mode": "cluster",
+        "state": info.get("cluster_state"),
+        "slotsAssigned": number("cluster_slots_assigned"),
+        "slotsOk": number("cluster_slots_ok"),
+        "slotsPfail": number("cluster_slots_pfail"),
+        "slotsFail": number("cluster_slots_fail"),
+        "knownNodes": number("cluster_known_nodes"),
+        "size": number("cluster_size"),
+        "nodes": ordered,
+    }
+
+
+def _replication_view(config: ClusterConfig, info: Dict[str, Any]) -> Dict[str, Any]:
+    role = info.get("role")
+    view: Dict[str, Any] = {
+        "cluster": config.name,
+        "mode": config.mode,
+        "role": {"master": "primary", "slave": "replica"}.get(role, role),
+    }
+    if role == "slave":
+        view["primary"] = f"{info.get('master_host')}:{info.get('master_port')}"
+        view["linkStatus"] = info.get("master_link_status")
+    replicas = []
+    for i in range(int(info.get("connected_slaves") or 0)):
+        replica = info.get(f"slave{i}")
+        if isinstance(replica, dict):
+            replicas.append(
+                {
+                    "address": f"{replica.get('ip')}:{replica.get('port')}",
+                    "state": replica.get("state"),
+                    "offset": replica.get("offset"),
+                    "lag": replica.get("lag"),
+                }
+            )
+    view["replicas"] = replicas
+    return view

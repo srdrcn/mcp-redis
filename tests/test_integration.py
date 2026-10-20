@@ -312,7 +312,7 @@ class TestMCPServerIntegration:
         tool_names = [tool["name"] for tool in tools]
 
         # Expected tool count (the @redis_tool declarations in src/tools; legacy mode lists every toolset)
-        expected_tool_count = 54
+        expected_tool_count = 55
         assert len(tools) == expected_tool_count, (
             f"Expected {expected_tool_count} tools, but got {len(tools)}"
         )
@@ -320,6 +320,7 @@ class TestMCPServerIntegration:
         # Expected tool names (alphabetically sorted for easier verification)
         expected_tools = [
             "client_list",
+            "cluster_nodes",
             "clusters_list",
             "create_vector_index_hash",
             "dbsize",
