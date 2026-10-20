@@ -1,15 +1,21 @@
 """
-Tests of src/common/connection.py: the client arguments per mode (with mocked redis-py classes), the retry policy
-over real sockets (a fake RESP server), and real clients and tool calls against redis-server processes started
-for this module (see tests/redis_servers.py; skipped where redis-server / redis-cli are not installed).
+Tests of src/common/connection.py: the client arguments per mode (with mocked redis-py classes), the single
+attempt per command over real sockets (a fake RESP server), and real clients and tool calls against redis-server
+processes started for this module (see tests/redis_servers.py; skipped where redis-server / redis-cli are not
+installed).
 """
 
+import asyncio
+import json
 import logging
+import re
 import secrets
+import select
 import socket
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Callable, List, Optional
 from unittest.mock import Mock, patch
 
@@ -21,7 +27,9 @@ from redis.cluster import ClusterNode, RedisCluster
 from redis.exceptions import AuthenticationError, ConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
+from redis.sentinel import MasterNotFoundError
 
+from src.common import connection as connection_module
 from src.common import registry
 from src.common.config_loader import (
     ConfigError,
@@ -30,11 +38,15 @@ from src.common.config_loader import (
     set_config,
 )
 from src.common.connection import (
+    FAILED_CREATION_SECONDS,
     MAX_CONNECTIONS,
+    MAX_PUBSUB_CONNECTIONS,
+    SENTINEL_TIMEOUT_SECONDS,
     SOCKET_CONNECT_TIMEOUT_SECONDS,
     SOCKET_TIMEOUT_SECONDS,
     ClusterSelectionError,
     RedisConnectionManager,
+    _Sentinel,
     client_kwargs,
     create_client,
     current_cluster,
@@ -57,31 +69,27 @@ DEFAULTS = {
     "max_connections": 16,
 }
 
-# Retry policy of standalone and sentinel clients (and of the sentinels themselves). Retry compares backoff,
-# retries and supported errors, so these work in assert_called_once_with; assert_command_retry checks the details.
-COMMAND_RETRY = Retry(NoBackoff(), 1, supported_errors=(ConnectionError,))
-# RedisCluster: a single attempt
-CLUSTER_RETRY = Retry(NoBackoff(), 0)
+# Retry policy of every client: standalone, sentinel master, the sentinels themselves and RedisCluster. Retry
+# compares backoff, retries and supported errors, so this works in assert_called_once_with; assert_no_retry checks
+# the details.
+NO_RETRY = Retry(NoBackoff(), 0)
+# redis-py's default; with 0 retries the list makes no difference, so it is left as it is
+DEFAULT_SUPPORTED_ERRORS = {ConnectionError, RedisTimeoutError, socket.timeout}
+
+# Sentinel lookups: each Sentinel gets at most SENTINEL_TIMEOUT_SECONDS to connect and to answer.
+SENTINEL_DEFAULTS = {"socket_connect_timeout": 2, "socket_timeout": 2}
 
 # Waits on the threading Events below; generous, but bounded so a broken lock cannot hang the run.
 WAIT_SECONDS = 5
 
 
-def assert_command_retry(retry):
-    """One immediate retry when the connection drops, none on a timeout: a command that timed out may have run,
+def assert_no_retry(retry):
+    """A single attempt per command: a command that timed out, or whose connection dropped, may already have run,
     and sending a write again would apply it twice."""
     assert type(retry) is Retry
     assert type(retry._backoff) is NoBackoff
-    assert retry.get_retries() == 1
-    assert set(retry._supported_errors) == {ConnectionError}
-    assert RedisTimeoutError not in retry._supported_errors
-    assert socket.timeout not in retry._supported_errors
-
-
-def assert_cluster_retry(retry):
-    assert type(retry) is Retry
-    assert type(retry._backoff) is NoBackoff
     assert retry.get_retries() == 0
+    assert set(retry._supported_errors) == DEFAULT_SUPPORTED_ERRORS
 
 
 def cluster(name="a", **fields):
@@ -128,8 +136,23 @@ def cluster_cls():
 
 @pytest.fixture
 def sentinel_cls():
-    with patch("src.common.connection.Sentinel") as cls:
+    """Patched _Sentinel, the Sentinel subclass connection.py creates."""
+    with patch("src.common.connection._Sentinel") as cls:
         yield cls
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A clock for connection.py (the failed-creation memo) that only moves when the test calls advance(s)."""
+    now = [1000.0]
+    monkeypatch.setattr(
+        connection_module, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+
+    def advance(seconds: float) -> None:
+        now[0] += seconds
+
+    return advance
 
 
 @pytest.fixture
@@ -167,7 +190,7 @@ def _read_command(reader) -> Optional[List[str]]:
 
 
 class FakeRedisServer:
-    """A RESP server on a free local port, so the retry behaviour can be tested with real sockets everywhere
+    """A RESP server on a free local port, so the connection handling can be tested with real sockets everywhere
     (no redis-server needed). It answers the connection handshake (CLIENT SETINFO, ...) with +OK and every
     other command as ``respond(n)`` says, n being the command's number (1-based): the reply, None to never
     answer (a hung server), or DROP to close the connection (a restarted server)."""
@@ -230,6 +253,16 @@ class FakeRedisServer:
             reader.close()
             conn.close()
 
+    def disconnect_clients(self) -> None:
+        """Closes the open connections but keeps listening (a server restarted between two commands)."""
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for conn in sockets:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def close(self) -> None:
         self._stopped.set()
         self._acceptor.join(5)
@@ -263,15 +296,20 @@ class TestTimeouts:
     def test_defaults(self):
         assert SOCKET_CONNECT_TIMEOUT_SECONDS == 5
         assert SOCKET_TIMEOUT_SECONDS == 10
+        assert SENTINEL_TIMEOUT_SECONDS == 2
         assert MAX_CONNECTIONS == 16
+        assert MAX_PUBSUB_CONNECTIONS == 50
+        assert FAILED_CREATION_SECONDS == 5
 
     def test_client_timeouts_stay_below_the_tool_timeout(self):
         """A slow cluster must fail with its own error, not the generic tool timeout."""
         assert SOCKET_CONNECT_TIMEOUT_SECONDS < TOOL_TIMEOUT_SECONDS
         assert SOCKET_TIMEOUT_SECONDS < TOOL_TIMEOUT_SECONDS
+        assert SENTINEL_TIMEOUT_SECONDS < SOCKET_CONNECT_TIMEOUT_SECONDS
 
     def test_pool_has_room_for_the_concurrent_tool_calls(self):
-        """Every worker the registry runs for a cluster gets a connection, with room left for pub/sub."""
+        """Every worker the registry runs for a cluster gets a connection; pub/sub subscriptions hold theirs in
+        a client of their own (MAX_PUBSUB_CONNECTIONS), so they cannot use up this pool."""
         assert MAX_CONNECTIONS > MAX_CONCURRENT_CALLS_PER_CLUSTER
 
     def test_unreachable_cluster_fails_before_the_tool_timeout(self, use_config):
@@ -305,6 +343,44 @@ class TestTimeouts:
             f" and {sum(sleeps):.1f} s of backoff: {total:.1f} s"
         )
 
+    def test_unreachable_sentinels_fail_before_the_tool_timeout(self, use_config):
+        """Regression: the master lookup asks each Sentinel in turn with the cluster's 5 s connect timeout, so
+        three unreachable Sentinels took 15 s, the whole tool timeout. Each now gets SENTINEL_TIMEOUT_SECONDS
+        and a single attempt (simulated time, as above)."""
+        hosts = ["192.0.2.1:26379", "192.0.2.2:26379", "192.0.2.3:26379"]
+        use_config(
+            cluster("sentinels", mode="sentinel", hosts=hosts, masterName="m"),
+            passwords={"sentinels_sentinel_pass": "sentinel-secret"},
+        )
+        attempts = []
+        sleeps = []
+
+        def connect_times_out(connection):
+            attempts.append((connection.host, connection.socket_connect_timeout))
+            raise socket.timeout("timed out")
+
+        with (
+            patch.object(redis.connection.Connection, "_connect", connect_times_out),
+            patch("redis.retry.sleep", side_effect=sleeps.append),
+        ):
+            client = RedisConnectionManager.get_connection()
+            with pytest.raises(MasterNotFoundError) as exc:
+                client.ping()
+
+        assert attempts == [
+            ("192.0.2.1", SENTINEL_TIMEOUT_SECONDS),
+            ("192.0.2.2", SENTINEL_TIMEOUT_SECONDS),
+            ("192.0.2.3", SENTINEL_TIMEOUT_SECONDS),
+        ]
+        assert sleeps == []
+        assert sum(t for _, t in attempts) < TOOL_TIMEOUT_SECONDS
+        assert str(exc.value) == (
+            "No master found for 'm' : "
+            "192.0.2.1:26379 - TimeoutError: Timeout connecting to server, "
+            "192.0.2.2:26379 - TimeoutError: Timeout connecting to server, "
+            "192.0.2.3:26379 - TimeoutError: Timeout connecting to server"
+        )
+
     def test_hung_server_fails_after_one_socket_timeout(self, use_config, fake_server):
         """A server that accepts connections but stops answering (overloaded, stuck): the command is sent once
         and fails with the client's own TimeoutError after one socket timeout. redis-py's default Retry sent it
@@ -328,34 +404,51 @@ class TestTimeouts:
 
         assert [c[0] for c in server.commands] == ["PING", "PING"]
         assert server.connections == 1
-        assert elapsed >= timeout
+        # the socket timeout, minus the resolution of a coarse clock (Windows)
+        assert elapsed >= timeout - 0.05
         # with the default socket timeout the single attempt ends before the tool timeout
         attempts = len(server.commands) - 1
         assert attempts * SOCKET_TIMEOUT_SECONDS < TOOL_TIMEOUT_SECONDS
 
-    def test_dropped_connection_is_retried_once(self, use_config, fake_server):
-        """A connection the server closed (e.g. after a Redis restart) is replaced and the command sent again."""
+    def test_dropped_connection_is_not_sent_again(self, use_config, fake_server):
+        """Regression: a command whose connection dropped was sent again on a new connection. The server may
+        have run it before the connection dropped (killed client, network cut before the reply), so a write
+        could be applied twice. The caller gets the ConnectionError; the next command uses a new connection."""
         server = fake_server(lambda n: DROP if n == 2 else PONG)
         use_config(cluster("restarted", hosts=server.address))
-        client = RedisConnectionManager.get_connection()
-        assert client.ping() is True
-
-        assert client.ping() is True
-
-        assert [c[0] for c in server.commands] == ["PING", "PING", "PING"]
-        assert server.connections == 2
-
-    def test_connection_dropped_again_fails(self, use_config, fake_server):
-        server = fake_server(lambda n: PONG if n == 1 else DROP)
-        use_config(cluster("flapping", hosts=server.address))
         client = RedisConnectionManager.get_connection()
         assert client.ping() is True
 
         with pytest.raises(ConnectionError):
             client.ping()
 
-        # the first attempt and one retry
+        assert [c[0] for c in server.commands] == ["PING", "PING"]
+        assert server.connections == 1
+
+        assert client.ping() is True
         assert [c[0] for c in server.commands] == ["PING", "PING", "PING"]
+        assert server.connections == 2
+
+    def test_idle_connection_closed_by_the_server_is_replaced(
+        self, use_config, fake_server
+    ):
+        """Without client retries, a pooled connection the server closed while it was idle (e.g. a Redis
+        restart) still costs no error: the pool checks a connection before handing it out and replaces it. The
+        command is sent once, on the new connection."""
+        server = fake_server(lambda n: PONG)
+        use_config(cluster("restarted", hosts=server.address))
+        client = RedisConnectionManager.get_connection()
+        assert client.ping() is True
+
+        server.disconnect_clients()
+        # wait until the pooled connection has seen the close, so the next command finds it closed
+        (pooled,) = client.connection_pool._available_connections
+        readable, _, _ = select.select([pooled._sock], [], [], WAIT_SECONDS)
+        assert readable, "the close never reached the pooled connection"
+
+        assert client.ping() is True
+
+        assert [c[0] for c in server.commands] == ["PING", "PING"]
         assert server.connections == 2
 
 
@@ -366,9 +459,9 @@ class TestStandaloneClient:
         RedisConnectionManager.get_connection()
 
         redis_cls.assert_called_once_with(
-            host="redis.example", port=6390, db=2, retry=COMMAND_RETRY, **DEFAULTS
+            host="redis.example", port=6390, db=2, retry=NO_RETRY, **DEFAULTS
         )
-        assert_command_retry(redis_cls.call_args.kwargs["retry"])
+        assert_no_retry(redis_cls.call_args.kwargs["retry"])
 
     def test_each_client_gets_its_own_retry(self, use_config, redis_cls):
         """Retry objects are mutable (update_supported_errors); clients must not share one."""
@@ -381,7 +474,7 @@ class TestStandaloneClient:
         retries = [c.kwargs["retry"] for c in redis_cls.call_args_list]
         assert len({id(r) for r in retries}) == 3
         for retry in retries:
-            assert_command_retry(retry)
+            assert_no_retry(retry)
 
     def test_returns_the_created_client(self, use_config, redis_cls):
         use_config(cluster())
@@ -400,7 +493,7 @@ class TestStandaloneClient:
             host="h",
             port=6379,
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             **{**DEFAULTS, "decode_responses": False},
         )
 
@@ -432,7 +525,7 @@ class TestStandaloneClient:
             host="h",
             port=6379,
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             username="mcp-reader",
             password="12345",
             **DEFAULTS,
@@ -483,7 +576,7 @@ class TestStandaloneClient:
             host="h",
             port=6380,
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             ssl=True,
             ssl_cert_reqs="optional",
             ssl_ca_certs="/etc/redis-mcp/tls/ca.crt",
@@ -503,7 +596,7 @@ class TestStandaloneClient:
             host="h",
             port=6380,
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             ssl=True,
             ssl_cert_reqs="required",
             **DEFAULTS,
@@ -537,7 +630,7 @@ class TestStandaloneClient:
             host="h",
             port=6379,
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             decode_responses=True,
             lib_name=LIB_NAME,
             socket_connect_timeout=1,
@@ -565,7 +658,7 @@ class TestStandaloneClient:
     def test_options_cannot_replace_what_the_server_manages(
         self, use_config, redis_cls, option
     ):
-        """The retry policy (no resend after a timeout), TLS, decoding, secrets and the address are set by the
+        """The retry policy (a single attempt), TLS, decoding, secrets and the address are set by the
         server or by the cluster's own keys; `options` cannot change them."""
         with pytest.raises(ConfigError, match=f"options {option} not supported"):
             use_config(cluster(tls=True, options={option: "x"}))
@@ -584,11 +677,11 @@ class TestRedisClusterClient:
 
         cluster_cls.assert_called_once_with(
             startup_nodes=[ClusterNode("h1", 6379), ClusterNode("h2", 6380)],
-            retry=CLUSTER_RETRY,
+            retry=NO_RETRY,
             password="pw",
             **DEFAULTS,
         )
-        assert_cluster_retry(cluster_cls.call_args.kwargs["retry"])
+        assert_no_retry(cluster_cls.call_args.kwargs["retry"])
         kwargs = cluster_cls.call_args.kwargs
         assert "db" not in kwargs
         assert "host" not in kwargs
@@ -617,7 +710,7 @@ class TestRedisClusterClient:
 
         cluster_cls.assert_called_once_with(
             startup_nodes=[ClusterNode("h1", 6379)],
-            retry=CLUSTER_RETRY,
+            retry=NO_RETRY,
             decode_responses=False,
             lib_name=LIB_NAME,
             socket_connect_timeout=5,
@@ -657,25 +750,24 @@ class TestSentinelClient:
         sentinel_cls.assert_called_once_with(
             [("s1", 26379), ("s2", 26380)],
             sentinel_kwargs={
-                "socket_connect_timeout": 5,
-                "socket_timeout": 10,
-                "retry": COMMAND_RETRY,
+                **SENTINEL_DEFAULTS,
+                "retry": NO_RETRY,
                 "password": "spw",
                 **tls,
             },
         )
-        assert_command_retry(sentinel_cls.call_args.kwargs["sentinel_kwargs"]["retry"])
+        assert_no_retry(sentinel_cls.call_args.kwargs["sentinel_kwargs"]["retry"])
         sentinel = sentinel_cls.return_value
         sentinel.master_for.assert_called_once_with(
             "mymaster",
             db=3,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             username="app",
             password="pw",
             **tls,
             **DEFAULTS,
         )
-        assert_command_retry(sentinel.master_for.call_args.kwargs["retry"])
+        assert_no_retry(sentinel.master_for.call_args.kwargs["retry"])
         assert client is sentinel.master_for.return_value
         redis_cls.assert_not_called()
 
@@ -689,41 +781,193 @@ class TestSentinelClient:
 
         sentinel_cls.assert_called_once_with(
             [("s1", 26379)],
-            sentinel_kwargs={
-                "socket_connect_timeout": 5,
-                "socket_timeout": 10,
-                "retry": COMMAND_RETRY,
-            },
+            sentinel_kwargs={**SENTINEL_DEFAULTS, "retry": NO_RETRY},
         )
         sentinel_cls.return_value.master_for.assert_called_once_with(
             "m",
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             password="pw",
             **{**DEFAULTS, "decode_responses": False},
         )
 
-    def test_options_timeouts_reach_the_sentinels(self, use_config, sentinel_cls):
+    @pytest.mark.parametrize(
+        "options, sentinel_timeouts",
+        [
+            # above the cap: the Sentinels get SENTINEL_TIMEOUT_SECONDS, the master the configured values
+            (
+                {"socket_timeout": 3, "socket_connect_timeout": 1},
+                {"socket_connect_timeout": 1, "socket_timeout": 2},
+            ),
+            (
+                {"socket_timeout": 30, "socket_connect_timeout": 20},
+                {"socket_connect_timeout": 2, "socket_timeout": 2},
+            ),
+            # below the cap: the configured values
+            (
+                {"socket_timeout": 0.5, "socket_connect_timeout": 1.5},
+                {"socket_connect_timeout": 1.5, "socket_timeout": 0.5},
+            ),
+        ],
+        ids=["one-above-the-cap", "both-above-the-cap", "below-the-cap"],
+    )
+    def test_options_timeouts_reach_the_sentinels_capped(
+        self, use_config, sentinel_cls, options, sentinel_timeouts
+    ):
         use_config(
             cluster(
-                "z",
-                mode="sentinel",
-                hosts="s1:26379",
-                masterName="m",
-                options={"socket_timeout": 3, "socket_connect_timeout": 1},
+                "z", mode="sentinel", hosts="s1:26379", masterName="m", options=options
             )
         )
 
         RedisConnectionManager.get_connection()
 
         assert sentinel_cls.call_args.kwargs["sentinel_kwargs"] == {
-            "socket_connect_timeout": 1,
-            "socket_timeout": 3,
-            "retry": COMMAND_RETRY,
+            **sentinel_timeouts,
+            "retry": NO_RETRY,
         }
         kwargs = sentinel_cls.return_value.master_for.call_args.kwargs
-        assert kwargs["socket_timeout"] == 3
-        assert kwargs["socket_connect_timeout"] == 1
+        assert kwargs["socket_timeout"] == options["socket_timeout"]
+        assert kwargs["socket_connect_timeout"] == options["socket_connect_timeout"]
+
+
+SENTINEL_SECRET = "sentinel-" + secrets.token_hex(8)
+MASTER_SECRET = "master-" + secrets.token_hex(8)
+
+
+def _sentinel(*hosts: str, **sentinel_kwargs) -> _Sentinel:
+    """A _Sentinel with the Sentinel password (no connection is made until a Sentinel is asked)."""
+    return _Sentinel(
+        [(host, int(port)) for host, port in (h.rsplit(":", 1) for h in hosts)],
+        sentinel_kwargs={
+            **SENTINEL_DEFAULTS,
+            "retry": Retry(NoBackoff(), 0),
+            "password": SENTINEL_SECRET,
+            **sentinel_kwargs,
+        },
+        password=MASTER_SECRET,
+    )
+
+
+MASTER_STATE = {
+    "ip": "10.0.0.5",
+    "port": 6379,
+    "is_master": True,
+    "is_sdown": False,
+    "is_odown": False,
+    "num-other-sentinels": 1,
+}
+
+
+class TestSentinelMasterNotFound:
+    """Regression: redis-py's MasterNotFoundError named each failed Sentinel by its client repr, which lists the
+    connection arguments, the Sentinel password included; the message reaches the tool result and the log.
+    _Sentinel names each one by host:port and the error."""
+
+    def test_message_names_sentinels_by_address_without_the_password(self):
+        sentinel = _sentinel("s1:26379", "s2:26380", "s3:26381")
+        errors = [
+            ConnectionError("Error 111 connecting to s1:26379. Connection refused."),
+            RedisTimeoutError("Timeout reading from s2:26380"),
+            AuthenticationError("invalid username-password pair"),
+        ]
+        for client, error in zip(sentinel.sentinels, errors):
+            client.sentinel_masters = Mock(side_effect=error)
+
+        with pytest.raises(MasterNotFoundError) as exc:
+            sentinel.discover_master("mymaster")
+
+        message = str(exc.value)
+        assert message == (
+            "No master found for 'mymaster' : "
+            "s1:26379 - ConnectionError: Error 111 connecting to s1:26379. Connection refused., "
+            "s2:26380 - TimeoutError: Timeout reading from s2:26380, "
+            "s3:26381 - AuthenticationError: invalid username-password pair"
+        )
+        assert SENTINEL_SECRET not in message
+        assert MASTER_SECRET not in message
+        assert "password=" not in message
+        assert "ConnectionPool" not in message
+        for client in sentinel.sentinels:
+            client.sentinel_masters.assert_called_once_with()
+
+    def test_no_sentinel_knows_the_master(self):
+        sentinel = _sentinel("s1:26379", "s2:26380")
+        for client in sentinel.sentinels:
+            client.sentinel_masters = Mock(return_value={"other": MASTER_STATE})
+
+        with pytest.raises(MasterNotFoundError) as exc:
+            sentinel.discover_master("mymaster")
+
+        assert str(exc.value) == "No master found for 'mymaster'"
+
+    def test_master_in_a_bad_state_is_skipped(self):
+        sentinel = _sentinel("s1:26379", "s2:26380")
+        first, second = sentinel.sentinels
+        first.sentinel_masters = Mock(
+            return_value={"mymaster": {**MASTER_STATE, "is_odown": True}}
+        )
+        second.sentinel_masters = Mock(
+            return_value={"mymaster": {**MASTER_STATE, "ip": "10.0.0.6"}}
+        )
+
+        assert sentinel.discover_master("mymaster") == ("10.0.0.6", 6379)
+
+    def test_answering_sentinel_after_a_failed_one(self):
+        """As in redis-py: the address comes from the first Sentinel that knows a healthy master, and that
+        Sentinel is asked first next time."""
+        sentinel = _sentinel("s1:26379", "s2:26380")
+        first, second = sentinel.sentinels
+        first.sentinel_masters = Mock(side_effect=ConnectionError("refused"))
+        second.sentinel_masters = Mock(return_value={"mymaster": MASTER_STATE})
+
+        assert sentinel.discover_master("mymaster") == ("10.0.0.5", 6379)
+        assert sentinel.sentinels == [second, first]
+
+    def test_configured_sentinel_cluster_uses_sentinel_subclass(self, use_config):
+        use_config(
+            cluster("x", mode="sentinel", hosts="s1:26379", masterName="mymaster"),
+            passwords={"x_pass": MASTER_SECRET, "x_sentinel_pass": SENTINEL_SECRET},
+        )
+
+        client = RedisConnectionManager.get_connection()
+
+        assert type(client.connection_pool.sentinel_manager) is _Sentinel
+
+    def test_refused_sentinels_over_real_sockets(self, use_config):
+        """Nothing listens on the Sentinel ports: the tool's error names both of them and holds neither
+        password."""
+        first = redis_servers.free_port()
+        second = redis_servers.free_port()
+        while second == first:
+            second = redis_servers.free_port()
+        use_config(
+            cluster(
+                "refused",
+                mode="sentinel",
+                hosts=f"127.0.0.1:{first},127.0.0.1:{second}",
+                masterName="mymaster",
+            ),
+            passwords={
+                "refused_pass": MASTER_SECRET,
+                "refused_sentinel_pass": SENTINEL_SECRET,
+            },
+        )
+        client = RedisConnectionManager.get_connection()
+
+        with pytest.raises(MasterNotFoundError) as exc:
+            client.ping()
+
+        message = str(exc.value)
+        assert message.startswith("No master found for 'mymaster' : "), message
+        # refused at once on Linux and macOS; Windows may first hit the connect timeout
+        for port in (first, second):
+            assert re.search(
+                rf"127\.0\.0\.1:{port} - (ConnectionError|TimeoutError): ", message
+            ), message
+        assert SENTINEL_SECRET not in message
+        assert MASTER_SECRET not in message
+        assert "password=" not in message
 
 
 class TestEntraIdClient:
@@ -743,7 +987,7 @@ class TestEntraIdClient:
             host="h",
             port=6379,
             db=0,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             credential_provider=credential_provider.provider,
             **DEFAULTS,
         )
@@ -755,7 +999,7 @@ class TestEntraIdClient:
 
         cluster_cls.assert_called_once_with(
             startup_nodes=[ClusterNode("h1", 6379)],
-            retry=CLUSTER_RETRY,
+            retry=NO_RETRY,
             credential_provider=credential_provider.provider,
             **DEFAULTS,
         )
@@ -768,8 +1012,8 @@ class TestEntraIdClient:
         credential_provider.assert_not_called()
         assert "credential_provider" not in redis_cls.call_args.kwargs
 
-    def test_provider_error_is_raised_and_not_cached(
-        self, use_config, redis_cls, credential_provider
+    def test_provider_error_is_raised_and_not_kept(
+        self, use_config, redis_cls, credential_provider, clock
     ):
         use_config(cluster("ent", entraid=True))
         credential_provider.side_effect = [
@@ -781,6 +1025,7 @@ class TestEntraIdClient:
             RedisConnectionManager.get_connection()
         redis_cls.assert_not_called()
 
+        clock(FAILED_CREATION_SECONDS)
         RedisConnectionManager.get_connection()
         assert credential_provider.call_count == 2
         redis_cls.assert_called_once()
@@ -848,6 +1093,32 @@ class TestClientKwargsHelpers:
         assert redis_cls.call_count == 2
         assert RedisConnectionManager._clients == {}
 
+    def test_create_client_max_connections(self, use_config, redis_cls, cluster_cls):
+        """max_connections wins over the default and over the cluster's options (the pub/sub client's size)."""
+        config = use_config(
+            cluster("a", options={"max_connections": 7}),
+            cluster("b"),
+            cluster("c", mode="cluster", hosts="h1:7000"),
+        )
+        a, b, c = config.clusters
+
+        create_client(a)
+        create_client(a, max_connections=3)
+        create_client(b, False, max_connections=3)
+        create_client(b)
+        create_client(c, max_connections=3)
+
+        assert [
+            call.kwargs["max_connections"] for call in redis_cls.call_args_list
+        ] == [
+            7,
+            3,
+            3,
+            MAX_CONNECTIONS,
+        ]
+        assert redis_cls.call_args_list[2].kwargs["decode_responses"] is False
+        assert cluster_cls.call_args.kwargs["max_connections"] == 3
+
 
 class TestRealClientConstruction:
     """The real redis-py classes accept the arguments (these clients connect lazily, so no server is needed)."""
@@ -887,9 +1158,9 @@ class TestRealClientConstruction:
         }
         kwargs = pool.connection_kwargs
         assert {k: kwargs.get(k) for k in expected} == expected
-        # redis-py copies the Retry into each connection without adding TimeoutError (no retry_on_timeout)
-        assert_command_retry(kwargs["retry"])
-        assert_command_retry(pool.make_connection().retry)
+        # redis-py copies the Retry into each connection, unchanged (no retry_on_timeout / retry_on_error)
+        assert_no_retry(kwargs["retry"])
+        assert_no_retry(pool.make_connection().retry)
 
     def test_standalone_defaults(self, use_config):
         use_config(cluster("a", hosts="h:6379"))
@@ -900,7 +1171,20 @@ class TestRealClientConstruction:
         assert pool.max_connections == MAX_CONNECTIONS
         assert pool.connection_kwargs["socket_connect_timeout"] == 5
         assert pool.connection_kwargs["socket_timeout"] == 10
-        assert_command_retry(pool.make_connection().retry)
+        assert_no_retry(pool.make_connection().retry)
+
+    def test_pubsub_client_has_a_pool_of_its_own(self, use_config):
+        use_config(cluster("a", hosts="h:6379", options={"max_connections": 7}))
+
+        client = RedisConnectionManager.get_connection()
+        pubsub = RedisConnectionManager.get_connection(pubsub=True)
+
+        assert type(pubsub) is Redis
+        assert pubsub.connection_pool is not client.connection_pool
+        assert client.connection_pool.max_connections == 7
+        assert pubsub.connection_pool.max_connections == MAX_PUBSUB_CONNECTIONS
+        assert pubsub.connection_pool.connection_kwargs["host"] == "h"
+        assert_no_retry(pubsub.connection_pool.make_connection().retry)
 
     def test_sentinel_master_and_sentinels(self, use_config):
         use_config(
@@ -923,11 +1207,12 @@ class TestRealClientConstruction:
         assert pool.service_name == "mymaster"
         assert pool.connection_class is redis.sentinel.SentinelManagedSSLConnection
         assert pool.max_connections == MAX_CONNECTIONS
-        assert_command_retry(pool.connection_kwargs["retry"])
-        assert_command_retry(pool.make_connection().retry)
+        assert_no_retry(pool.connection_kwargs["retry"])
+        assert_no_retry(pool.make_connection().retry)
         assert pool.connection_kwargs["db"] == 2
         assert pool.connection_kwargs["password"] == "pw"
         assert pool.connection_kwargs["decode_responses"] is False
+        assert type(pool.sentinel_manager) is _Sentinel
         sentinels = pool.sentinel_manager.sentinels
         assert [
             (
@@ -940,9 +1225,13 @@ class TestRealClientConstruction:
             assert s.connection_pool.connection_class is redis.connection.SSLConnection
             kwargs = s.connection_pool.connection_kwargs
             assert kwargs["password"] == "spw"
-            assert kwargs["socket_connect_timeout"] == 5
-            assert kwargs["socket_timeout"] == 10
-            assert_command_retry(kwargs["retry"])
+            assert kwargs["socket_connect_timeout"] == SENTINEL_TIMEOUT_SECONDS
+            assert kwargs["socket_timeout"] == SENTINEL_TIMEOUT_SECONDS
+            assert_no_retry(kwargs["retry"])
+            assert_no_retry(s.connection_pool.make_connection().retry)
+        # the master keeps the cluster's timeouts
+        assert pool.connection_kwargs["socket_connect_timeout"] == 5
+        assert pool.connection_kwargs["socket_timeout"] == 10
 
 
 class TestClientCache:
@@ -997,7 +1286,71 @@ class TestClientCache:
         assert RedisConnectionManager.get_connection(cluster="b") is b
         assert redis_cls.call_count == 2
 
-    def test_failed_creation_is_not_cached(self, use_config, redis_cls, caplog):
+    def test_pubsub_gets_its_own_client(self, use_config, redis_cls):
+        """Subscriptions hold their connection for as long as they live: they get a client of their own, with
+        MAX_PUBSUB_CONNECTIONS, so they never take the connections the tool calls need."""
+        use_config(cluster("a"))
+
+        client = RedisConnectionManager.get_connection()
+        pubsub = RedisConnectionManager.get_connection(pubsub=True)
+
+        assert pubsub is not client
+        assert [c.kwargs["max_connections"] for c in redis_cls.call_args_list] == [
+            MAX_CONNECTIONS,
+            MAX_PUBSUB_CONNECTIONS,
+        ]
+        assert RedisConnectionManager.get_connection(pubsub=True) is pubsub
+        assert RedisConnectionManager.get_connection(cluster="a", pubsub=True) is pubsub
+        assert RedisConnectionManager.get_connection() is client
+        assert redis_cls.call_count == 2
+        assert set(RedisConnectionManager._clients) == {
+            ("a", True, False),
+            ("a", True, True),
+        }
+
+    def test_pubsub_first(self, use_config, redis_cls):
+        use_config(cluster("a"))
+
+        pubsub = RedisConnectionManager.get_connection(pubsub=True)
+        client = RedisConnectionManager.get_connection()
+
+        assert pubsub is not client
+        assert redis_cls.call_args.kwargs["max_connections"] == MAX_CONNECTIONS
+
+    def test_pubsub_size_wins_over_the_max_connections_option(
+        self, use_config, redis_cls
+    ):
+        use_config(cluster("a", options={"max_connections": 4}))
+
+        RedisConnectionManager.get_connection()
+        RedisConnectionManager.get_connection(pubsub=True)
+
+        assert [c.kwargs["max_connections"] for c in redis_cls.call_args_list] == [
+            4,
+            MAX_PUBSUB_CONNECTIONS,
+        ]
+
+    def test_pubsub_clients_per_cluster_and_decode_mode(
+        self, use_config, redis_cls, cluster_cls
+    ):
+        use_config(cluster("a"), cluster("c", mode="cluster", hosts="h1:7000"))
+
+        a = RedisConnectionManager.get_connection(cluster="a", pubsub=True)
+        a_raw = RedisConnectionManager.get_connection(
+            cluster="a", decode_responses=False, pubsub=True
+        )
+        c = RedisConnectionManager.get_connection(cluster="c", pubsub=True)
+
+        assert len({id(a), id(a_raw), id(c)}) == 3
+        assert set(RedisConnectionManager._clients) == {
+            ("a", True, True),
+            ("a", False, True),
+            ("c", True, True),
+        }
+        cluster_cls.assert_called_once()
+        assert cluster_cls.call_args.kwargs["max_connections"] == MAX_PUBSUB_CONNECTIONS
+
+    def test_failed_creation_is_not_kept(self, use_config, redis_cls, caplog, clock):
         use_config(cluster("a"))
         created = Mock(spec=Redis)
         redis_cls.side_effect = [ConnectionError("Connection refused"), created]
@@ -1008,11 +1361,13 @@ class TestClientCache:
         assert "Failed to create the Redis client for cluster a" in caplog.text
         assert "Connection refused" in caplog.text
 
+        clock(FAILED_CREATION_SECONDS)
         assert RedisConnectionManager.get_connection() is created
         assert RedisConnectionManager.get_connection() is created
         assert redis_cls.call_count == 2
+        assert RedisConnectionManager._failures == {}
 
-    def test_failed_cluster_creation_is_not_cached(self, use_config, cluster_cls):
+    def test_failed_cluster_creation_is_not_kept(self, use_config, cluster_cls, clock):
         use_config(cluster("c", mode="cluster", hosts="h1:7000"))
         created = Mock(spec=RedisCluster)
         cluster_cls.side_effect = [
@@ -1023,6 +1378,7 @@ class TestClientCache:
         with pytest.raises(redis.exceptions.RedisClusterException):
             RedisConnectionManager.get_connection()
 
+        clock(FAILED_CREATION_SECONDS)
         assert RedisConnectionManager.get_connection() is created
         assert cluster_cls.call_count == 2
 
@@ -1049,7 +1405,9 @@ class TestClientCache:
         clients = [
             RedisConnectionManager.get_connection(cluster="a"),
             RedisConnectionManager.get_connection(cluster="a", decode_responses=False),
+            RedisConnectionManager.get_connection(cluster="a", pubsub=True),
             RedisConnectionManager.get_connection(cluster="b"),
+            RedisConnectionManager.get_connection(cluster="b", pubsub=True),
         ]
 
         RedisConnectionManager.reset()
@@ -1058,6 +1416,7 @@ class TestClientCache:
             client.close.assert_called_once_with()
         assert RedisConnectionManager._clients == {}
         assert RedisConnectionManager._locks == {}
+        assert RedisConnectionManager._failures == {}
 
     def test_reset_creates_new_clients_afterwards(self, use_config, redis_cls):
         use_config(cluster("a"))
@@ -1085,6 +1444,159 @@ class TestClientCache:
         RedisConnectionManager.reset()
 
         assert RedisConnectionManager._clients == {}
+
+
+class TestFailedCreation:
+    """A failed client creation (unreachable Redis Cluster, Entra ID error, ...) is remembered for
+    FAILED_CREATION_SECONDS: the calls waiting for it, and the calls right after it, get the same error instead of
+    each spending another connect timeout. A call after that window tries again; reset() forgets the failure."""
+
+    def test_a_call_within_the_window_gets_the_same_error(
+        self, use_config, redis_cls, caplog, clock
+    ):
+        use_config(cluster("a"))
+        redis_cls.side_effect = ConnectionError("Connection refused")
+
+        with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
+            with pytest.raises(ConnectionError) as first:
+                RedisConnectionManager.get_connection()
+            clock(FAILED_CREATION_SECONDS - 0.1)
+            with pytest.raises(ConnectionError) as second:
+                RedisConnectionManager.get_connection(cluster="a")
+
+        assert second.value is first.value
+        redis_cls.assert_called_once()
+        # logged once, when the creation failed
+        assert caplog.text.count("Failed to create the Redis client for cluster a") == 1
+
+    def test_waiters_get_the_same_error_without_creating_again(
+        self, use_config, redis_cls, clock
+    ):
+        use_config(cluster("a"))
+        started = threading.Event()
+        release = threading.Event()
+
+        def create(**kwargs):
+            started.set()
+            release.wait(WAIT_SECONDS * 2)
+            raise ConnectionError("Connection refused")
+
+        redis_cls.side_effect = create
+        errors = []
+
+        def connect():
+            try:
+                RedisConnectionManager.get_connection(cluster="a")
+            except ConnectionError as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=connect, daemon=True) for _ in range(4)]
+        threads[0].start()
+        try:
+            assert started.wait(WAIT_SECONDS)
+            for t in threads[1:]:
+                t.start()
+            # the others wait for the cluster's lock while the first creation runs
+            threads[1].join(0.2)
+            assert threads[1].is_alive()
+        finally:
+            release.set()
+            for t in threads:
+                t.join(WAIT_SECONDS)
+
+        assert not any(t.is_alive() for t in threads)
+        assert len(errors) == 4
+        assert all(e is errors[0] for e in errors)
+        redis_cls.assert_called_once()
+
+    def test_a_call_after_the_window_tries_again(self, use_config, redis_cls, clock):
+        use_config(cluster("a"))
+        created = Mock(spec=Redis)
+        redis_cls.side_effect = [ConnectionError("Connection refused"), created]
+
+        with pytest.raises(ConnectionError):
+            RedisConnectionManager.get_connection()
+        clock(FAILED_CREATION_SECONDS)
+
+        assert RedisConnectionManager.get_connection() is created
+        assert redis_cls.call_count == 2
+        assert RedisConnectionManager._failures == {}
+
+    def test_a_new_failure_starts_a_new_window(self, use_config, redis_cls, clock):
+        use_config(cluster("a"))
+        created = Mock(spec=Redis)
+        redis_cls.side_effect = [
+            ConnectionError("first"),
+            ConnectionError("second"),
+            created,
+        ]
+
+        with pytest.raises(ConnectionError, match="first"):
+            RedisConnectionManager.get_connection()
+        clock(FAILED_CREATION_SECONDS + 1)
+        with pytest.raises(ConnectionError, match="second"):
+            RedisConnectionManager.get_connection()
+        clock(FAILED_CREATION_SECONDS - 0.1)
+        with pytest.raises(ConnectionError, match="second"):
+            RedisConnectionManager.get_connection()
+        assert redis_cls.call_count == 2
+
+        clock(0.1)
+        assert RedisConnectionManager.get_connection() is created
+        assert redis_cls.call_count == 3
+
+    def test_without_a_window_every_call_tries_again(
+        self, use_config, redis_cls, monkeypatch
+    ):
+        monkeypatch.setattr(connection_module, "FAILED_CREATION_SECONDS", 0)
+        use_config(cluster("a"))
+        redis_cls.side_effect = [ConnectionError("first"), ConnectionError("second")]
+
+        with pytest.raises(ConnectionError, match="first"):
+            RedisConnectionManager.get_connection()
+        with pytest.raises(ConnectionError, match="second"):
+            RedisConnectionManager.get_connection()
+
+        assert redis_cls.call_count == 2
+
+    def test_reset_forgets_the_failure(self, use_config, redis_cls, clock):
+        use_config(cluster("a"))
+        created = Mock(spec=Redis)
+        redis_cls.side_effect = [ConnectionError("Connection refused"), created]
+        with pytest.raises(ConnectionError):
+            RedisConnectionManager.get_connection()
+
+        RedisConnectionManager.reset()
+
+        assert RedisConnectionManager._failures == {}
+        assert RedisConnectionManager.get_connection() is created
+        assert redis_cls.call_count == 2
+
+    def test_the_failure_is_kept_per_client(self, use_config, redis_cls, clock):
+        """Only the client that failed (cluster, decode mode, pub/sub) is affected."""
+        use_config(cluster("a"), cluster("b"))
+
+        def create(**kwargs):
+            if (
+                kwargs["host"] == "a.example"
+                and kwargs["decode_responses"]
+                and kwargs["max_connections"] == MAX_CONNECTIONS
+            ):
+                raise ConnectionError("down")
+            return Mock(spec=Redis)
+
+        redis_cls.side_effect = create
+
+        with pytest.raises(ConnectionError, match="down"):
+            RedisConnectionManager.get_connection(cluster="a")
+        RedisConnectionManager.get_connection(cluster="a", decode_responses=False)
+        RedisConnectionManager.get_connection(cluster="a", pubsub=True)
+        RedisConnectionManager.get_connection(cluster="b")
+        with pytest.raises(ConnectionError, match="down"):
+            RedisConnectionManager.get_connection(cluster="a")
+
+        assert redis_cls.call_count == 4
+        assert set(RedisConnectionManager._failures) == {("a", True, False)}
 
 
 class TestClusterSelection:
@@ -1187,7 +1699,7 @@ class TestClusterSelection:
             host="legacy.example",
             port=6390,
             db=4,
-            retry=COMMAND_RETRY,
+            retry=NO_RETRY,
             username="legacy-user",
             password="legacy-pw",
             **DEFAULTS,
@@ -1393,7 +1905,7 @@ class TestRealClients:
 
         client = RedisConnectionManager.get_connection()
         assert isinstance(client, RedisCluster)
-        assert_cluster_retry(client.retry)
+        assert_no_retry(client.retry)
         keys = [unique_key(client, f"c{i}") for i in range(10)]
         for i, key in enumerate(keys):
             assert client.set(key, f"v{i}") is True
@@ -1469,7 +1981,7 @@ class TestRealClients:
         )
 
         client = RedisConnectionManager.get_connection()
-        # no backoff to wait for: the retry policy retries a dropped connection once, immediately
+        # a single attempt, no backoff to wait for
         with pytest.raises(AuthenticationError):
             client.ping()
 
@@ -1496,16 +2008,50 @@ def src_tools(monkeypatch):
     )
 
 
-def _list_tool_server(cluster_config: dict):
+def _list_tool_server(cluster_config: dict, toolsets=("core", "data")):
     """build_server for one writable cluster with the data tools, the config active as at startup."""
-    config = parse_config({"toolsets": ["core", "data"], "clusters": [cluster_config]})
+    config = parse_config({"toolsets": list(toolsets), "clusters": [cluster_config]})
     set_config(config)
     return build_server(config)
 
 
+@pytest.mark.integration
+class TestPubSubClient:
+    @pytest.mark.asyncio
+    async def test_subscriptions_do_not_take_the_tool_connections(
+        self, standalone_server, unique_key, src_tools
+    ):
+        """Regression: each subscription holds a connection for as long as it lives, and they came from the
+        pool of the tool calls: MAX_CONNECTIONS open subscriptions left no connection for the other tools
+        ("Too many connections"). Subscriptions now use a client of their own."""
+        mcp = _list_tool_server(
+            {"name": "local", "hosts": standalone_server.address},
+            toolsets=("core", "data", "pubsub"),
+        )
+        key = unique_key(standalone_server.client(), "list")
+
+        for i in range(MAX_CONNECTIONS + 1):
+            result = json.loads(
+                await _call_tool(mcp, "subscribe", channel=f"{key}:channel{i}")
+            )
+            assert "subscription_id" in result, result
+
+        assert await _call_tool(mcp, "lpush", name=key, value="v") == (
+            f"Value 'v' pushed to the left of list '{key}'."
+        )
+        assert await _call_tool(mcp, "llen", name=key) == "1"
+        client = RedisConnectionManager.get_connection()
+        pubsub = RedisConnectionManager.get_connection(pubsub=True)
+        assert pubsub is not client
+        assert len(pubsub.connection_pool._in_use_connections) == MAX_CONNECTIONS + 1
+        assert len(client.connection_pool._in_use_connections) == 0
+
+
 # Short enough to fail while the server sleeps (DEBUG SLEEP below), long enough for a loaded CI runner.
 WRITE_SOCKET_TIMEOUT = 1
-SLEEP_SECONDS = 2
+# Long enough that the server still sleeps when the write times out: the block of debug_sleep starts about
+# half a second into the sleep, and the write then needs a moment to be sent.
+SLEEP_SECONDS = 3
 
 
 def _list_after_wakeup(server: redis_servers.RedisServer, key: str) -> List[str]:
@@ -1551,7 +2097,8 @@ class TestNoDoubleWrite:
         assert "Timeout" in result, result
         assert result.startswith(f"Error pushing value to list '{key}'")
         assert "did not finish within" not in result
-        assert WRITE_SOCKET_TIMEOUT <= elapsed < TOOL_TIMEOUT_SECONDS
+        # the socket timeout (minus the resolution of a coarse clock), not the tool timeout
+        assert WRITE_SOCKET_TIMEOUT - 0.05 <= elapsed < TOOL_TIMEOUT_SECONDS
 
     @pytest.mark.asyncio
     async def test_timed_out_lpush_is_not_sent_again_in_cluster_mode(
@@ -1580,4 +2127,66 @@ class TestNoDoubleWrite:
         assert "Timeout" in result, result
         assert result.startswith(f"Error pushing value to list '{key}'")
         # one socket timeout, then the topology refresh (the other primaries answer at once)
-        assert WRITE_SOCKET_TIMEOUT <= elapsed < TOOL_TIMEOUT_SECONDS
+        assert WRITE_SOCKET_TIMEOUT - 0.05 <= elapsed < TOOL_TIMEOUT_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_dropped_lpush_is_not_sent_again(
+        self, standalone_server, unique_key, src_tools, monkeypatch
+    ):
+        """Regression: the client sent a command again when its connection dropped (one retry on
+        ConnectionError). A connection can drop after the server ran the command (client killed, network cut
+        before the reply), so the push was applied twice.
+
+        While the server sleeps, the push is sent and then a CLIENT KILL of the tool's connection: when the
+        server wakes up it runs both in that order, so the push is applied and its connection closed before
+        the reply goes out."""
+        name = "mcp-test-" + uuid.uuid4().hex[:12]
+        mcp = _list_tool_server(
+            {
+                "name": "local",
+                "hosts": standalone_server.address,
+                "options": {"client_name": name},
+            }
+        )
+        key = unique_key(standalone_server.client(), "list")
+        # leaves a connected connection in the pool; the push below uses it
+        assert await _call_tool(mcp, "llen", name=key) == "0"
+        with standalone_server.client() as admin:
+            ids = [c["id"] for c in admin.client_list() if c["name"] == name]
+        assert len(ids) == 1, ids
+
+        lpush_sent = threading.Event()
+        send_command = redis.connection.AbstractConnection.send_command
+
+        def send_and_report(self, *args, **kwargs):
+            send_command(self, *args, **kwargs)
+            if args and args[0] == "LPUSH":
+                lpush_sent.set()
+
+        monkeypatch.setattr(
+            redis.connection.AbstractConnection, "send_command", send_and_report
+        )
+        # connected before the sleep, so its command is read right after the push
+        killer = standalone_server.connection()
+        try:
+            with redis_servers.debug_sleep(standalone_server, SLEEP_SECONDS):
+                push = asyncio.create_task(
+                    _call_tool(mcp, "lpush", name=key, value="once")
+                )
+                assert await asyncio.to_thread(lpush_sent.wait, WAIT_SECONDS)
+                # the push has reached the sleeping server (local socket; with a margin)
+                await asyncio.sleep(0.2)
+                killer.send_command("CLIENT", "KILL", "ID", ids[0])
+                result = await push
+            assert killer.read_response() == 1
+        finally:
+            killer.disconnect()
+
+        # applied once (twice when the client sent it again on a new connection)
+        elements = _list_after_wakeup(standalone_server, key)
+        assert elements == ["once"]
+        # the caller gets the dropped connection, not a success after a resend
+        assert result.startswith(f"Error pushing value to list '{key}'"), result
+        assert "Timeout" not in result
+        # the next call gets a new connection
+        assert await _call_tool(mcp, "llen", name=key) == "1"

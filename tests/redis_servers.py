@@ -153,6 +153,14 @@ class RedisServer:
         """A plain client of this server (decoding responses, no retries); kwargs override the defaults."""
         return _client(self.port, self.password, **kwargs)
 
+    def connection(self, **kwargs: Any) -> redis.Connection:
+        """A single connected connection of this server (authenticated if it has a password), for sending a
+        command now and reading its reply later (``send_command`` / ``read_response``). Disconnect it when done.
+        """
+        connection = self.client(**kwargs).connection_pool.make_connection()
+        connection.connect()
+        return connection
+
     def log_tail(self, lines: int = 20) -> str:
         try:
             text = (self.directory / "redis.log").read_text(errors="replace")
@@ -350,29 +358,50 @@ def running_cluster(directory: Path, size: int = 3) -> Iterator[RedisClusterNode
         cluster.stop()
 
 
+# How long the busy probe waits for a reply, and how many of these waits in a row must pass without one: a
+# single slow reply on a loaded machine must not pass for the hang of DEBUG SLEEP.
+PROBE_TIMEOUT = 0.25
+SILENT_PROBES = 2
+
+
 def _wait_until_busy(
     server: RedisServer, sleeper: threading.Thread, deadline: float
 ) -> bool:
-    """True once the server stops answering (an inline PING on a connection of its own gets no reply); False
-    if the sleeper ended or the deadline passed first."""
+    """True once the server stops answering: an inline PING on a connection of its own gets no reply for
+    SILENT_PROBES probe timeouts in a row. False if the sleeper ended or the deadline passed first."""
     with socket.create_connection((HOST, server.port), timeout=1) as probe:
-        probe.settimeout(0.2)
+        probe.settimeout(PROBE_TIMEOUT)
+        reply = b""
+        waiting = False  # a PING was sent and its reply has not arrived yet
+        silent = 0
         while time.monotonic() < deadline and sleeper.is_alive():
-            # any reply, even -NOAUTH on a server with a password, means it still processes commands
-            probe.sendall(b"PING\r\n")
+            if not waiting:
+                probe.sendall(b"PING\r\n")
+                waiting = True
             try:
-                if not probe.recv(1024):
-                    raise RuntimeError("the server closed the probe connection")
+                data = probe.recv(1024)
             except socket.timeout:
-                return True
-            time.sleep(0.01)
+                silent += 1
+                if silent >= SILENT_PROBES:
+                    return True
+                continue
+            if not data:
+                raise RuntimeError("the server closed the probe connection")
+            # any reply, even -NOAUTH on a server with a password, means it still processes commands
+            silent = 0
+            reply += data
+            if reply.endswith(b"\r\n"):
+                reply = b""
+                waiting = False
+                time.sleep(0.01)
     return False
 
 
 @contextmanager
 def debug_sleep(server: RedisServer, seconds: float) -> Iterator[None]:
     """Makes the server hang: DEBUG SLEEP runs on a connection of its own, and the block starts once the
-    server has stopped answering. On exit it waits until the sleep is over (the server answers again)."""
+    server has stopped answering (for SILENT_PROBES * PROBE_TIMEOUT, so the block has a little less than
+    ``seconds``). On exit it waits until the sleep is over (the server answers again)."""
     sleeper = server.client(socket_timeout=seconds + STARTUP_TIMEOUT)
     errors: List[BaseException] = []
 

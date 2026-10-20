@@ -26,13 +26,25 @@ CONFIG_API_KEY = "0123456789abcdef0123456789abcdef"
 # what --api-key / REDIS_MCP_API_KEY set (e.g. from a Secret), different from the config's apiKey
 OVERRIDE_API_KEY = "fedcba9876543210fedcba9876543210"
 
-# values api_key_error refuses: blank, padded (could never match a trimmed header) and template placeholders
+# values api_key_error refuses: padded (could never match a trimmed header) and template placeholders
 INVALID_API_KEYS = [
-    ("   ", "blank"),
     (" padded-key-0123456789 ", "whitespace"),
     ("<api-key-here>", "placeholder"),
     ("${REDIS_MCP_API_KEY}", "placeholder"),
 ]
+
+# a blank --api-key / REDIS_MCP_API_KEY is refused with its own message (an empty one is ignored)
+BLANK_API_KEYS = ["   ", "\t", " \n "]
+BLANK_API_KEY_IDS = ["spaces", "tab", "newline"]
+BLANK_API_KEY_ERROR = (
+    "--api-key / REDIS_MCP_API_KEY is blank; set a key, or leave it empty or unset to keep apiKey"
+    " from the config"
+)
+
+LEGACY_CA_PATH_ERROR = (
+    "--ssl-ca-path / REDIS_SSL_CA_PATH is not supported with --cluster-mode (redis-py's RedisCluster"
+    " ignores it); use --ssl-ca-certs / REDIS_SSL_CA_CERTS"
+)
 
 # --url values that do not count as a URL (gemini-cli passes "${REDIS_URL}" verbatim when it is not set)
 PLACEHOLDER_URLS = ["", "   ", "${REDIS_URL}", " ${REDIS_URL} "]
@@ -549,31 +561,47 @@ class TestCLI:
 
     @patch("src.main.RedisMCPServer")
     def test_cli_cluster_mode_with_ca_path_is_refused(self, mock_server_class):
-        """RedisCluster ignores ssl_ca_path, so the nodes would be verified against the system CAs instead."""
+        """RedisCluster ignores ssl_ca_path, so the nodes would be verified against the system CAs instead.
+        The error names the flags the user set, not the YAML keys they map to."""
         with legacy_settings():
             result = self.runner.invoke(
                 cli, ["--cluster-mode", "--ssl", "--ssl-ca-path", "/etc/ssl/certs"]
             )
 
         assert result.exit_code == 2
-        assert result.stderr.startswith("redis-mcp: Invalid config")
+        assert result.stderr == f"redis-mcp: {LEGACY_CA_PATH_ERROR}\n"
+        assert "caPath" not in result.stderr
         mock_server_class.assert_not_called()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="src bug: in the legacy mode the error names the YAML keys (clusters[0]: tls.caPath, caFile)"
-        " instead of --ssl-ca-path / REDIS_SSL_CA_PATH and --ssl-ca-certs, which the user actually set",
-    )
     @patch("src.main.RedisMCPServer")
-    def test_cli_cluster_mode_ca_path_error_names_the_flag(self, mock_server_class):
+    def test_cli_cluster_mode_with_ca_certs_is_accepted(self, mock_server_class):
+        """The alternative the refusal names works."""
         with legacy_settings():
             result = self.runner.invoke(
-                cli, ["--cluster-mode", "--ssl", "--ssl-ca-path", "/etc/ssl/certs"]
+                cli, ["--cluster-mode", "--ssl", "--ssl-ca-certs", "/etc/ssl/ca.pem"]
             )
 
-        assert result.exit_code == 2
-        assert "--ssl-ca-path" in result.stderr
-        assert "--ssl-ca-certs" in result.stderr
+        assert result.exit_code == 0, result.output
+        config = mock_server_class.call_args.kwargs["config"]
+        cluster = config.cluster("default")
+        assert cluster.mode == "cluster"
+        assert cluster.tls.ca_file == "/etc/ssl/ca.pem"
+        assert cluster.tls.ca_path is None
+
+    @pytest.mark.parametrize(
+        "args",
+        [["--ssl-ca-path", "/etc/ssl/certs"], ["--cluster-mode", "--ssl-ca-path", "x"]],
+        ids=["standalone", "cluster-without-ssl"],
+    )
+    @patch("src.main.RedisMCPServer")
+    def test_cli_ca_path_without_cluster_mode_and_ssl_is_accepted(
+        self, mock_server_class, args
+    ):
+        with legacy_settings():
+            result = self.runner.invoke(cli, args)
+
+        assert result.exit_code == 0, result.output
+        mock_server_class.assert_called_once()
 
     @pytest.mark.parametrize("url", PLACEHOLDER_URLS, ids=PLACEHOLDER_URL_IDS)
     @patch("src.main.parse_redis_uri")
@@ -1027,9 +1055,28 @@ class TestCLIConfig:
         assert result.exit_code == 2
         assert result.stderr.startswith("redis-mcp: --api-key / REDIS_MCP_API_KEY: ")
         assert result.stderr.count("\n") == 1
-        if api_key.strip():
-            # the error explains the problem without repeating the value
-            assert api_key.strip() not in result.output
+        # the error explains the problem without repeating the value
+        assert api_key.strip() not in result.output
+        server_class.assert_not_called()
+
+    @pytest.mark.parametrize("source", ["option", "env"])
+    @pytest.mark.parametrize("legacy", [False, True], ids=["config", "legacy"])
+    @pytest.mark.parametrize("api_key", BLANK_API_KEYS, ids=BLANK_API_KEY_IDS)
+    def test_blank_api_key_exits_2(
+        self, tmp_path, server_class, source, legacy, api_key
+    ):
+        """Unlike an empty value, a blank one is a mistake (e.g. a Secret holding a newline): refused."""
+        args = [] if legacy else ["--config", str(write_config(tmp_path))]
+        env = {}
+        if source == "option":
+            args += ["--api-key", api_key]
+        else:
+            env = {"REDIS_MCP_API_KEY": api_key}
+
+        result = self.runner.invoke(cli, args, env=env)
+
+        assert result.exit_code == 2
+        assert result.stderr == f"redis-mcp: {BLANK_API_KEY_ERROR}\n"
         server_class.assert_not_called()
 
     def test_invalid_api_key_also_fails_in_legacy_mode(self, server_class):
@@ -1357,8 +1404,36 @@ class TestMain:
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert err.startswith("redis-mcp: --api-key / REDIS_MCP_API_KEY: ")
-        if api_key.strip():
-            assert api_key.strip() not in err
+        assert api_key.strip() not in err
+        server_class.assert_not_called()
+
+    @pytest.mark.parametrize("config_file", [False, True], ids=["legacy", "config"])
+    @pytest.mark.parametrize("api_key", BLANK_API_KEYS, ids=BLANK_API_KEY_IDS)
+    def test_blank_api_key_env_exits_2(
+        self, tmp_path, monkeypatch, capsys, server_class, config_file, api_key
+    ):
+        if config_file:
+            monkeypatch.setenv("REDIS_MCP_CONFIG", str(write_config(tmp_path)))
+        monkeypatch.setenv("REDIS_MCP_API_KEY", api_key)
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+
+        assert exc.value.code == 2
+        assert capsys.readouterr().err == f"redis-mcp: {BLANK_API_KEY_ERROR}\n"
+        server_class.assert_not_called()
+
+    def test_legacy_cluster_mode_with_ca_path_env_exits_2(self, capsys, server_class):
+        """REDIS_CLUSTER_MODE + REDIS_SSL + REDIS_SSL_CA_PATH: refused with the names of the settings."""
+        with patch.dict(
+            "src.common.config.REDIS_CFG",
+            {"cluster_mode": True, "ssl": True, "ssl_ca_path": "/etc/ssl/certs"},
+        ):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 2
+        assert capsys.readouterr().err == f"redis-mcp: {LEGACY_CA_PATH_ERROR}\n"
         server_class.assert_not_called()
 
     def test_invalid_config_exits_2(self, tmp_path, monkeypatch, capsys, server_class):
@@ -1432,10 +1507,19 @@ class TestApplyApiKey:
 
         assert config.api_key == "short"
 
+    @pytest.mark.parametrize("value", BLANK_API_KEYS, ids=BLANK_API_KEY_IDS)
+    def test_blank_value_raises_and_keeps_config_key(self, tmp_path, value):
+        config = make_config(tmp_path, apiKey=CONFIG_API_KEY)
+
+        with pytest.raises(ConfigError) as exc:
+            apply_api_key(config, value)
+
+        assert str(exc.value) == BLANK_API_KEY_ERROR
+        assert config.api_key == CONFIG_API_KEY
+
     @pytest.mark.parametrize(
         "value, problem",
         [
-            ("   ", "blank"),
             (" padded-key-0123456789", "whitespace"),
             ("padded-key-0123456789\n", "whitespace"),
             ("<api-key-here>", "placeholder"),
@@ -1451,6 +1535,5 @@ class TestApplyApiKey:
         message = str(exc.value)
         assert message.startswith("--api-key / REDIS_MCP_API_KEY: ")
         assert problem in message
-        if value.strip():
-            assert value.strip() not in message
+        assert value.strip() not in message
         assert config.api_key == CONFIG_API_KEY

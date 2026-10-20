@@ -1,6 +1,87 @@
+from unittest.mock import Mock, patch
+
 import pytest
+from redis import Redis
+from redis.cluster import RedisCluster
+from redis.exceptions import RedisError
 
 import src.tools.misc as misc
+
+
+@pytest.fixture
+def mock_redis_cluster():
+    """get_connection returns a RedisCluster mock (a cluster in mode: cluster)."""
+    with patch(
+        "src.common.connection.RedisConnectionManager.get_connection"
+    ) as mock_get_conn:
+        mock_cluster = Mock(spec=RedisCluster)
+        mock_get_conn.return_value = mock_cluster
+        yield mock_cluster
+
+
+@pytest.mark.asyncio
+async def test_scan_all_keys_follows_the_cursor(mock_redis_connection_manager):
+    """A standalone/sentinel client: SCAN until the cursor is back at 0."""
+    mock_redis = mock_redis_connection_manager
+    mock_redis.scan.side_effect = [(17, [b"user:1", "user:2"]), (0, [b"user:3"])]
+
+    result = await misc.scan_all_keys("user:*", batch_size=50)
+
+    assert result == ["user:1", "user:2", "user:3"]
+    assert [c.kwargs for c in mock_redis.scan.call_args_list] == [
+        {"cursor": 0, "match": "user:*", "count": 50},
+        {"cursor": 17, "match": "user:*", "count": 50},
+    ]
+    mock_redis.scan_iter.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scan_all_keys_on_a_redis_cluster_uses_scan_iter(mock_redis_cluster):
+    """RedisCluster.scan returns a cursor per node, which cannot be passed back as the cursor; scan_iter
+    walks every primary."""
+    mock_redis_cluster.scan_iter.return_value = iter([b"user:1", "user:2", b"user:3"])
+
+    result = await misc.scan_all_keys("user:*", batch_size=50)
+
+    assert result == ["user:1", "user:2", "user:3"]
+    mock_redis_cluster.scan_iter.assert_called_once_with(match="user:*", count=50)
+    mock_redis_cluster.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scan_all_keys_on_a_redis_cluster_defaults(mock_redis_cluster):
+    mock_redis_cluster.scan_iter.return_value = iter([])
+
+    assert await misc.scan_all_keys() == []
+    mock_redis_cluster.scan_iter.assert_called_once_with(match="*", count=100)
+
+
+@pytest.mark.asyncio
+async def test_scan_all_keys_on_a_redis_cluster_error(mock_redis_cluster):
+    def failing_scan(**kwargs):
+        yield b"user:1"
+        raise RedisError("CLUSTERDOWN")
+
+    mock_redis_cluster.scan_iter.side_effect = failing_scan
+
+    result = await misc.scan_all_keys("user:*")
+
+    assert result == "Error scanning all keys with pattern 'user:*': CLUSTERDOWN"
+
+
+@pytest.mark.asyncio
+async def test_scan_all_keys_error(mock_redis_connection_manager):
+    mock_redis_connection_manager.scan.side_effect = RedisError("Connection failed")
+
+    result = await misc.scan_all_keys("user:*")
+
+    assert result == "Error scanning all keys with pattern 'user:*': Connection failed"
+
+
+def test_redis_cluster_is_not_a_redis():
+    """The cluster check of scan_all_keys/dbsize: a standalone client mock must not pass for a cluster."""
+    assert not isinstance(Mock(spec=Redis), RedisCluster)
+    assert isinstance(Mock(spec=RedisCluster), RedisCluster)
 
 
 @pytest.mark.asyncio

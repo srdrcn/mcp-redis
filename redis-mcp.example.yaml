@@ -31,10 +31,10 @@ clusters:
     # modules: [json, search]      # lists the json/search tools for this cluster (Redis 8, Redis Stack)
     # tls:                         # or `tls: true` for TLS with the system CAs
     #   caFile: /etc/redis-mcp/tls/ca.crt   # caPath is not supported with mode: cluster
-    # options:                     # client tuning; the accepted keys depend on the mode (README, "Cluster options")
-    #   socket_timeout: 5
-  # A primary managed by Redis Sentinel. The Sentinels' own password is <name>_sentinel_pass, so no other cluster
-  # may be named cbuatrds_sentinel:
+    # options:                     # client tuning; keys and values depend on the mode (README, "Cluster options")
+    #   socket_timeout: 5          # seconds, a number > 0
+  # A primary managed by Redis Sentinel. Each Sentinel gets at most 2 s to name the primary. The Sentinels' own
+  # password is <name>_sentinel_pass, so no other cluster may be named cbuatrds_sentinel:
   # - name: cbuatrds
   #   mode: sentinel
   #   hosts: [cbuatrds-s1.example.com:26379, cbuatrds-s2.example.com:26379, cbuatrds-s3.example.com:26379]

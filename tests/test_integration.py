@@ -537,6 +537,41 @@ class TestMCPServerIntegration:
         assert [row["name"] for row in rows] == [LEGACY_CLUSTER]
         assert rows[0]["status"] == "ok", rows[0]
 
+    def test_legacy_pubsub_first_read_after_subscribe_gets_the_message(
+        self, redis_client, server_process
+    ):
+        """The legacy mode lists the pubsub toolset; the first read_messages after subscribe returns the
+        published message (it gets None for the skipped subscribe confirmation first and keeps reading)."""
+        channel = f"mcp:it:legacy:channel:{uuid.uuid4().hex}"
+        self._initialize_server(server_process)
+
+        subscription = self._call_tool(
+            server_process, 20, "subscribe", {"channel": channel}
+        )
+        subscription_id = subscription["structuredContent"]["result"]["subscription_id"]
+        try:
+            published = self._call_tool(
+                server_process, 21, "publish", {"channel": channel, "message": "hi"}
+            )
+            first_read = self._call_tool(
+                server_process,
+                22,
+                "read_messages",
+                {
+                    "subscription_id": subscription_id,
+                    "timeout_ms": 5000,
+                    "max_messages": 1,
+                },
+            )
+        finally:
+            self._call_tool(
+                server_process, 23, "unsubscribe", {"subscription_id": subscription_id}
+            )
+
+        assert not published.get("isError"), published
+        messages = first_read["structuredContent"]["result"]["messages"]
+        assert [(m["channel"], m["data"]) for m in messages] == [(channel, "hi")]
+
     def _request(self, server_process, request_id, method, params=None):
         """Sends a request and returns the result of the response with its id."""
         message = {"jsonrpc": "2.0", "id": request_id, "method": method}

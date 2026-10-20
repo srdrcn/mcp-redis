@@ -13,6 +13,30 @@ from src.common.subscription_manager import SubscriptionManager
 from src.tools.pub_sub import psubscribe, publish, read_messages, subscribe, unsubscribe
 
 
+def _message(data: bytes) -> dict:
+    return {
+        "type": "message",
+        "channel": b"test_channel",
+        "pattern": None,
+        "data": data,
+    }
+
+
+def _get_message(*replies):
+    """A ``PubSub.get_message`` side effect: returns ``replies`` in order (``None`` stands for the skipped
+    subscribe confirmation, which comes back at once), then blocks for the timeout and returns ``None`` like
+    the real one when nothing arrives."""
+    queue = list(replies)
+
+    def get_message(ignore_subscribe_messages=False, timeout=0.0):
+        if queue:
+            return queue.pop(0)
+        time.sleep(timeout)
+        return None
+
+    return get_message
+
+
 class TestPubSubOperations:
     """Test cases for Redis pub/sub operations."""
 
@@ -389,23 +413,46 @@ class TestPubSubOperations:
             assert result == expected
 
     @pytest.mark.asyncio
+    async def test_subscribe_uses_the_pubsub_client(self):
+        """Subscriptions hold their connection: they get a client of their own, so they never take the
+        connections the tool calls need."""
+        with patch(
+            "src.tools.pub_sub.RedisConnectionManager.get_connection"
+        ) as mock_get_conn:
+            mock_get_conn.return_value.pubsub.return_value = Mock()
+
+            result = await subscribe("test_channel")
+
+        assert result["status"] == "success"
+        mock_get_conn.assert_called_once_with(pubsub=True)
+
+    @pytest.mark.asyncio
+    async def test_psubscribe_uses_the_pubsub_client(self):
+        with patch(
+            "src.tools.pub_sub.RedisConnectionManager.get_connection"
+        ) as mock_get_conn:
+            mock_get_conn.return_value.pubsub.return_value = Mock()
+
+            result = await psubscribe("events:*")
+
+        assert result["status"] == "success"
+        mock_get_conn.assert_called_once_with(pubsub=True)
+
+    @pytest.mark.asyncio
     async def test_read_messages_success(self, mock_redis_connection_manager):
-        """Test reading messages from an active subscription."""
+        """Test reading messages from an active subscription: fewer than max_messages arrive, so the read
+        waits until timeout_ms has passed."""
         mock_redis = mock_redis_connection_manager
         mock_pubsub = Mock()
-        mock_pubsub.get_message.side_effect = [
-            {
-                "type": "message",
-                "channel": b"test_channel",
-                "pattern": None,
-                "data": b"Hello World",
-            },
-            None,
-        ]
+        mock_pubsub.get_message.side_effect = _get_message(_message(b"Hello World"))
         mock_redis.pubsub.return_value = mock_pubsub
 
         subscription = await subscribe("test_channel")
-        result = await read_messages(subscription["subscription_id"], max_messages=5)
+        start = time.monotonic()
+        result = await read_messages(
+            subscription["subscription_id"], timeout_ms=300, max_messages=5
+        )
+        elapsed = time.monotonic() - start
 
         assert result == {
             "subscription_id": subscription["subscription_id"],
@@ -419,7 +466,59 @@ class TestPubSubOperations:
                 }
             ],
         }
-        assert mock_pubsub.get_message.call_count == 2
+        # the message, then (at least) one wait for the rest of the time
+        assert mock_pubsub.get_message.call_count >= 2
+        assert elapsed >= 0.2
+        for call in mock_pubsub.get_message.call_args_list:
+            assert call.kwargs["ignore_subscribe_messages"] is True
+
+    @pytest.mark.asyncio
+    async def test_read_messages_none_before_the_first_message_does_not_end_the_read(
+        self, mock_redis_connection_manager
+    ):
+        """The first read after subscribe gets None for the skipped subscribe confirmation; the read goes
+        on and returns the message that follows."""
+        mock_redis = mock_redis_connection_manager
+        mock_pubsub = Mock()
+        mock_pubsub.get_message.side_effect = _get_message(
+            None, None, _message(b"after the confirmation")
+        )
+        mock_redis.pubsub.return_value = mock_pubsub
+
+        subscription = await subscribe("test_channel")
+        result = await read_messages(
+            subscription["subscription_id"], timeout_ms=5000, max_messages=1
+        )
+
+        assert result["message_count"] == 1
+        assert result["messages"][0]["data"] == "after the confirmation"
+        # max_messages reached: no wait for the rest of the 5 s
+        assert mock_pubsub.get_message.call_count == 3
+        timeouts = [c.kwargs["timeout"] for c in mock_pubsub.get_message.call_args_list]
+        assert all(0 < t <= 5 for t in timeouts)
+
+    @pytest.mark.asyncio
+    async def test_read_messages_with_zero_timeout_returns_immediately(
+        self, mock_redis_connection_manager
+    ):
+        mock_redis = mock_redis_connection_manager
+        mock_pubsub = Mock()
+        mock_pubsub.get_message.return_value = None
+        mock_redis.pubsub.return_value = mock_pubsub
+
+        subscription = await subscribe("test_channel")
+        start = time.monotonic()
+        result = await read_messages(
+            subscription["subscription_id"], timeout_ms=0, max_messages=10
+        )
+
+        assert result["message_count"] == 0
+        assert result["messages"] == []
+        # a single non-blocking poll
+        mock_pubsub.get_message.assert_called_once_with(
+            ignore_subscribe_messages=True, timeout=0.0
+        )
+        assert time.monotonic() - start < 2
 
     @pytest.mark.asyncio
     async def test_read_messages_multiple_without_blocking(
@@ -467,6 +566,7 @@ class TestPubSubOperations:
 
         def capture_timeout(*args, **kwargs):
             captured_timeouts.append(kwargs.get("timeout"))
+            time.sleep(kwargs.get("timeout"))
             return None
 
         mock_pubsub.get_message.side_effect = capture_timeout
@@ -500,20 +600,22 @@ class TestPubSubOperations:
     async def test_read_messages_returns_empty_list_when_no_messages(
         self, mock_redis_connection_manager
     ):
-        """Test reading when no messages are currently available."""
+        """Test reading when no messages arrive: empty after timeout_ms."""
         mock_redis = mock_redis_connection_manager
         mock_pubsub = Mock()
-        mock_pubsub.get_message.return_value = None
+        mock_pubsub.get_message.side_effect = _get_message()
         mock_redis.pubsub.return_value = mock_pubsub
 
         subscription = await subscribe("test_channel")
-        result = await read_messages(subscription["subscription_id"])
+        start = time.monotonic()
+        result = await read_messages(subscription["subscription_id"], timeout_ms=300)
 
         assert result == {
             "subscription_id": subscription["subscription_id"],
             "message_count": 0,
             "messages": [],
         }
+        assert time.monotonic() - start >= 0.2
 
     @pytest.mark.asyncio
     async def test_read_messages_unknown_subscription(self):
@@ -687,7 +789,8 @@ class TestPubSubOperations:
 
             await publish("test_channel", "test_message")
 
-            mock_get_conn.assert_called_once()
+            # publish is an ordinary call: the tool calls' client, not the pub/sub one
+            mock_get_conn.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_function_signatures(self):

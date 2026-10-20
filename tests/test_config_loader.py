@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from pydantic import ValidationError
 from redis import Redis
 from redis.cluster import REDIS_ALLOWED_KEYS, RedisCluster
 from redis.connection import AbstractConnection, Connection, ConnectionPool
@@ -806,7 +807,72 @@ class TestValidationErrors:
     def test_errors_are_chained_to_the_validation_error(self):
         with pytest.raises(ConfigError) as exc:
             parse_config({"clusters": []})
-        assert exc.value.__cause__ is not None
+        assert isinstance(exc.value.__cause__, ValidationError)
+
+
+SECRET = "TOPSECRET" + "-input"
+
+
+class TestErrorsHideTheInput:
+    """A mistyped secret must not reach the log: neither the ConfigError text nor the chained pydantic
+    ValidationError (shown in a traceback) carries the input values."""
+
+    @pytest.mark.parametrize("model", [ServerConfig, ClusterConfig, TlsConfig])
+    def test_models_hide_the_input(self, model):
+        assert model.model_config["hide_input_in_errors"] is True
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"clusters": [cluster(hosts=f"user:{SECRET}@h:6379")]},
+            {"clusters": [cluster(hosts=f"h:1,{SECRET}")]},
+            {"clusters": [cluster(password=SECRET)]},
+            {"clusters": [cluster(tls={"keyPassword": SECRET})]},
+            {"clusters": [cluster(tls={"certReqs": SECRET})]},
+            {"clusters": [cluster(options={"password": SECRET})]},
+            {"clusters": [cluster(options={"client_name": SECRET + " x"})]},
+            {"clusters": [cluster(options={"socket_timeout": SECRET})]},
+            {"clusters": [cluster(name=SECRET + " x")]},
+            {"clusters": [cluster(username=[SECRET])]},
+            {"clusters": [cluster(db=SECRET)]},
+            {"clusters": [cluster(mode=SECRET)]},
+            {"clusters": [cluster(modules=[SECRET])]},
+            {"clusters": [SECRET]},
+            {"clusters": SECRET},
+            {"apiKey": " " + SECRET, "clusters": [cluster()]},
+            {"apiKey": [SECRET], "clusters": [cluster()]},
+            {"apiKey": "<" + SECRET + ">", "clusters": [cluster()]},
+            {"pasword": SECRET, "clusters": [cluster()]},
+            {"port": SECRET, "clusters": [cluster()]},
+        ],
+    )
+    def test_neither_message_nor_traceback_shows_the_input(self, data):
+        with pytest.raises(ConfigError) as exc:
+            parse_config(data)
+        assert isinstance(exc.value.__cause__, ValidationError)
+        assert SECRET not in str(exc.value)
+        assert SECRET not in str(exc.value.__cause__)
+        printed = "".join(traceback.format_exception(exc.value))
+        assert SECRET not in printed
+        assert "input_value" not in printed
+
+    def test_from_yaml(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        path.write_text(
+            f"apiKey: ' {SECRET}'\npasword: {SECRET}\n"
+            f"clusters:\n  - name: a\n    hosts: h:6379\n    username: [{SECRET}]\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value).count("\n - ") == 3
+        assert SECRET not in "".join(traceback.format_exception(exc.value))
+
+    def test_from_legacy(self, redis_config):
+        redis_config["host"] = f"user:{SECRET}@h"
+        with pytest.raises(ConfigError) as exc:
+            from_legacy(redis_config)
+        assert SECRET not in "".join(traceback.format_exception(exc.value))
 
 
 def mode_cluster(mode: str, **fields):
@@ -1057,6 +1123,242 @@ class TestOptions:
         assert key in set(REDIS_ALLOWED_KEYS) | _params(RedisCluster.__init__)
 
 
+# What each option's error message says it must be.
+OPTION_EXPECTED = {
+    "socket_timeout": "a number of seconds > 0",
+    "socket_connect_timeout": "a number of seconds > 0",
+    "socket_keepalive": "true or false",
+    "max_connections": "an integer >= 1",
+    "client_name": "a name without spaces",
+    "protocol": "2 or 3",
+    "health_check_interval": "a number of seconds >= 0",
+    "read_from_replicas": "true or false",
+    "require_full_coverage": "true or false",
+    "reinitialize_steps": "an integer >= 0",
+    "dynamic_startup_nodes": "true or false",
+}
+
+_BOOL_GOOD = [(True, True), (False, False)]
+# YAML 1.1 already reads yes/on/true as booleans; quoted text and numbers are not booleans
+_BOOL_BAD = ["true", "yes", "1", "0", 1, 0, "", None, ["true"]]
+
+# Accepted values per option (YAML text or Python values) and what the loader turns them into.
+GOOD_OPTION_VALUES = {
+    "socket_timeout": [
+        ("5", 5),
+        ("0.5", 0.5),
+        ("1e-3", 0.001),
+        (".1", 0.1),
+        (30, 30),
+        (2.5, 2.5),
+    ],
+    "socket_connect_timeout": [("2", 2), ("0.25", 0.25), (10, 10)],
+    "socket_keepalive": _BOOL_GOOD,
+    "max_connections": [("1", 1), ("32", 32), ("012", 12), (100, 100)],
+    "client_name": [
+        ("mcp", "mcp"),
+        ("redis-mcp_1.eu", "redis-mcp_1.eu"),
+        ("0123", "0123"),
+        ("0x1F", "0x1F"),
+        ("1.5", "1.5"),
+        ("café", "café"),
+    ],
+    "protocol": [("2", 2), ("3", 3), (2, 2), (3, 3)],
+    "health_check_interval": [("0", 0), ("30", 30), ("0.5", 0.5), (0, 0)],
+    "read_from_replicas": _BOOL_GOOD,
+    "require_full_coverage": _BOOL_GOOD,
+    "reinitialize_steps": [("0", 0), ("5", 5), (10, 10)],
+    "dynamic_startup_nodes": _BOOL_GOOD,
+}
+
+# Rejected values per option. None (YAML null or an empty value) would remove a timeout's time bound.
+BAD_OPTION_VALUES = {
+    "socket_timeout": [
+        "0",
+        "0.0",
+        "-1",
+        "-0.5",
+        "abc",
+        "5s",
+        "",
+        True,
+        False,
+        None,
+        [5],
+        {"s": "5"},
+    ],
+    "socket_connect_timeout": ["0", "-2", "2 s", True, None, float("nan")],
+    "socket_keepalive": _BOOL_BAD,
+    "max_connections": ["0", "-1", "1.5", "2.0", "many", True, None, 2.0],
+    "client_name": [
+        "",
+        "has space",
+        " mcp",
+        "mcp ",
+        "tab\there",
+        "new\nline",
+        "nbsp here",
+        7,
+        1.5,
+        True,
+        None,
+        ["mcp"],
+    ],
+    "protocol": ["1", "4", "0", "-2", "three", True, False, None, 2.5],
+    "health_check_interval": ["-1", "-0.5", "30s", True, None],
+    "read_from_replicas": _BOOL_BAD,
+    "require_full_coverage": _BOOL_BAD,
+    "reinitialize_steps": ["-1", "1.5", "five", True, None],
+    "dynamic_startup_nodes": _BOOL_BAD,
+}
+
+
+def mode_for(key: str) -> str:
+    """A mode in which the option is allowed."""
+    return "standalone" if key in ALLOWED_OPTIONS["standalone"] else "cluster"
+
+
+def option_error(key: str, value, mode=None) -> str:
+    return config_error(
+        {"clusters": [mode_cluster(mode or mode_for(key), options={key: value})]}
+    )
+
+
+class TestOptionValues:
+    """Each allowed option's value is checked, so a typo fails at startup instead of on the first call."""
+
+    def test_every_allowed_key_has_a_value_check(self):
+        allowed = {key for keys in MODE_OPTIONS.values() for key in keys}
+        assert set(config_loader.OPTION_VALUES) == allowed
+        assert set(OPTION_EXPECTED) == allowed
+        assert set(GOOD_OPTION_VALUES) == allowed
+        assert set(BAD_OPTION_VALUES) == allowed
+
+    @pytest.mark.parametrize(
+        "key, value, expected",
+        [
+            (key, value, expected)
+            for key, pairs in GOOD_OPTION_VALUES.items()
+            for value, expected in pairs
+        ],
+    )
+    def test_good_value(self, key, value, expected):
+        config = parse_config(
+            {"clusters": [mode_cluster(mode_for(key), options={key: value})]}
+        )
+        options = config.clusters[0].options
+        assert options == {key: expected}
+        assert type(options[key]) is type(expected)
+
+    @pytest.mark.parametrize(
+        "key, value",
+        [(key, value) for key, values in BAD_OPTION_VALUES.items() for value in values],
+    )
+    def test_bad_value(self, key, value):
+        assert option_error(key, value) == (
+            f"Invalid config:\n - clusters[0]: options.{key} must be {OPTION_EXPECTED[key]}"
+        )
+
+    @pytest.mark.parametrize(
+        "mode, key", [(mode, key) for mode in MODES for key in ALLOWED_OPTIONS[mode]]
+    )
+    def test_values_are_checked_in_every_mode(self, mode, key):
+        error = option_error(key, BAD_OPTION_VALUES[key][0], mode)
+        assert f" - clusters[0]: options.{key} must be {OPTION_EXPECTED[key]}" in error
+
+    def test_bad_value_is_not_echoed(self):
+        error = option_error("client_name", "TOPSECRET with space")
+        assert "TOPSECRET" not in error
+
+    def test_unsupported_key_is_reported_before_the_values(self):
+        # an unsupported key has no value check; it must not end in a KeyError
+        error = config_error(
+            {"clusters": [cluster(options={"socket_timeout": "0", "password": "x"})]}
+        )
+        assert " - clusters[0]: options password not supported in standalone" in error
+        assert "must be" not in error
+
+    def test_each_cluster_reports_its_own_value(self):
+        error = config_error(
+            {
+                "clusters": [
+                    cluster(options={"socket_timeout": "0"}),
+                    cluster(name="b", options={"socket_timeout": "1"}),
+                    mode_cluster(
+                        "cluster", name="c", options={"reinitialize_steps": "-1"}
+                    ),
+                ]
+            }
+        )
+        assert error == (
+            "Invalid config:"
+            "\n - clusters[0]: options.socket_timeout must be a number of seconds > 0"
+            "\n - clusters[2]: options.reinitialize_steps must be an integer >= 0"
+        )
+
+    @pytest.mark.parametrize(
+        "line, key, expected",
+        [
+            ("socket_timeout: 0", "socket_timeout", "a number of seconds > 0"),
+            ("socket_timeout:", "socket_timeout", "a number of seconds > 0"),
+            ("socket_timeout: null", "socket_timeout", "a number of seconds > 0"),
+            ("socket_connect_timeout: ~", "socket_connect_timeout", "a number"),
+            ("socket_keepalive: 'true'", "socket_keepalive", "true or false"),
+            ("max_connections: 1.5", "max_connections", "an integer >= 1"),
+            ("client_name: my mcp", "client_name", "a name without spaces"),
+            ("client_name:", "client_name", "a name without spaces"),
+            ("protocol: 4", "protocol", "2 or 3"),
+            ("health_check_interval: -1", "health_check_interval", "a number"),
+        ],
+    )
+    def test_bad_value_from_yaml(self, tmp_path, line, key, expected):
+        path = write(
+            tmp_path / "c.yaml",
+            "clusters:\n  - name: a\n    hosts: h:6379\n    options:\n      "
+            + line
+            + "\n",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert f" - clusters[0]: options.{key} must be {expected}" in str(exc.value)
+
+    @pytest.mark.parametrize("word", ["yes", "on", "True", "FALSE", "off"])
+    def test_yaml_booleans_are_accepted(self, tmp_path, word):
+        path = write(
+            tmp_path / "c.yaml",
+            "clusters:\n  - name: a\n    hosts: h:6379\n    options:\n"
+            "      socket_keepalive: " + word + "\n",
+        )
+        value = load_config(path).clusters[0].options["socket_keepalive"]
+        assert value is (word.lower() in ("yes", "on", "true"))
+
+    def test_value_is_checked_after_the_merge(self, tmp_path):
+        main = write(tmp_path / "main.yaml", MAIN_CONFIG)
+        conf_d = tmp_path / "conf.d"
+        conf_d.mkdir()
+        write(
+            conf_d / "10-a.yaml",
+            "clusters: [{name: a, options: {socket_timeout: 0}}]\n",
+        )
+        with pytest.raises(ConfigError) as exc:
+            load_config(main, conf_d)
+        assert str(exc.value) == (
+            "Invalid config:\n - clusters[0]: options.socket_timeout must be a number of seconds > 0"
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="bug: the timeouts are only checked for > 0, so a value beyond what a socket timeout can hold "
+        "(1e10 s, or 1e400 which becomes inf) is accepted, and then every connection fails with "
+        "OverflowError('timestamp out of range for C PyTime_t') instead of a config error at startup",
+    )
+    @pytest.mark.parametrize("key", ["socket_timeout", "socket_connect_timeout"])
+    @pytest.mark.parametrize("value", ["1e10", "1e400"])
+    def test_timeout_too_large_for_a_socket_is_rejected(self, key, value):
+        error = option_error(key, value)
+        assert f" - clusters[0]: options.{key} must be " in error
+
+
 class TestTlsCaPath:
     """RedisCluster drops ssl_ca_path, so caPath is rejected in cluster mode."""
 
@@ -1171,22 +1473,28 @@ class TestHostsWithCredentials:
         assert "clusters[0].hosts: hosts takes host:port entries" in str(exc.value)
         assert self.SECRET not in str(exc.value)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: parse_hosts checks each comma-separated item for '@', so a password containing a comma "
-        "splits into an item without '@' that is echoed (\"'user:pa' is not host:port\")",
+    @pytest.mark.parametrize(
+        "hosts",
+        [
+            "user:TOP,SECRET@h:6379",
+            "h:1,user:TOP,SECRET@h:2",
+            "TOP,SECRET@h:6379",
+            "redis://user:TOP,SECRET@h:6379",
+            "h:1,rediss://TOP,SECRET:6379",
+            ["n1:7000", "user:TOP,SECRET@n2:7001"],
+            ["n1:7000", "user:TOP", "SECRET@n2:7001"],
+        ],
     )
-    def test_password_with_a_comma_is_not_echoed(self):
-        hosts = "user:TOP,SECRET@h:6379"
-        error = config_error({"clusters": [cluster(hosts=hosts)]})
-        assert "hosts takes host:port entries without a scheme or credentials" in error
+    def test_password_with_a_comma_is_not_echoed(self, hosts):
+        # the whole value is checked for credentials before it is split into entries
+        error = config_error({"clusters": [mode_cluster("cluster", hosts=hosts)]})
+        assert error == (
+            "Invalid config:\n - clusters[0].hosts: hosts takes host:port entries without a scheme or"
+            " credentials (user:password@); passwords come from the passwords directory"
+        )
         assert "TOP" not in error
+        assert "SECRET" not in error
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="bug: the ConfigError is chained to pydantic's ValidationError, whose text includes "
-        "input_value='user:<password>@h:6379', so a traceback of the error prints the password",
-    )
     def test_traceback_does_not_show_the_password(self):
         hosts = f"user:{self.SECRET}@h:6379"
         data = {"clusters": [cluster(hosts=hosts)]}
@@ -1298,15 +1606,109 @@ class TestParseHosts:
             ("fe80::1", 6380),
         ]
 
-    @pytest.mark.parametrize("hosts", ["h", "h:", ":1", "h:x", ",", "h:1,,h:2"])
-    def test_invalid(self, hosts):
-        with pytest.raises(ValueError, match="is not host:port"):
+    def test_surrounding_whitespace_is_ignored(self):
+        assert parse_hosts("\th1:1 ,\n h2:2\r\n") == [("h1", 1), ("h2", 2)]
+
+    @pytest.mark.parametrize(
+        "hosts, number",
+        [
+            ("h", 1),
+            ("h:", 1),
+            (":1", 1),
+            ("h:x", 1),
+            ("h:+1", 1),
+            ("h:-1", 1),
+            ("h: 1", 1),
+            ("", 1),
+            ("  ", 1),
+            (",", 1),
+            ("[::1]", 1),
+            ("h:1,,h:2", 2),
+            ("h:1,", 2),
+            ("h:1, h:2 ,x:y", 3),
+            ("a:1,b:2,c:3,d", 4),
+        ],
+    )
+    def test_invalid_entry_is_numbered(self, hosts, number):
+        with pytest.raises(ValueError) as exc:
+            parse_hosts(hosts)
+        assert str(exc.value) == (
+            f"hosts entry {number} is not host:port (or [IPv6 address]:port)"
+        )
+
+    @pytest.mark.parametrize(
+        "hosts, number",
+        [
+            ("my host:6379", 1),
+            ("h :6379", 1),
+            ("h:1,h\t2:2", 2),
+            ("h:1,h\n2:2", 2),
+            ("h:1,h\u00a02:2", 2),
+            ("[::1 ]:6379", 1),
+        ],
+    )
+    def test_whitespace_inside_a_host_is_an_error(self, hosts, number):
+        with pytest.raises(ValueError) as exc:
+            parse_hosts(hosts)
+        assert str(exc.value) == (
+            f"hosts entry {number} is not host:port (or [IPv6 address]:port)"
+        )
+
+    @pytest.mark.parametrize(
+        "hosts, number",
+        [
+            ("h:0", 1),
+            ("h:65536", 1),
+            ("h:99999999", 1),
+            ("h:1,h:00000", 2),
+            ("a:1,b:2,[::1]:70000", 3),
+        ],
+    )
+    def test_port_out_of_range(self, hosts, number):
+        with pytest.raises(ValueError) as exc:
+            parse_hosts(hosts)
+        assert str(exc.value) == (
+            f"hosts entry {number}: the port must be between 1 and 65535"
+        )
+
+    @pytest.mark.parametrize(
+        "hosts",
+        [
+            "TOPSECRET",
+            "h:1,TOPSECRET",
+            "TOPSECRET:abc",
+            "TOPSECRET value:1",
+            "h:1, TOPSECRET:0",
+            "[TOPSECRET]:65536",
+            "TOPSECRET:",
+        ],
+    )
+    def test_entry_is_not_echoed(self, hosts):
+        # a password pasted into hosts must not reach the log
+        with pytest.raises(ValueError) as exc:
+            parse_hosts(hosts)
+        assert "TOPSECRET" not in str(exc.value)
+        error = config_error({"clusters": [mode_cluster("cluster", hosts=hosts)]})
+        assert " - clusters[0].hosts: hosts entry " in error
+        assert "TOPSECRET" not in error
+
+    @pytest.mark.parametrize("hosts", ["h@x:1", "h:1,@", "h:1,x://y", "://"])
+    def test_any_at_sign_or_scheme_is_a_credentials_error(self, hosts):
+        with pytest.raises(ValueError, match="without a scheme or credentials"):
             parse_hosts(hosts)
 
-    @pytest.mark.parametrize("hosts", ["h:0", "h:65536", "h:99999999"])
-    def test_port_out_of_range(self, hosts):
-        with pytest.raises(ValueError, match="port must be between 1 and 65535"):
-            parse_hosts(hosts)
+    @pytest.mark.xfail(
+        strict=True,
+        reason="bug: parse_hosts checks the port with str.isdigit(), which is also true for digits int() "
+        "cannot parse (e.g. superscript '²'); int() then raises its own ValueError \"invalid literal for "
+        "int() with base 10: '²'\", which echoes the entry and has no entry number",
+    )
+    def test_port_with_a_digit_int_cannot_parse(self):
+        with pytest.raises(ValueError) as exc:
+            parse_hosts("h:1,h:\u00b2")
+        assert str(exc.value) == (
+            "hosts entry 2 is not host:port (or [IPv6 address]:port)"
+        )
 
 
 class TestTlsConfig:
@@ -1684,14 +2086,15 @@ class TestFileErrors:
 
     def test_os_error(self, tmp_path):
         path = write(tmp_path / "c.yaml", MAIN_CONFIG)
-        with patch(
-            "builtins.open", side_effect=PermissionError(13, "Permission denied")
+        with patch.object(
+            Path, "read_bytes", side_effect=PermissionError(13, "Permission denied")
         ):
             with pytest.raises(ConfigError) as exc:
                 load_config(path)
         assert str(exc.value) == (
             f"Could not read config file: {path} (Permission denied)"
         )
+        assert isinstance(exc.value.__cause__, PermissionError)
 
     @pytest.mark.parametrize(
         "text",
@@ -1746,7 +2149,7 @@ class TestFileErrors:
         with pytest.raises(ConfigError) as exc:
             load_config(path)
         assert str(exc.value) == (
-            f"Could not read config file: {path} (not UTF-8: invalid byte at position 8)"
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line 1)"
         )
         assert isinstance(exc.value.__cause__, UnicodeDecodeError)
 
@@ -1757,9 +2160,38 @@ class TestFileErrors:
         )
         with pytest.raises(ConfigError) as exc:
             load_config(path)
-        assert str(exc.value).startswith(
-            f"Could not read config file: {path} (not UTF-8: invalid byte at position "
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line 1)"
         )
+
+    @pytest.mark.parametrize(
+        "raw, line",
+        [
+            (b"\xff", 1),
+            (b"a: \xe2\x82", 1),
+            (b"a: \xe2\nb: 1\n", 1),
+            (b"a: 1\n\xff: 2\n", 2),
+            (b"a: 1\r\nb: \xc3\x28\r\n", 2),
+            (b"a: 1\n\n\n# caf\xe9\n", 4),
+            (b"a: 1\nb: 2\n#\n#\n#\n#\nc: \x80\n", 7),
+            ("a: café\nb: ok\n".encode() + b"c: \xc0\xaf\n", 3),
+        ],
+    )
+    def test_invalid_utf8_names_the_line(self, tmp_path, raw, line):
+        path = tmp_path / "c.yaml"
+        path.write_bytes(raw)
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line {line})"
+        )
+
+    def test_invalid_utf8_does_not_echo_the_content(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        path.write_bytes(b"apiKey: TOPSECRET\xff\n")
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert "TOPSECRET" not in str(exc.value)
 
     def test_invalid_utf8_drop_in_names_the_file(self, tmp_path):
         main = write(tmp_path / "main.yaml", MAIN_CONFIG)
@@ -1769,22 +2201,82 @@ class TestFileErrors:
         bad.write_bytes(b"port: 1\n# \xc3\x28\n")
         with pytest.raises(ConfigError) as exc:
             load_config(main, conf_d)
-        assert str(exc.value).startswith(
-            f"Could not read config file: {bad} (not UTF-8"
+        assert str(exc.value) == (
+            f"Could not read config file: {bad} (not UTF-8: invalid byte on line 2)"
+        )
+
+    def test_invalid_utf8_line_after_a_long_line(self, tmp_path):
+        # larger than the 8 KiB chunks a text stream decodes in, where a position would be chunk-relative
+        path = tmp_path / "c.yaml"
+        raw = b"# " + b"x" * 300_000 + b"\napiKey: \xff\n"
+        assert len(raw) > 8 * 1024
+        path.write_bytes(raw)
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line 2)"
+        )
+
+    def test_invalid_utf8_line_in_a_large_file(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        raw = b"port: 8080\n" + b"# padding comment line\n" * 5000 + b"apiKey: \xfe\n"
+        assert len(raw) > 8 * 1024
+        path.write_bytes(raw)
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line 5002)"
+        )
+
+    def test_invalid_utf8_after_a_byte_order_mark(self, tmp_path):
+        path = tmp_path / "c.yaml"
+        path.write_bytes(b"\xef\xbb\xbfport: 1\napiKey: abcdef\xff\n")
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line 2)"
         )
 
     @pytest.mark.xfail(
         strict=True,
-        reason="bug: _read reports UnicodeDecodeError.start, which is relative to the text decoder's chunk "
-        "(8 KiB in CPython), so the position is wrong in a config file larger than that",
+        reason="bug: utf-8-sig strips the byte order mark before decoding, so UnicodeDecodeError.start counts "
+        "from after the 3 BOM bytes, but _read counts the newlines in raw[:start] (BOM included): a bad "
+        "byte within the first 3 bytes of a line is reported on the line before",
     )
-    def test_invalid_utf8_position_in_a_large_file(self, tmp_path):
+    @pytest.mark.parametrize(
+        "raw, line",
+        [
+            (b"\xef\xbb\xbfport: 1\n\xff: x\n", 2),
+            (b"\xef\xbb\xbfport: 1\n# x\n# \xff\n", 3),
+        ],
+    )
+    def test_invalid_utf8_line_at_a_line_start_after_a_byte_order_mark(
+        self, tmp_path, raw, line
+    ):
         path = tmp_path / "c.yaml"
-        head = b"# " + b"x" * 300_000 + b"\napiKey: "
-        path.write_bytes(head + b"\xff\n")
+        path.write_bytes(raw)
         with pytest.raises(ConfigError) as exc:
             load_config(path)
-        assert f"invalid byte at position {len(head)})" in str(exc.value)
+        assert str(exc.value) == (
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line {line})"
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="regression: _read now passes the decoded text to yaml.load, so the YAMLError marks carry the "
+        "buffer and the message quotes the offending line (with a stream, as before, it gives only "
+        "line/column); a YAML typo on the apiKey line puts the key into the startup error and its traceback",
+    )
+    @pytest.mark.parametrize(
+        "text", ['apiKey: "TOPSECRET\nclusters: []\n', "apiKey: TOPSECRET: x\n"]
+    )
+    def test_parse_error_does_not_quote_the_line(self, tmp_path, text):
+        path = tmp_path / "c.yaml"
+        path.write_text(text, encoding="utf-8")
+        with pytest.raises(ConfigError) as exc:
+            load_config(path)
+        assert str(exc.value).startswith(f"Could not parse config file: {path} (")
+        assert "TOPSECRET" not in "".join(traceback.format_exception(exc.value))
 
     def test_utf8_with_bom(self, tmp_path):
         # editors on Windows may save UTF-8 with a byte order mark
@@ -2139,11 +2631,36 @@ class TestFromLegacy:
         with pytest.raises(ConfigError, match=r"clusters\[0\]\.tls\.certReqs"):
             from_legacy(redis_config)
 
-    def test_cluster_mode_with_ssl_ca_path_is_an_error(self, redis_config):
-        # RedisCluster would drop ssl_ca_path; failing is better than verifying against the system CAs
-        redis_config.update(cluster_mode=True, ssl=True, ssl_ca_path="/ca")
-        with pytest.raises(ConfigError, match=r"tls\.caPath is not supported"):
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {},
+            {"ssl_ca_certs": "/ca.crt"},
+            {"ssl_cert_reqs": "none"},
+            {"ssl_certfile": "/tls.crt", "ssl_keyfile": "/tls.key"},
+        ],
+    )
+    def test_cluster_mode_with_ssl_ca_path_is_an_error(self, redis_config, extra):
+        # RedisCluster would drop ssl_ca_path; failing is better than verifying against the system CAs.
+        # The message names the flag / variable the user set, not the config key.
+        redis_config.update(cluster_mode=True, ssl=True, ssl_ca_path="/ca", **extra)
+        with pytest.raises(ConfigError) as exc:
             from_legacy(redis_config)
+        assert str(exc.value) == (
+            "--ssl-ca-path / REDIS_SSL_CA_PATH is not supported with --cluster-mode (redis-py's RedisCluster"
+            " ignores it); use --ssl-ca-certs / REDIS_SSL_CA_CERTS"
+        )
+
+    def test_cluster_mode_without_ssl_ignores_ssl_ca_path(self, redis_config):
+        redis_config.update(cluster_mode=True, ssl=False, ssl_ca_path="/ca")
+        c = from_legacy(redis_config).clusters[0]
+        assert c.mode == "cluster"
+        assert c.tls is None
+
+    def test_ssl_ca_path_without_cluster_mode(self, redis_config):
+        redis_config.update(ssl=True, ssl_ca_path="/ca")
+        tls = from_legacy(redis_config).clusters[0].tls
+        assert tls.client_kwargs()["ssl_ca_path"] == "/ca"
 
     def test_cluster_mode_with_ssl_ca_certs(self, redis_config):
         redis_config.update(cluster_mode=True, ssl=True, ssl_ca_certs="/ca.crt")

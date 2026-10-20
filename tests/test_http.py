@@ -17,13 +17,22 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", StarletteDeprecationWarning)
     from starlette.testclient import TestClient
 
-from src.common.config_loader import ServerConfig, from_legacy, parse_config
+from src.common.config_loader import (
+    ConfigError,
+    ServerConfig,
+    from_legacy,
+    parse_config,
+)
 from src.common.http import API_KEY_HEADER, ApiKeyMiddleware, http_app, run_http
 from src.common.server import HEALTH_PATH, MCP_PATH, build_server
 from src.main import apply_api_key, cli
 
 API_KEY = "0123456789abcdef0123456789abcdef"
 HTTP_LOGGER = "src.common.http"
+BLANK_API_KEY_ERROR = (
+    "--api-key / REDIS_MCP_API_KEY is blank; set a key, or leave it empty or unset to keep apiKey"
+    " from the config"
+)
 
 MCP_HEADERS = {
     "Content-Type": "application/json",
@@ -626,6 +635,14 @@ class TestLegacyModeApiKey:
 
         assert response.status_code == 200
 
+    @pytest.mark.parametrize("api_key", ["   ", "\n"], ids=["spaces", "newline"])
+    def test_blank_key_is_refused_not_ignored(self, api_key):
+        """Unlike an empty value, a blank one (e.g. a Secret holding a newline) cannot leave /mcp open."""
+        with pytest.raises(ConfigError) as exc:
+            _legacy_config(api_key)
+
+        assert str(exc.value) == BLANK_API_KEY_ERROR
+
 
 class TestCliHttpApiKey:
     """The CLI end to end up to uvicorn: the app it would serve guards /mcp with the --api-key /
@@ -679,6 +696,34 @@ class TestCliHttpApiKey:
         names = [t["name"] for t in right.json()["result"]["tools"]]
         assert "get" in names
         assert health.status_code == 200
+
+    @pytest.mark.parametrize("config_file", [False, True], ids=["legacy", "config"])
+    @pytest.mark.parametrize("source", ["option", "env"])
+    def test_blank_key_does_not_start_the_server(self, tmp_path, config_file, source):
+        """A blank --api-key / REDIS_MCP_API_KEY stops the start-up: neither an open /mcp (legacy mode) nor
+        a silent fallback to the config's apiKey."""
+        args = ["--transport", "http"]
+        env = {}
+        if config_file:
+            path = tmp_path / "redis-mcp.yaml"
+            path.write_text(
+                f"apiKey: {API_KEY}\npasswordsDir: {tmp_path}\n"
+                "clusters:\n  - name: a\n    hosts: a:6379\n",
+                encoding="utf-8",
+            )
+            args += ["--config", str(path)]
+            env["a_pass"] = None
+        if source == "option":
+            args += ["--api-key", "  "]
+        else:
+            env["REDIS_MCP_API_KEY"] = "  "
+
+        with patch("src.common.http.uvicorn.run") as mock_run:
+            result = CliRunner().invoke(cli, args, env=env)
+
+        assert result.exit_code == 2
+        assert result.stderr == f"redis-mcp: {BLANK_API_KEY_ERROR}\n"
+        mock_run.assert_not_called()
 
     def test_legacy_mode_without_key_is_open(self, caplog):
         caplog.set_level(logging.WARNING, logger=HTTP_LOGGER)

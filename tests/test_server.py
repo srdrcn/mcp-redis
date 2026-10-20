@@ -107,7 +107,7 @@ def created_clients():
     client.get.return_value = "value"
     client.created_for = []
 
-    def create_client(cluster_config, decode_responses=True):
+    def create_client(cluster_config, decode_responses=True, max_connections=None):
         client.created_for.append((current_cluster.get(), cluster_config.name))
         return client
 
@@ -359,19 +359,25 @@ class TestHttpApp:
         assert "get" not in names
 
     @pytest.mark.parametrize("kind", ["yaml", "legacy"])
-    def test_single_cluster_call_without_cluster(self, kind, created_clients):
+    def test_single_cluster_call_without_cluster(
+        self, kind, created_clients, fresh_executors
+    ):
         config, name = _single_cluster(kind)
         set_config(config)
         mcp = build_server(config)
 
         with TestClient(mcp.streamable_http_app()) as client:
             result = _call_tool(client, "get", {"key": "k"})
+            named = _call_tool(client, "get", {"key": "k", "cluster": name})
 
         assert result["isError"] is False
         assert result["content"][0]["text"] == "value"
-        created_clients.get.assert_called_once_with("k")
-        # no cluster selected for the call; the connection manager uses the only one
+        assert named["isError"] is False
+        assert created_clients.get.call_count == 2
+        # no cluster selected for the first call; the connection manager uses the only one, and both calls
+        # share its client and its worker pool
         assert created_clients.created_for == [(None, name)]
+        assert set(fresh_executors) == {name}
 
     def test_two_clusters_call_without_cluster_is_rejected(self, created_clients):
         config = _two_clusters()

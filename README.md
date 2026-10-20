@@ -43,14 +43,14 @@ config file, tools grouped into toolsets, a read-only switch, and Streamable HTT
   (`<passwordsDir>/<name>_pass`) or an environment variable (`<name>_pass`). `hosts` and `options` cannot carry
   one either.
 - **Bounded calls**: every tool call has a 15 s limit. The Redis clients use 5 s connect and 10 s socket timeouts
-  and resend a command at most once, and only when its connection dropped (never after a timeout, and never on a
-  Redis Cluster). A standalone server, a Sentinel-managed primary or a Redis Cluster node that stops answering
-  therefore reports its own error (`Timeout reading from socket`) after 10 s. Sentinels and Redis Cluster startup
-  nodes that do not answer while the client looks for the primary or reads the slot map cost one timeout each and
-  can still add up to the 15 s limit (see
-  [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)).
+  and send every command once: there are no client retries, so a write is never applied twice. A standalone
+  server, a Sentinel-managed primary or a Redis Cluster node that stops answering therefore reports its own error
+  (`Timeout reading from socket`) after 10 s. Each Sentinel gets at most 2 s to name the primary. Redis Cluster
+  startup nodes that do not answer while the client reads the slot map cost one timeout each and can still add up
+  to the 15 s limit (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)).
 - **Clusters are isolated**: each cluster has its own 8 workers for tool calls and its own connection pools (16
-  connections), so a cluster that hangs does not slow down calls to the others.
+  connections for the tools, 50 for pub/sub subscriptions), so a cluster that hangs does not slow down calls to
+  the others, and open subscriptions do not take the connections the other tools need.
 - **Simple to operate**: a single static API key (in the config, or from a Secret through `REDIS_MCP_API_KEY`),
   JSON logs with one line per tool call, a `/healthz` endpoint, a non-root image that runs on a read-only root
   filesystem, and kustomize manifests for OpenShift (`restricted-v2` SCC).
@@ -58,9 +58,11 @@ config file, tools grouped into toolsets, a read-only switch, and Streamable HTT
   describe a single cluster named `default` with every toolset, as described in the rest of this README (from
   [Table of Contents](#table-of-contents) on). Because it is the only cluster, the tools' `cluster` parameter is
   optional, so calls without it keep working. One combination is now refused at startup: `--cluster-mode` (or
-  `REDIS_CLUSTER_MODE`) with `--ssl-ca-path` (or `REDIS_SSL_CA_PATH`) stops with
-  `tls.caPath is not supported in cluster mode; use caFile`, because redis-py's `RedisCluster` ignores the CA
-  directory. Use `--ssl-ca-certs` (`REDIS_SSL_CA_CERTS`) with a CA bundle file instead.
+  `REDIS_CLUSTER_MODE`) together with `--ssl` (`REDIS_SSL`) and `--ssl-ca-path` (`REDIS_SSL_CA_PATH`) stops with
+  `redis-mcp: --ssl-ca-path / REDIS_SSL_CA_PATH is not supported with --cluster-mode (redis-py's RedisCluster
+  ignores it); use --ssl-ca-certs / REDIS_SSL_CA_CERTS` (exit code 2), because redis-py's `RedisCluster` ignores
+  the CA directory and would verify the nodes against the system CAs only. Use `--ssl-ca-certs`
+  (`REDIS_SSL_CA_CERTS`) with a CA bundle file instead.
 
 Contents: [Quick start](#quick-start) · [Command line](#command-line) ·
 [Configuration file](#configuration-file) · [Passwords](#passwords) ·
@@ -123,7 +125,7 @@ docker run --rm -p 8080:8080 --read-only --tmpfs /tmp \
 | `--config <file>` | `REDIS_MCP_CONFIG` | Main config file (YAML). |
 | `--config-dir <dir>` | `REDIS_MCP_CONFIG_DIR` | Directory of drop-in `.yaml`/`.yml` files merged over the main config (see [Drop-in files](#drop-in-files---config-dir)). Can be used without `--config`. |
 | `--transport stdio\|http` | | Transport. Defaults to `http` when an HTTP port is set (> 0) and to `stdio` otherwise. `--transport http` without a port uses 8080. |
-| `--api-key <key>` | `REDIS_MCP_API_KEY` | API key that HTTP clients must send in `X-Authorization`. Overrides `apiKey` from the config, also in the legacy mode. An empty value is ignored, so an empty variable cannot turn authentication off. The value is checked like `apiKey` (`redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey has leading or trailing whitespace ...`). Prefer the variable: a command line can be read by other users (`ps`) and anyone who can read the Deployment. |
+| `--api-key <key>` | `REDIS_MCP_API_KEY` | API key that HTTP clients must send in `X-Authorization`. Overrides `apiKey` from the config, also in the legacy mode. An empty value is ignored, so an empty variable cannot turn authentication off. A value of only whitespace stops the server (`redis-mcp: --api-key / REDIS_MCP_API_KEY is blank; set a key, or leave it empty or unset to keep apiKey from the config`); any other value is checked like `apiKey` (`redis-mcp: --api-key / REDIS_MCP_API_KEY: apiKey has leading or trailing whitespace ...`). Prefer the variable: a command line can be read by other users (`ps`) and anyone who can read the Deployment. |
 | `--http-port <port>` | | HTTP port (1–65535). Overrides `port` from the config. (`--port` is the Redis port of the legacy mode.) |
 
 With `--config` or `--config-dir`, the clusters come from the config only: the legacy connection flags (`--url`,
@@ -134,8 +136,9 @@ With `--config` or `--config-dir`, the clusters come from the config only: the l
 `REDIS_ENTRAID_*` variables still apply to clusters with `entraid: true`.
 
 The process writes `redis-mcp: ...` to stderr and exits with code 2 for: an invalid or unreadable config (also
-one that is not UTF-8) or password file, an invalid `--api-key`, a legacy flag combined with `--config`, an
-unknown toolset, and a cluster with `entraid: true` but no Entra ID auth flow. A malformed option value gets
+one that is not UTF-8: `Could not read config file: <path> (not UTF-8: invalid byte on line <n>)`; a UTF-8 byte
+order mark is accepted) or password file, a blank or invalid `--api-key`, a legacy flag combined with `--config`,
+an unknown toolset, and a cluster with `entraid: true` but no Entra ID auth flow. A malformed option value gets
 click's usage error, also with exit code 2. `python src/main.py` (the image's default command) takes no options
 and reads `REDIS_MCP_CONFIG`/`REDIS_MCP_CONFIG_DIR` and `REDIS_MCP_API_KEY` from the environment.
 
@@ -177,10 +180,10 @@ clusters:
     # modules: [json, search]      # lists the json/search tools for this cluster (Redis 8, Redis Stack)
     # tls:                         # or `tls: true` for TLS with the system CAs
     #   caFile: /etc/redis-mcp/tls/ca.crt   # caPath is not supported with mode: cluster
-    # options:                     # client tuning; the accepted keys depend on the mode (README, "Cluster options")
-    #   socket_timeout: 5
-  # A primary managed by Redis Sentinel. The Sentinels' own password is <name>_sentinel_pass, so no other cluster
-  # may be named cbuatrds_sentinel:
+    # options:                     # client tuning; keys and values depend on the mode (README, "Cluster options")
+    #   socket_timeout: 5          # seconds, a number > 0
+  # A primary managed by Redis Sentinel. Each Sentinel gets at most 2 s to name the primary. The Sentinels' own
+  # password is <name>_sentinel_pass, so no other cluster may be named cbuatrds_sentinel:
   # - name: cbuatrds
   #   mode: sentinel
   #   hosts: [cbuatrds-s1.example.com:26379, cbuatrds-s2.example.com:26379, cbuatrds-s3.example.com:26379]
@@ -206,8 +209,10 @@ both on.
 YAML numbers keep the text they are written with wherever a string is expected, so `apiKey: 0123456701234567` or
 `username: 0123` are read exactly as written (plain YAML 1.1 would turn them into octal numbers); `port` and `db`
 are converted to numbers. In `options`, values that look like integers or decimals are passed to redis-py as
-numbers, quoted or not. Unknown keys are errors, and the error message names the field
-(`clusters[0].password: Extra inputs are not permitted`).
+numbers, quoted or not, except `client_name`, which stays text (`client_name: 0123` is the name `0123`); every
+option value is then checked (see [Cluster options](#cluster-options)). Unknown keys are errors, and the error
+message names the field (`clusters[0].password: Extra inputs are not permitted`). Error messages never repeat
+the rejected value, so a password typed into the wrong field does not reach the log.
 
 #### Cluster keys
 
@@ -215,7 +220,7 @@ numbers, quoted or not. Unknown keys are errors, and the error message names the
 |---|---|---|---|
 | `name` | string | (required) | Unique name of 1–63 characters from `A-Z a-z 0-9 _ . -`, starting with a letter or digit. It becomes a value of the `cluster` enum, and it names the password file or variable (`<name>_pass`). A cluster must not be named `<x>_sentinel` while a `mode: sentinel` cluster `<x>` exists, because `<x>_sentinel_pass` would be both its password and the Sentinel password of `<x>` (`cluster name <x>_sentinel clashes with the Sentinel password of cluster <x> (<x>_sentinel_pass); rename one of them`). |
 | `mode` | `standalone`, `cluster` or `sentinel` | `standalone` | `standalone`: `redis.Redis`. `cluster`: `redis.cluster.RedisCluster` (Redis Cluster / OSS cluster API). `sentinel`: `redis.sentinel.Sentinel(...).master_for(masterName)`, always the current primary. |
-| `hosts` | string or list | (required) | `host:port` entries, as a comma-separated string or a YAML list. IPv6 addresses are written `[addr]:port` (quote them in YAML). `standalone` takes exactly one; `cluster` takes the startup nodes (the client reads the slot map from them and discovers the other nodes); `sentinel` takes the Sentinels. An entry with a scheme (`redis://`) or credentials (`user:password@`) is rejected with `hosts takes host:port entries without a scheme or credentials (user:password@); passwords come from the passwords directory`; the message does not repeat the entry, which may hold a password. |
+| `hosts` | string or list | (required) | `host:port` entries, as a comma-separated string or a YAML list. IPv6 addresses are written `[addr]:port` (quote them in YAML). `standalone` takes exactly one; `cluster` takes the startup nodes (the client reads the slot map from them and discovers the other nodes); `sentinel` takes the Sentinels. A value that contains a scheme (`://`) or credentials (`@`) anywhere is rejected with `hosts takes host:port entries without a scheme or credentials (user:password@); passwords come from the passwords directory`. Other errors name the entry by its position (1 for the first) and never repeat it, since it may hold a password: `hosts entry 2 is not host:port (or [IPv6 address]:port)` (also for an empty entry or a space inside the host) and `hosts entry 2: the port must be between 1 and 65535`. Prefer fully qualified host names (see [DNS lookups](#dns-lookups)). |
 | `db` | integer (≥ 0) | `0` | Database number (`standalone`, `sentinel`). A Redis Cluster only has database 0, so `db` other than 0 is rejected with `mode: cluster`. |
 | `username` | string | not set | ACL user (redis-py `username`). Without it, the password authenticates the `default` user (`requirepass`). Cannot be combined with `entraid`. |
 | `masterName` | string | not set | Name of the monitored primary. Required with `mode: sentinel`, rejected with the other modes. |
@@ -228,27 +233,31 @@ numbers, quoted or not. Unknown keys are errors, and the error message names the
 #### Cluster options
 
 `options` accepts only the redis-py arguments below. Addresses, `db`, `username` and `tls` have their own keys,
-passwords come from the passwords directory, and the server sets `decode_responses` and the retry policy itself.
-Any other key, or a key of another mode, stops the server at startup:
+passwords come from the passwords directory, and the server sets `decode_responses` and `retry` itself. Any other
+key, or a key of another mode, stops the server at startup:
 
 ```
 redis-mcp: Invalid config:
  - clusters[0]: options password, retry_on_timeout not supported in standalone mode (supported: socket_timeout, socket_connect_timeout, socket_keepalive, max_connections, client_name, protocol, health_check_interval; addresses, db, username and tls have their own keys, passwords come from the passwords directory)
 ```
 
-| Option | Modes | Default | Meaning |
-|---|---|---|---|
-| `socket_timeout` | all | `10` | Seconds to wait for a reply. With `mode: sentinel` also used for the Sentinel connections. |
-| `socket_connect_timeout` | all | `5` | Seconds to wait for a connection. With `mode: sentinel` also used for the Sentinel connections. |
-| `socket_keepalive` | all | off | TCP keepalive on the connections to Redis. |
-| `max_connections` | all | `16` | Size of each client's connection pool (with `mode: cluster`, per node). |
-| `client_name` | all | not set | Connection name set with `CLIENT SETNAME`, shown by `CLIENT LIST`. |
-| `protocol` | all | `2` | RESP protocol version, `2` or `3`. |
-| `health_check_interval` | `standalone`, `sentinel` | `0` (off) | A connection that was idle for longer than this many seconds is checked with `PING` before it is used. |
-| `read_from_replicas` | `cluster` | `false` | Send read commands to the replicas as well (round robin); replicas can return slightly older data. redis-py 6 marks the argument as deprecated. |
-| `require_full_coverage` | `cluster` | `true` | `false` also accepts a cluster whose hash slots are not all covered. |
-| `reinitialize_steps` | `cluster` | `5` | Number of `MOVED` redirects after which the whole slot map is read again (`1`: after every one, `0`: never). |
-| `dynamic_startup_nodes` | `cluster` | `true` | After connecting, use the discovered nodes as startup nodes for later slot map refreshes. Set `false` when `hosts` is a DNS name or load balancer address that `CLUSTER SLOTS` does not list. |
+The values are checked as well. A value outside the rule in the "Value" column, `null` included (a `null`
+timeout would remove the time bound), stops the server with `options.<key> must be <rule>`, for example
+`clusters[0]: options.socket_timeout must be a number of seconds > 0`.
+
+| Option | Modes | Default | Value | Meaning |
+|---|---|---|---|---|
+| `socket_timeout` | all | `10` | a number of seconds > 0 | Seconds to wait for a reply. With `mode: sentinel` the Sentinel connections use it too, but at most 2 s. |
+| `socket_connect_timeout` | all | `5` | a number of seconds > 0 | Seconds to wait for a connection. With `mode: sentinel` the Sentinel connections use it too, but at most 2 s. The host name lookup is not part of it (see [DNS lookups](#dns-lookups)). |
+| `socket_keepalive` | all | off | `true` or `false` | TCP keepalive on the connections to Redis. |
+| `max_connections` | all | `16` | an integer >= 1 | Size of the connection pool of the tools' client (with `mode: cluster`, per node). Keep it above the 8 calls a cluster runs at a time, or calls fail with `Too many connections`. Pub/sub subscriptions have a client of their own with 50 connections, which this option does not change. |
+| `client_name` | all | not set | a name without spaces (not empty) | Connection name set with `CLIENT SETNAME`, shown by `CLIENT LIST`. Kept as text, also when it looks like a number. |
+| `protocol` | all | `2` | `2` or `3` | RESP protocol version. |
+| `health_check_interval` | `standalone`, `sentinel` | `0` (off) | a number of seconds >= 0 | A connection that was idle for longer than this many seconds is checked with `PING` before it is used. |
+| `read_from_replicas` | `cluster` | `false` | `true` or `false` | Send read commands to the replicas as well (round robin); replicas can return slightly older data. redis-py 6 marks the argument as deprecated. |
+| `require_full_coverage` | `cluster` | `true` | `true` or `false` | `false` also accepts a cluster whose hash slots are not all covered. |
+| `reinitialize_steps` | `cluster` | `5` | an integer >= 0 | Number of `MOVED` redirects after which the whole slot map is read again (`1`: after every one, `0`: never). |
+| `dynamic_startup_nodes` | `cluster` | `true` | `true` or `false` | After connecting, use the discovered nodes as startup nodes for later slot map refreshes. Set `false` when `hosts` is a DNS name or load balancer address that `CLUSTER SLOTS` does not list. |
 
 `health_check_interval` is not accepted with `mode: cluster`, and the last four keys only with `mode: cluster`,
 because redis-py would drop or reject them there.
@@ -277,22 +286,32 @@ socket_timeout=10
 # 2. credentials: username and the <name>_pass password, or credential_provider with entraid: true
 # 3. tls: ssl=True, ssl_cert_reqs, ssl_ca_certs, ssl_ca_path, ssl_certfile, ssl_keyfile, ssl_check_hostname
 # 4. the cluster's options: map (only the keys of "Cluster options")
-max_connections=16                      # only if options does not set it
-# 5. retry policy, set by the server (options cannot change it)
-retry=Retry(NoBackoff(), 1, supported_errors=(ConnectionError,))  # standalone, sentinel (and the Sentinels)
-retry=Retry(NoBackoff(), 0)                                        # cluster
+max_connections=16                      # tools' client, only if options does not set it
+max_connections=50                      # pub/sub client, always
+# 5. set by the server (options cannot change it)
+retry=Retry(NoBackoff(), 0)             # one attempt per command, in every mode (also for the Sentinels)
 ```
 
-- There is one client per cluster (two if tools ask for both `decode_responses` values). It is created on first
-  use and then reused. Each cluster has its own lock, so a cluster that is slow to connect does not hold up calls
-  for the others, and a failed creation is not cached: the next call tries again.
-- Each client has a pool of up to 16 connections (`max_connections`): room for the 8 calls a cluster runs at a
-  time plus open pub/sub subscriptions. A subscription holds its connection until `unsubscribe`; with 16
-  subscriptions open on one cluster, most other calls on that cluster fail with `Too many connections`.
+- A cluster has up to three clients: one for the tools, one with `decode_responses=False` for
+  `get_vector_from_hash` (which reads raw bytes), and one for pub/sub subscriptions. Each is created on first use
+  and then reused. Each cluster has its own lock, so a cluster that is slow to connect does not hold up calls for
+  the others.
+- A failed creation is not kept as a client, but its error is remembered for 5 s: calls in that time, including
+  those that were waiting for the creation, get the same error at once, and the first call after it tries again.
+  Only a Redis Cluster client connects while it is created (it reads the slot map), so this mostly spares a burst
+  of calls to an unreachable Redis Cluster from repeating the slow connection attempt one after another.
+- The tools' client has a pool of up to 16 connections (`max_connections`): room for the 8 calls a cluster runs
+  at a time and the `clusters_list` checks. Pub/sub subscriptions hold their connection until `unsubscribe`, so
+  they use a client of their own with up to 50 connections (with `mode: cluster`, per node), as many as the server
+  allows subscriptions. Open subscriptions therefore never take the connections the other tools need.
 - **Sentinel**: the Sentinel connections use the cluster's socket timeouts (including overrides from `options`),
-  its `tls` settings, the same retry policy and the password `<name>_sentinel_pass` (no username). The other
-  `options` apply only to the connections to the primary.
-- The retry policy and what it means for slow or unreachable clusters is described in
+  but at most 2 s each, its `tls` settings, one attempt per command and the password `<name>_sentinel_pass` (no
+  username). The other `options` apply only to the connections to the primary. When no Sentinel names the
+  primary, the error lists each Sentinel that could not be asked as `<host>:<port> - <error type>: <message>`, for
+  example
+  `No master found for 'mymaster' : 10.0.0.5:26379 - TimeoutError: Timeout connecting to server`. (redis-py's own
+  message would show the Sentinel clients' connection arguments, the Sentinel password included.)
+- No retries, and what that means for slow or unreachable clusters, is described in
   [Time limits, retries and concurrency](#time-limits-retries-and-concurrency).
 
 ### Passwords
@@ -404,8 +423,20 @@ The config is read once at startup, so restart the server to apply changes.
 | `docs` | 1 | `search_redis_documents` | | | Not tied to a cluster (no `cluster` parameter). Calls `MCP_DOCS_SEARCH_URL` (default `https://redis.io/convai/api/docs/search`), so the pod needs egress to it. |
 | **Total** | **54** | **28** | **16** | **10** | |
 
-Pub/sub subscriptions live in the server process (at most 50 at a time). They are lost when the pod restarts, and
+Pub/sub subscriptions live in the server process: at most 50 at a time over all clusters (one more gets `Too many
+active subscriptions. Close unused subscriptions and try again.`), and a subscription that was not read for 5
+minutes is closed when the next one is created. They use the cluster's pub/sub client, not the connections of the
+other tools (see [Redis clients](#redis-clients)). `read_messages` waits up to `timeout_ms` (default 1000, at most
+5000; `0` does not wait) and returns once `max_messages` messages (default 10, at most 100) have arrived or the
+time is up; a call right after `subscribe` waits like any other. Subscriptions are lost when the pod restarts, and
 `read_messages` then answers `Subscription '<id>' was not found`; this is why the Deployment runs a single replica.
+
+On a Redis Cluster, `dbsize` adds up the keys of every primary, and `scan_all_keys` scans every primary until each
+one is done. `scan_keys` runs one `SCAN` step on every primary at once (`count` applies to each of them): `keys`
+holds what all of them returned, `cursor` is a map from `<host>:<port>` to that primary's next cursor, and
+`scan_complete` is always `false`, even when every cursor is 0. Its `cursor` argument is a single number that is
+sent to every primary, so `scan_keys` cannot page through a Redis Cluster: use `scan_all_keys` with a narrow
+`pattern` there (it still has to finish within the 15 s limit).
 
 ### Which tools are listed
 
@@ -450,48 +481,73 @@ The call's worker keeps running until the Redis client gives up, so a write that
 applied. `clusters_list` checks all clusters in parallel and stops waiting after 13 s; a cluster whose check has
 not finished by then shows `status: timeout` (`The connection check did not finish within the time limit`).
 
-**Client timeouts and retries.** The Redis clients wait 5 s for a connection (`socket_connect_timeout`) and 10 s
-for a reply (`socket_timeout`); both can be changed per cluster in [`options`](#cluster-options). redis-py's
-default retry policy (3 retries with backoff, timeouts included) is replaced:
+**Client timeouts, no retries.** The Redis clients wait 5 s for a connection (`socket_connect_timeout`) and 10 s
+for a reply (`socket_timeout`); both can be changed per cluster in [`options`](#cluster-options). Every command is
+sent once, in every mode and also to the Sentinels: redis-py's default retry policy (3 retries with backoff,
+timeouts included) is replaced by a single attempt. A command whose connection broke or timed out may already
+have run, so sending it again could apply a write twice, and retries could outlast the 15 s limit.
 
-- **Standalone and Sentinel** (also the connections to the Sentinels): when a connection drops (a
-  `ConnectionError`, for example after a Redis restart or a failover), the command is sent once more right away on
-  a new connection. A timeout is not retried: the command may have run, and sending a write again would apply it
-  twice.
-- **Redis Cluster**: a single attempt. After a connection error or a timeout, the client removes that node from
-  its startup nodes and reads the slot map again from the others before it reports the error, so the next call
-  uses the new topology. `MOVED` and `ASK` redirects are still followed.
+- A call whose connection breaks while its command is in flight fails once with the client's error, for example
+  `Error while reading from <host>:<port> : (104, 'Connection reset by peer')` when the server was killed, or
+  `Timeout reading from socket` when the server or its host went away without closing the connection. So the first
+  call after a restart or a failover can fail once; the next call opens a new connection (on Sentinel, to the
+  primary the Sentinels name then).
+- Connections that broke while they sat idle in the pool are still replaced: the pool checks a connection before
+  it hands it out and reconnects when the server has closed it. Measured: after a restart of a standalone server,
+  and after `SENTINEL FAILOVER` (the Sentinels close the clients of the old primary), the next call succeeded.
+- **Redis Cluster**: after a connection error or a timeout, the client removes that node from its startup nodes
+  and reads the slot map again from the others before it reports the error, so the next call uses the new
+  topology. `MOVED` and `ASK` redirects are still followed.
+- **Sentinel**: each new connection to the primary first asks the Sentinels, in turn, which node is the primary.
+  Each Sentinel gets at most 2 s (`socket_connect_timeout` and `socket_timeout` of the cluster, capped at 2 s), so
+  the lookup ends within 2 s per Sentinel that does not answer.
 
-**What a cluster that fails returns.** Measured with the default timeouts and redis-py 6.4, with a closed port,
-with a listener whose backlog is full (connections time out, as with a firewall that drops packets), with a
-listener that accepts connections but never answers, and with `DEBUG SLEEP` on a running server:
+**What a cluster that fails returns.** Measured with the default timeouts, redis-py 6.4 and Redis 7.0, with a
+closed port, with a listener whose backlog is full (connections time out, as with a firewall that drops packets),
+with a listener that accepts connections but never answers, and with `DEBUG SLEEP` on a running server:
 
 | Failure | `standalone` | `sentinel` | `cluster` |
 |---|---|---|---|
-| Connection refused | `Error 111 connecting to <host>:<port>. Connection refused.` at once | `No master found for '<masterName>'` at once | `Redis Cluster cannot be connected. Please provide at least one reachable node: Error 111 ...` at once |
-| Connection times out | `Timeout connecting to server` after 5 s | 5 s per Sentinel, and the lookup of the primary runs twice: with one Sentinel `No master found` after 10 s, with two or more the 15 s limit | 5 s per startup node: with one or two nodes `Redis Cluster cannot be connected ...: Timeout connecting to server` after 5 or 10 s, with three or more the 15 s limit |
-| Connection accepted, no answer | `Timeout reading from socket` after 10 s | 10 s per Sentinel, twice: the 15 s limit even with one Sentinel | 10 s per startup node: with one node `Redis Cluster cannot be connected ...: Timeout reading from socket` after 10 s, with two or more the 15 s limit |
+| Connection refused | `Error 111 connecting to <host>:<port>. Connection refused.` at once | `No master found for '<masterName>' : <host>:<port> - ConnectionError: Error 111 connecting to <host>:<port>. Connection refused.` (one entry per Sentinel) at once | `Redis Cluster cannot be connected. Please provide at least one reachable node: Error 111 ...` at once |
+| Connection times out | `Timeout connecting to server` after 5 s | 2 s per Sentinel: `No master found for '<masterName>' : <host>:<port> - TimeoutError: Timeout connecting to server, ...` after 2 s with one Sentinel, 6 s with three | 5 s per startup node: with one or two nodes `Redis Cluster cannot be connected ...: Timeout connecting to server` after 5 or 10 s, with three or more the 15 s limit |
+| Connection accepted, no answer | `Timeout reading from socket` after 10 s | 2 s per Sentinel: `No master found for '<masterName>' : <host>:<port> - TimeoutError: Timeout reading from socket, ...` after 2 s with one Sentinel, 6 s with three | 10 s per startup node: with one node `Redis Cluster cannot be connected ...: Timeout reading from socket` after 10 s, with two or more the 15 s limit |
 | Server hangs after the client connected | `Timeout reading from socket` after 10 s | the primary: `Timeout reading from socket` after 10 s | a node: `Timeout reading from socket` after 10 s for keys on that node; keys on the other nodes are not affected |
 
 The Sentinel and startup node rows apply when none of them answers. One that answers ends the search: with a
-hanging Sentinel listed before a working one, the first call took 10 s and succeeded, and later calls asked the
-working Sentinel first; a Redis Cluster whose first startup node hangs behaves the same on its first call.
+hanging Sentinel listed before a working one, the first call took 2 s and succeeded, and later calls asked the
+working Sentinel first; with a hanging first startup node, the first call to a Redis Cluster took 10 s and
+succeeded. A Redis Cluster that cannot be connected is remembered for 5 s (see [Redis clients](#redis-clients)):
+calls in that time get the same error at once, and the first call after it tries again.
 
-If Sentinels or startup nodes can become unreachable without refusing connections (a firewall that drops
-packets), lower the timeouts of that cluster in `options` so that the worst case stays below 15 s: 2 × number of
-Sentinels × timeout for `mode: sentinel`, number of startup nodes × timeout for `mode: cluster`. With
-`socket_timeout: 3` and `socket_connect_timeout: 2`, one hanging Sentinel failed with its own error after 6 s and
-three hanging startup nodes after 9 s. `socket_timeout` also limits every command on that cluster, so keep it
-above the slowest command you expect.
+If startup nodes can become unreachable without refusing connections (a firewall that drops packets), lower the
+timeouts of that cluster in `options` so that number of startup nodes × timeout stays below 15 s: with
+`socket_timeout: 3` and `socket_connect_timeout: 2`, a hanging first startup node delayed the first call by 3 s.
+`socket_timeout` also limits every command on that cluster, so keep it above the slowest command you expect.
+Sentinels need no tuning for this: with the 2 s cap, even five Sentinels that do not answer fail after about
+10 s.
 
 **Concurrency.** Tool calls run in worker threads, 8 per cluster. Calls to a cluster beyond 8 at a time wait for
 a free worker; the wait counts toward their 15 s, and a call still waiting at the limit is dropped without
-running. Calls without a cluster (`clusters_list` without `cluster`, `read_messages`, `unsubscribe`,
-`search_redis_documents`, and any call that leaves out `cluster` when only one cluster is configured) share
-another 8 workers. A cluster that hangs ties up only its own workers. With 12 simultaneous `get` calls to a
-standalone cluster that accepted connections but never answered, 8 returned `Timeout reading from socket` after
-10 s and the other 4 (which got a worker only after 10 s) the 15 s timeout message, while `get` calls to another
-cluster made at the same time answered within about 10 ms.
+running. When only one cluster is configured, a call that leaves out `cluster` runs on that cluster's workers,
+like a call that names it. Calls without a cluster (`clusters_list` without `cluster`, `read_messages`,
+`unsubscribe`, `search_redis_documents`) share another 8 workers. A cluster that hangs ties up only its own
+workers. With 12 simultaneous `get` calls to a standalone cluster that accepted connections but never answered,
+8 returned `Timeout reading from socket` after 10 s and the other 4 (which got a worker only after 10 s) the 15 s
+timeout message, while `get` calls to another cluster made at the same time answered within about 10 ms.
+
+#### DNS lookups
+
+Host names are resolved before the connection attempt starts, so the lookup is not covered by
+`socket_connect_timeout`. It runs for every new connection (the pool keeps and reuses them), for the names in
+`hosts` and for names that Sentinel or `CLUSTER SLOTS` return (usually IP addresses). A name that does not
+resolve fails quickly (`Error -2 connecting to <host>:<port>. Name or service not known.`), but a slow or
+unreachable DNS server can make a lookup take longer than the whole 15 s limit. In a pod, the default `ndots:5`
+makes the resolver try a name with fewer than five dots, such as `redis-1.example.com`, with every search domain
+of the pod first (`<namespace>.svc.cluster.local`, `svc.cluster.local`, `cluster.local`, ...), each one a DNS
+query that has to fail before the real name is asked. For Redis hosts outside the cluster, write fully qualified
+names in `hosts` and lower `ndots`: `deploy/openshift/deployment.yaml` has a commented `dnsConfig` with
+`ndots: "2"`, which makes names with two or more dots go to DNS as written first; short names such as a Service
+name still go through the search domains.
 
 ### Transports and security
 

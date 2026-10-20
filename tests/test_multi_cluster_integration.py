@@ -283,6 +283,11 @@ def _text(result: Dict[str, Any]) -> str:
     return "".join(c["text"] for c in result["content"] if c["type"] == "text")
 
 
+def _result(result: Dict[str, Any]) -> Any:
+    """The structured result of a tool call (FastMCP wraps it in {"result": ...})."""
+    return result["structuredContent"]["result"]
+
+
 def _rows(result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """clusters_list rows by cluster name."""
     assert not result.get("isError"), _text(result)
@@ -451,7 +456,9 @@ class TestStdio:
 
 class TestStdioWrongPassword:
     def test_bad_password_only_breaks_its_own_cluster(self, tmp_path, standalone):
-        config = _write_config(tmp_path, standalone, alpha_password="wrong")
+        # a token that cannot appear in a reply by chance (unlike e.g. "wrong")
+        wrong_password = "wrong-" + secrets.token_hex(12)
+        config = _write_config(tmp_path, standalone, alpha_password=wrong_password)
 
         with _stdio_server(tmp_path, config) as client:
             result = client.call("clusters_list")
@@ -463,8 +470,9 @@ class TestStdioWrongPassword:
         assert "AuthenticationError" in rows["alpha"]["error"]
         assert rows["beta"]["status"] == "ok"
         assert rows["gamma"]["status"] == "ok"
-        assert "wrong" not in json.dumps(result)
+        assert wrong_password not in json.dumps(result)
         assert alpha_get.startswith("Error retrieving key k")
+        assert wrong_password not in alpha_get
         assert not beta_set.get("isError"), _text(beta_set)
 
 
@@ -501,6 +509,72 @@ class TestStdioSingleCluster:
         assert unknown.get("isError") is True
         assert _value(protected, key) == "v1"
         assert _value(open_server, key) is None
+
+
+class TestStdioPubSub:
+    """The pubsub toolset against a real server."""
+
+    @staticmethod
+    def _config(tmp_path: Path, server: RedisServer) -> Path:
+        return _write(
+            tmp_path,
+            {
+                "toolsets": ["core", "data", "pubsub"],
+                "passwordsDir": str(_passwords_dir(tmp_path, None)),
+                "clusters": [
+                    {"name": "beta", "hosts": server.address, "readOnly": False}
+                ],
+            },
+        )
+
+    def test_first_read_after_subscribe_gets_the_message(self, tmp_path, standalone):
+        """The first read gets None for the (skipped) subscribe confirmation; it goes on to the message."""
+        _, open_server = standalone
+        channel = "mcp:it:pubsub:" + secrets.token_hex(4)
+
+        with _stdio_server(tmp_path, self._config(tmp_path, open_server)) as client:
+            subscription = client.call("subscribe", channel=channel)
+            subscription_id = _result(subscription)["subscription_id"]
+            published = client.call("publish", channel=channel, message="hello")
+            first_read = client.call(
+                "read_messages",
+                subscription_id=subscription_id,
+                timeout_ms=5000,
+                max_messages=1,
+            )
+            client.call("unsubscribe", subscription_id=subscription_id)
+
+        assert not subscription.get("isError"), _text(subscription)
+        assert not published.get("isError"), _text(published)
+        messages = _result(first_read)["messages"]
+        assert [(m["channel"], m["data"]) for m in messages] == [(channel, "hello")]
+
+    def test_subscriptions_do_not_take_the_tool_calls_connections(
+        self, tmp_path, standalone
+    ):
+        """More open subscriptions than a cluster client has connections (16): the tool calls go on."""
+        _, open_server = standalone
+        open_server.client().set("mcp:it:pubsub:key", "still-readable")
+        channels = [f"mcp:it:pubsub:many:{i}" for i in range(20)]
+
+        with _stdio_server(tmp_path, self._config(tmp_path, open_server)) as client:
+            subscriptions = [client.call("subscribe", channel=c) for c in channels]
+            get = client.call("get", key="mcp:it:pubsub:key")
+            published = client.call("publish", channel=channels[-1], message="last")
+            last_id = _result(subscriptions[-1])["subscription_id"]
+            read = client.call(
+                "read_messages",
+                subscription_id=last_id,
+                timeout_ms=5000,
+                max_messages=1,
+            )
+
+        for result in subscriptions:
+            assert not result.get("isError"), _text(result)
+            assert "subscription_id" in _result(result), _text(result)
+        assert _text(get) == "still-readable"
+        assert not published.get("isError"), _text(published)
+        assert [m["data"] for m in _result(read)["messages"]] == ["last"]
 
 
 def _keys_on_every_node(
@@ -607,12 +681,8 @@ class TestRedisCluster:
 
         assert missing.get("isError") is True
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="src bug: dbsize on a Redis Cluster counts one node only (redis-py sends DBSIZE to the default"
-        " node), so it reports a fraction of the keys",
-    )
     def test_dbsize_counts_the_keys_of_every_node(self, cluster_stdio, empty_cluster):
+        """redis-py sends DBSIZE to one node by default; the tool sums the keys of every primary."""
         keys = _keys_on_every_node(empty_cluster, "mcp:it:dbsize")
         client = empty_cluster.client()
         try:
@@ -623,19 +693,19 @@ class TestRedisCluster:
 
         result = cluster_stdio.call("dbsize", cluster=REDIS_CLUSTER)
 
-        assert _text(result) == str(len(keys))
+        assert not result.get("isError"), _text(result)
+        assert _text(result) == str(len(keys)) == "3"
+        # each node holds one of them
+        assert [_dbsize(node) for node in empty_cluster.nodes] == [1, 1, 1]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="src bug: scan_all_keys on a Redis Cluster fails (RedisCluster.scan returns a cursor per node,"
-        " which the loop passes back as the cursor: \"Invalid input of type: 'dict'\")",
-    )
     def test_scan_all_keys_sees_every_node(self, cluster_stdio, empty_cluster):
+        """RedisCluster.scan returns a cursor per node; the tool walks every primary instead."""
         keys = _keys_on_every_node(empty_cluster, "mcp:it:scan")
         client = empty_cluster.client()
         try:
             for key in keys:
                 client.set(key, "1")
+            client.set("mcp:it:other", "1")
         finally:
             client.close()
 
@@ -645,6 +715,13 @@ class TestRedisCluster:
 
         assert not result.get("isError"), _text(result)
         assert sorted(result["structuredContent"]["result"]) == sorted(keys)
+
+    def test_scan_all_keys_on_an_empty_cluster(self, cluster_stdio, empty_cluster):
+        result = cluster_stdio.call("scan_all_keys", cluster=REDIS_CLUSTER)
+
+        assert not result.get("isError"), _text(result)
+        assert result["structuredContent"]["result"] == []
+        assert _text(cluster_stdio.call("dbsize", cluster=REDIS_CLUSTER)) == "0"
 
 
 @contextmanager
