@@ -28,3 +28,12 @@ uv.lock
 /coverage.xml
 /.coverage
 /htmlcov/
+
+# Real configs and secrets never go into the repository (templates: redis-mcp.example.yaml,
+# deploy/openshift/redis-mcp.yaml.example, deploy/openshift/passwords.env.example)
+/redis-mcp.yaml
+*.local.yaml
+passwords.env
+conf.d/
+/deploy/openshift/redis-mcp.yaml
+/deploy/openshift/passwords.env

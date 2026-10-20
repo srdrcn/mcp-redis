@@ -2,133 +2,207 @@
 Unit tests for src/common/server.py
 """
 
+import pkgutil
+import sys
+import warnings
 from unittest.mock import patch
 
-from src.common.server import mcp
+import pytest
+from mcp.server.fastmcp import FastMCP
+from starlette.exceptions import StarletteDeprecationWarning
+
+with warnings.catch_warnings():
+    # starlette 1.x prefers httpx2 for its TestClient; httpx works the same for these tests
+    warnings.simplefilter("ignore", StarletteDeprecationWarning)
+    from starlette.testclient import TestClient
+
+import src.tools
+from src.common import registry
+from src.common.config_loader import ConfigError, ServerConfig, parse_config
+from src.common.server import (
+    DEFAULT_HTTP_PORT,
+    HEALTH_PATH,
+    INSTRUCTIONS,
+    MCP_PATH,
+    SERVER_NAME,
+    build_server,
+    load_tools,
+)
+
+MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
 
-class TestMCPServer:
-    """Test cases for MCP server initialization."""
+def _config(**root) -> ServerConfig:
+    data = {"clusters": [{"name": "a", "hosts": "a:6379"}]}
+    data.update(root)
+    return parse_config(data)
 
-    def test_mcp_server_instance_exists(self):
-        """Test that mcp server instance is created."""
-        assert mcp is not None
-        assert hasattr(mcp, "run")
-        assert hasattr(mcp, "tool")
 
-    def test_mcp_server_name(self):
-        """Test that mcp server has correct name."""
-        # The FastMCP server should have the correct name
-        assert hasattr(mcp, "name") or hasattr(mcp, "_name")
-        # We can't directly access the name in FastMCP, but we can verify it's a FastMCP instance
-        assert str(type(mcp)) == "<class 'mcp.server.fastmcp.server.FastMCP'>"
+class TestConstants:
+    def test_server_name(self):
+        assert SERVER_NAME == "Redis MCP Server"
 
-    def test_mcp_server_dependencies(self):
-        """Test that mcp server has correct dependencies."""
-        # FastMCP should have dependencies configured
-        # We can't directly test this without accessing private attributes
-        # but we can verify the server was initialized properly
-        assert mcp is not None
+    def test_paths_and_port(self):
+        assert MCP_PATH == "/mcp"
+        assert HEALTH_PATH == "/healthz"
+        assert DEFAULT_HTTP_PORT == 8080
 
-    @patch("mcp.server.fastmcp.FastMCP")
-    def test_mcp_server_initialization(self, mock_fastmcp):
-        """Test MCP server initialization with correct parameters."""
-        # Re-import to trigger initialization
-        import importlib
+    def test_instructions(self):
+        assert "cluster" in INSTRUCTIONS
+        assert "clusters_list" in INSTRUCTIONS
+        assert "WRITE:" in INSTRUCTIONS
+        assert f"{registry.TOOL_TIMEOUT_SECONDS} s" in INSTRUCTIONS
 
-        import src.common.server
 
-        importlib.reload(src.common.server)
+class TestLoadTools:
+    def test_imports_every_tools_module(self):
+        load_tools()
 
-        # Verify FastMCP was called with correct parameters
-        mock_fastmcp.assert_called_once_with(
-            "Redis MCP Server",
-            dependencies=["redis", "python-dotenv", "numpy", "aiohttp"],
-        )
+        for module in pkgutil.iter_modules(src.tools.__path__):
+            assert f"src.tools.{module.name}" in sys.modules
 
-    def test_mcp_server_tool_decorator(self):
-        """Test that mcp server provides tool decorator."""
-        assert hasattr(mcp, "tool")
-        assert callable(mcp.tool)
+    def test_is_idempotent(self):
+        load_tools()
+        before = registry.specs()
 
-    def test_mcp_server_run_method(self):
-        """Test that mcp server provides run method."""
-        assert hasattr(mcp, "run")
-        assert callable(mcp.run)
+        load_tools()
 
-    @patch.object(mcp, "run")
-    def test_mcp_server_run_can_be_called(self, mock_run):
-        """Test that mcp server run method can be called."""
-        mcp.run()
-        mock_run.assert_called_once()
+        assert registry.specs() == before
 
-    def test_mcp_tool_decorator_functionality(self):
-        """Test that the tool decorator can be used."""
 
-        # Test that we can use the decorator (this tests the decorator exists and is callable)
-        @mcp.tool()
-        async def test_tool():
-            """Test tool for decorator functionality."""
-            return "test"
+class TestBuildServer:
+    def test_returns_named_fastmcp(self):
+        mcp = build_server(_config())
 
-        # Verify the decorator worked
-        assert callable(test_tool)
-        assert hasattr(test_tool, "__name__")
-        assert test_tool.__name__ == "test_tool"
+        assert isinstance(mcp, FastMCP)
+        assert mcp.name == SERVER_NAME
 
-    def test_mcp_tool_decorator_with_parameters(self):
-        """Test that the tool decorator works with parameters."""
+    def test_instructions_mention_cluster(self):
+        mcp = build_server(_config())
 
-        @mcp.tool()
-        async def test_tool_with_params(param1: str, param2: int = 10):
-            """Test tool with parameters."""
-            return f"{param1}:{param2}"
+        assert mcp.instructions == INSTRUCTIONS
+        assert "cluster" in mcp.instructions
 
-        # Verify the decorator worked
-        assert callable(test_tool_with_params)
-        assert hasattr(test_tool_with_params, "__name__")
+    def test_streamable_http_settings(self):
+        mcp = build_server(_config())
 
-    def test_mcp_server_is_singleton(self):
-        """Test that importing server multiple times returns same instance."""
-        from src.common.server import mcp as mcp1
-        from src.common.server import mcp as mcp2
+        assert mcp.settings.stateless_http is True
+        assert mcp.settings.json_response is True
+        assert mcp.settings.streamable_http_path == MCP_PATH
 
-        assert mcp1 is mcp2
-        assert id(mcp1) == id(mcp2)
+    def test_port_from_config(self):
+        assert build_server(_config(port=9090)).settings.port == 9090
 
-    @patch("mcp.server.fastmcp.FastMCP")
-    def test_mcp_server_dependencies_list(self, mock_fastmcp):
-        """Test that MCP server is initialized with correct dependencies list."""
-        # Re-import to trigger initialization
-        import importlib
+    @pytest.mark.parametrize("port", [None, 0])
+    def test_default_port(self, port):
+        assert build_server(_config(port=port)).settings.port == DEFAULT_HTTP_PORT
 
-        import src.common.server
+    def test_host(self):
+        assert build_server(_config()).settings.host == "0.0.0.0"  # nosec B104
+        assert build_server(_config(), host="127.0.0.1").settings.host == "127.0.0.1"
 
-        importlib.reload(src.common.server)
+    def test_dependencies(self):
+        mcp = build_server(_config())
 
-        # Get the call arguments
-        call_args = mock_fastmcp.call_args
-        assert call_args[0][0] == "Redis MCP Server"  # First positional argument
-        assert call_args[1]["dependencies"] == [
+        assert mcp.dependencies == [
             "redis",
             "python-dotenv",
             "numpy",
             "aiohttp",
-        ]  # Keyword argument
+            "pyyaml",
+        ]
 
-    def test_mcp_server_type(self):
-        """Test that mcp server is of correct type."""
-        from mcp.server.fastmcp import FastMCP
+    @pytest.mark.asyncio
+    async def test_registers_the_selected_tools(self):
+        config = _config(
+            toolsets=["core", "data"],
+            clusters=[
+                {"name": "a", "hosts": "a:6379", "readOnly": True},
+                {"name": "b", "hosts": "b:6379"},
+            ],
+        )
 
-        assert isinstance(mcp, FastMCP)
+        mcp = build_server(config)
+        listed = await mcp.list_tools()
 
-    def test_mcp_server_attributes(self):
-        """Test that mcp server has expected attributes."""
-        # Test for common FastMCP attributes
-        expected_attributes = ["run", "tool"]
+        selected = registry.select(config)
+        assert [t.name for t in listed] == [spec.name for spec, _ in selected]
+        by_name = {t.name: t for t in listed}
+        for spec, _ in selected:
+            tool = by_name[spec.name]
+            assert tool.description == spec.description
+            assert tool.annotations == registry.annotations(spec)
 
-        for attr in expected_attributes:
-            assert hasattr(mcp, attr), f"MCP server missing attribute: {attr}"
-            assert callable(getattr(mcp, attr)), (
-                f"MCP server attribute {attr} is not callable"
+    @pytest.mark.asyncio
+    async def test_servers_are_independent(self):
+        writable = build_server(_config())
+        read_only = build_server(_config(readOnly=True))
+
+        writable_names = {t.name for t in await writable.list_tools()}
+        read_only_names = {t.name for t in await read_only.list_tools()}
+
+        assert "delete" in writable_names
+        assert "delete" not in read_only_names
+        assert read_only_names < writable_names
+
+    @pytest.mark.asyncio
+    async def test_no_tool_without_enabled_toolset(self):
+        mcp = build_server(_config(toolsets=["json"]))
+
+        # no cluster lists the json module
+        assert await mcp.list_tools() == []
+
+    def test_unknown_toolset_fails(self):
+        with pytest.raises(ConfigError, match="nope"):
+            build_server(_config(toolsets=["nope"]))
+
+
+class TestHttpApp:
+    def test_healthz(self):
+        mcp = build_server(_config())
+
+        with TestClient(mcp.streamable_http_app()) as client:
+            response = client.get(HEALTH_PATH)
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/json"
+        assert response.json() == {"status": "UP"}
+
+    def test_healthz_does_not_touch_redis(self):
+        mcp = build_server(_config())
+
+        with patch(
+            "src.common.connection.RedisConnectionManager.get_connection",
+            side_effect=ConnectionError("cluster down"),
+        ) as mock_get_connection:
+            with TestClient(mcp.streamable_http_app()) as client:
+                response = client.get(HEALTH_PATH)
+
+        assert response.json() == {"status": "UP"}
+        mock_get_connection.assert_not_called()
+
+    def test_healthz_only_answers_get(self):
+        mcp = build_server(_config())
+
+        with TestClient(mcp.streamable_http_app()) as client:
+            response = client.post(HEALTH_PATH)
+
+        assert response.status_code == 405
+
+    def test_mcp_endpoint_is_stateless_json(self):
+        mcp = build_server(_config(toolsets=["core"]))
+
+        with TestClient(mcp.streamable_http_app()) as client:
+            # no initialize first: in stateless mode every request stands alone
+            response = client.post(
+                MCP_PATH,
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                headers=MCP_HEADERS,
             )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        assert "mcp-session-id" not in response.headers
+        names = [t["name"] for t in response.json()["result"]["tools"]]
+        assert "clusters_list" in names
+        assert "get" not in names

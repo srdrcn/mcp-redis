@@ -1,0 +1,39 @@
+# Template for redis-mcp.yaml (the redis-mcp-config ConfigMap on OpenShift). Fill in the <...> fields; never commit
+# real values. Passwords are not part of this file: see deploy/openshift/passwords.env.example.
+port: 8080
+apiKey: <api-key>                # X-Authorization value; use a long random key (openssl rand -hex 32); "" = no auth
+readOnly: true
+disableDestructive: true
+toolsets: [core, data]
+passwordsDir: /etc/redis-mcp/passwords   # <name>_pass files (the redis-mcp-passwords Secret); else env <name>_pass
+
+clusters:
+  - name: cbdevrds
+    mode: standalone
+    hosts: cbdevrds.example.com:6379
+    db: 0
+    username: mcp-reader
+  - name: cbtstrds
+    mode: standalone
+    hosts: cbtstrds.example.com:6379
+    username: mcp-reader
+  - name: cbprdrds
+    mode: cluster                  # Redis Cluster: startup nodes, the client discovers the rest
+    hosts: [cbprdrds-1.example.com:6379, cbprdrds-2.example.com:6379, cbprdrds-3.example.com:6379]
+    username: mcp-reader
+  - name: cbsbxrds
+    mode: standalone
+    hosts: cbsbxrds.example.com:6379
+    username: mcp-writer           # an ACL user that may write; the sandbox is the only writable cluster
+    readOnly: false
+    # modules: [json, search]      # lists the json/search tools for this cluster (Redis 8, Redis Stack)
+    # tls:                         # or `tls: true` for TLS with the system CAs
+    #   caFile: /etc/redis-mcp/tls/ca.crt
+    # options:                     # redis-py client arguments, applied after the defaults
+    #   socket_timeout: 5
+  # A primary managed by Redis Sentinel (password of the Sentinels themselves: <name>_sentinel_pass):
+  # - name: cbuatrds
+  #   mode: sentinel
+  #   hosts: [cbuatrds-s1.example.com:26379, cbuatrds-s2.example.com:26379, cbuatrds-s3.example.com:26379]
+  #   masterName: mymaster
+  #   username: mcp-reader

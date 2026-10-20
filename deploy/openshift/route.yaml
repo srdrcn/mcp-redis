@@ -1,0 +1,17 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: redis-mcp
+  annotations:
+    # above the 15 s limit of a tool call
+    haproxy.router.openshift.io/timeout: 60s
+spec:
+  # host: redis-mcp.<apps-domain>   # if left empty, OpenShift generates redis-mcp-<namespace>.<apps-domain>
+  to:
+    kind: Service
+    name: redis-mcp
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

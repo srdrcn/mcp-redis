@@ -258,4 +258,4 @@ jobs:
 
     - name: ⚙️ Test Docker image
       run: |
-        docker run --rm redis-mcp-server:test uv run python -c "import src.main; print('Docker build successful')"
+        docker run --rm redis-mcp-server:test /app/.venv/bin/python -c "import src.main; print('Docker build successful')"

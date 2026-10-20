@@ -25,8 +25,621 @@ The Redis MCP Server is a **natural language interface** designed for agentic ap
 - "Store the session with an expiration time"
 - "Index and search this vector"
 
+## Multi-cluster mode (fork)
+
+This fork turns the server into an MCP server for a whole fleet of Redis deployments. It follows the operating model
+of [openshift-mcp-server](https://github.com/openshift/openshift-mcp-server) and of its sibling kafka-mcp: one YAML
+config file, tools grouped into toolsets, a read-only switch, and Streamable HTTP or stdio as transport.
+
+**Highlights**
+
+- **Many clusters, one server**: standalone servers, Redis Cluster and Sentinel-managed primaries side by side.
+  Every tool takes a `cluster` parameter whose enum lists exactly the clusters the tool may run on.
+- **54 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
+- **Read-only in the example config**: `readOnly: true` hides every write tool (one sandbox cluster opts back in),
+  and `disableDestructive: true` hides the delete/pop/remove tools.
+- **Passwords stay out of the config**: each cluster's password comes from a mounted Secret file
+  (`<passwordsDir>/<name>_pass`) or an environment variable (`<name>_pass`).
+- **Bounded calls**: every tool call has a 15 s limit, and the Redis clients use 5 s connect and 10 s socket
+  timeouts, so a slow or unreachable cluster reports its own error.
+- **Simple to operate**: a single static API key, JSON logs with one line per tool call, a `/healthz` endpoint, a
+  non-root image that runs on a read-only root filesystem, and kustomize manifests for OpenShift (`restricted-v2`
+  SCC).
+- **Legacy mode kept**: without `--config`, the `REDIS_*` environment variables and the connection flags
+  describe a single cluster named `default` with every toolset, as described in the rest of this README (from
+  [Table of Contents](#table-of-contents) on). The tools then take `cluster: "default"`.
+
+Contents: [Quick start](#quick-start) · [Command line](#command-line) ·
+[Configuration file](#configuration-file) · [Passwords](#passwords) ·
+[Redis ACL user per cluster](#redis-acl-user-per-cluster) · [Drop-in files](#drop-in-files---config-dir) ·
+[Toolsets](#toolsets) · [Which tools are listed](#which-tools-are-listed) ·
+[Transports and security](#transports-and-security) · [JSON logs](#json-logs) ·
+[Container image](#container-image) · [OpenShift deployment](#openshift-deployment) ·
+[Claude Code](#claude-code) · [Troubleshooting](#troubleshooting)
+
+### Quick start
+
+```bash
+uv sync                                          # creates .venv with the redis-mcp-server command
+cp redis-mcp.example.yaml redis-mcp.local.yaml   # git-ignored; set apiKey and the clusters
+export cbdevrds_pass='<password>'                # one <cluster>_pass variable per cluster (see Passwords)
+uv run redis-mcp-server --config redis-mcp.local.yaml
+```
+
+The server refuses to start while `apiKey` still holds the `<api-key>` placeholder
+(`redis-mcp: Invalid config: - apiKey: apiKey still holds a placeholder ...`, exit code 2): set a real key, for
+example from `openssl rand -hex 32`, or an empty value (`apiKey: ""`) to turn authentication off for a local run.
+The example config sets `port: 8080`, so the server listens on `http://localhost:8080/mcp`:
+
+```bash
+curl -s localhost:8080/healthz                   # {"status":"UP"}
+curl -s localhost:8080/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H "X-Authorization: $REDIS_MCP_KEY" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+To run over stdio instead (for a local MCP client that starts the process itself), add `--transport stdio`.
+
+**With Docker.** Build the image and mount the config and a directory with one `<cluster>_pass` file per cluster
+(keep it outside the repository):
+
+```bash
+docker build -t redis-mcp:latest .
+docker run --rm -p 8080:8080 --read-only --tmpfs /tmp \
+  -v "$PWD/redis-mcp.local.yaml:/etc/redis-mcp/config/redis-mcp.yaml:ro" \
+  -v "$HOME/redis-mcp-passwords:/etc/redis-mcp/passwords:ro" \
+  redis-mcp:latest /app/.venv/bin/redis-mcp-server --config /etc/redis-mcp/config/redis-mcp.yaml
+```
+
+- The image's default command (`/app/.venv/bin/python src/main.py`) also works: pass
+  `-e REDIS_MCP_CONFIG=/etc/redis-mcp/config/redis-mcp.yaml` instead of the command. Without that variable it runs
+  the legacy single-cluster mode from the `REDIS_*` variables.
+- The process runs as UID 1001 in group 0 and must be able to read the mounted files. Files with mode `600` owned
+  by your user are not readable by UID 1001; run the container as your UID with `--user "$(id -u):0"`.
+- Inside the container `localhost` is the container itself. To reach a Redis on the host, use `--network host`
+  (Linux; then `-p` is not needed) or the host's address.
+
+### Command line
+
+| Option | Environment variable | Meaning |
+|---|---|---|
+| `--config <file>` | `REDIS_MCP_CONFIG` | Main config file (YAML). |
+| `--config-dir <dir>` | `REDIS_MCP_CONFIG_DIR` | Directory of drop-in `.yaml`/`.yml` files merged over the main config (see [Drop-in files](#drop-in-files---config-dir)). Can be used without `--config`. |
+| `--transport stdio\|http` | | Transport. Defaults to `http` when an HTTP port is set (> 0) and to `stdio` otherwise. `--transport http` without a port uses 8080. |
+| `--http-port <port>` | | HTTP port (1–65535). Overrides `port` from the config. (`--port` is the Redis port of the legacy mode.) |
+
+With `--config` or `--config-dir`, the clusters come from the config only: the legacy connection flags (`--url`,
+`--host`, `--port`, `--db`, `--username`, `--password`, `--ssl*`, `--cluster-mode`) are rejected, for example
+`redis-mcp: --host cannot be combined with --config/--config-dir; define the clusters in the config file`, and the
+`REDIS_HOST`/`REDIS_PORT`/... variables are not used. The `--entraid-*` flags and `REDIS_ENTRAID_*` variables still
+apply to clusters with `entraid: true`.
+
+An invalid or unreadable config, a legacy flag combined with `--config`, or an unknown toolset is reported on stderr
+as `redis-mcp: ...` and the process exits with code 2 (a malformed option value gets click's usage error, also with
+exit code 2). `python src/main.py` (the image's default command) takes no options and reads
+`REDIS_MCP_CONFIG`/`REDIS_MCP_CONFIG_DIR` from the environment.
+
+### Configuration file
+
+This is the content of `redis-mcp.example.yaml` without its header comment
+(`deploy/openshift/redis-mcp.yaml.example` is identical). Never commit real values: keep them in
+`redis-mcp.local.yaml` or `redis-mcp.yaml` (both git-ignored) or in the OpenShift ConfigMap.
+
+```yaml
+port: 8080
+apiKey: <api-key>                # X-Authorization value; use a long random key (openssl rand -hex 32); "" = no auth
+readOnly: true
+disableDestructive: true
+toolsets: [core, data]
+passwordsDir: /etc/redis-mcp/passwords   # <name>_pass files (the redis-mcp-passwords Secret); else env <name>_pass
+
+clusters:
+  - name: cbdevrds
+    mode: standalone
+    hosts: cbdevrds.example.com:6379
+    db: 0
+    username: mcp-reader
+  - name: cbtstrds
+    mode: standalone
+    hosts: cbtstrds.example.com:6379
+    username: mcp-reader
+  - name: cbprdrds
+    mode: cluster                  # Redis Cluster: startup nodes, the client discovers the rest
+    hosts: [cbprdrds-1.example.com:6379, cbprdrds-2.example.com:6379, cbprdrds-3.example.com:6379]
+    username: mcp-reader
+  - name: cbsbxrds
+    mode: standalone
+    hosts: cbsbxrds.example.com:6379
+    username: mcp-writer           # an ACL user that may write; the sandbox is the only writable cluster
+    readOnly: false
+    # modules: [json, search]      # lists the json/search tools for this cluster (Redis 8, Redis Stack)
+    # tls:                         # or `tls: true` for TLS with the system CAs
+    #   caFile: /etc/redis-mcp/tls/ca.crt
+    # options:                     # redis-py client arguments, applied after the defaults
+    #   socket_timeout: 5
+  # A primary managed by Redis Sentinel (password of the Sentinels themselves: <name>_sentinel_pass):
+  # - name: cbuatrds
+  #   mode: sentinel
+  #   hosts: [cbuatrds-s1.example.com:26379, cbuatrds-s2.example.com:26379, cbuatrds-s3.example.com:26379]
+  #   masterName: mymaster
+  #   username: mcp-reader
+```
+
+#### Top-level keys
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `port` | integer (0–65535) | not set | HTTP port. When it is set (> 0) and `--transport` is not given, the server runs Streamable HTTP, otherwise stdio. `--http-port` overrides it. |
+| `apiKey` | string | not set | Static API key. HTTP requests to `/mcp` must send it in the `X-Authorization` header. Not set or empty (`""`) turns the check off. A non-empty key must not be blank, must not start or end with whitespace and must not be a `<...>` or `${...}` placeholder, otherwise the server does not start; a key shorter than 16 characters only logs a warning. |
+| `readOnly` | boolean | `false` | `true` hides every write tool on clusters that do not override it with their own `readOnly`. |
+| `disableDestructive` | boolean | `false` | `true` hides the destructive tools (`delete`, `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy`, `json_del`) on every cluster. It is global only and does not affect the other write tools. |
+| `toolsets` | list of strings | `[core]` | Toolsets to enable, which also sets the order of `tools/list`. An unknown name stops the server at startup; an empty or duplicate entry is an invalid config. |
+| `passwordsDir` | path | `/etc/redis-mcp/passwords` | Directory of the `<name>_pass` password files (see [Passwords](#passwords)). |
+| `clusters` | list | (required) | The Redis deployments. At least one is required, and names must be unique. |
+
+The defaults in the code are permissive (`readOnly: false`, `disableDestructive: false`). The example config turns
+both on.
+
+YAML numbers keep the text they are written with wherever a string is expected, so `apiKey: 0123456701234567` or
+`username: 0123` are read exactly as written (plain YAML 1.1 would turn them into octal numbers); `port` and `db`
+are converted to numbers. In `options`, values that look like integers or decimals are passed to redis-py as
+numbers, quoted or not. Unknown keys are errors, and the error message names the field
+(`clusters[0].password: Extra inputs are not permitted`).
+
+#### Cluster keys
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | (required) | Unique name of 1–63 characters from `A-Z a-z 0-9 _ . -`, starting with a letter or digit. It becomes a value of the `cluster` enum, and it names the password file or variable (`<name>_pass`). |
+| `mode` | `standalone`, `cluster` or `sentinel` | `standalone` | `standalone`: `redis.Redis`. `cluster`: `redis.cluster.RedisCluster` (Redis Cluster / OSS cluster API). `sentinel`: `redis.sentinel.Sentinel(...).master_for(masterName)`, always the current primary. |
+| `hosts` | string or list | (required) | `host:port` entries, as a comma-separated string or a YAML list. IPv6 addresses are written `[addr]:port` (quote them in YAML). `standalone` takes exactly one; `cluster` takes the startup nodes (the client reads the slot map from them and discovers the other nodes); `sentinel` takes the Sentinels. |
+| `db` | integer (≥ 0) | `0` | Database number (`standalone`, `sentinel`). A Redis Cluster only has database 0, so `db` other than 0 is rejected with `mode: cluster`. |
+| `username` | string | not set | ACL user (redis-py `username`). Without it, the password authenticates the `default` user (`requirepass`). Cannot be combined with `entraid`. |
+| `masterName` | string | not set | Name of the monitored primary. Required with `mode: sentinel`, rejected with the other modes. |
+| `tls` | `true` or map | not set (no TLS) | TLS for the connections to Redis (redis-py `ssl=True` plus the settings below). `true` uses the defaults: the server certificate is verified against the system CAs, including the host name. With `mode: sentinel` the same settings also apply to the Sentinel connections. |
+| `readOnly` | boolean | global `readOnly` | Per-cluster override of `readOnly`, in either direction. |
+| `modules` | list of `json`, `search` | `[]` | Modules the cluster has. The `json` and `search` toolsets offer their tools only on clusters that list the module. |
+| `entraid` | boolean | `false` | Authenticate with the Entra ID credential provider (settings from the `--entraid-*` flags / `REDIS_ENTRAID_*` variables, see [EntraID Authentication](#entraid-authentication-for-azure-managed-redis)) instead of a password. |
+| `options` | map | `{}` | redis-py client keyword arguments, applied after the defaults, the credentials and the TLS settings (they override all of them). `password`, `credential_provider` and `decode_responses` are rejected. |
+
+#### TLS keys
+
+| Key | Type | Default | redis-py argument | Meaning |
+|---|---|---|---|---|
+| `caFile` | path | not set | `ssl_ca_certs` | CA bundle (PEM) trusted in addition to the system CAs. |
+| `caPath` | path | not set | `ssl_ca_path` | Directory of CA certificates. |
+| `certFile` | path | not set | `ssl_certfile` | Client certificate (mutual TLS). |
+| `keyFile` | path | not set | `ssl_keyfile` | Key of the client certificate. |
+| `certReqs` | `required`, `optional` or `none` | `required` | `ssl_cert_reqs` | Verification of the server certificate. `none` also turns the host name check off. |
+| `checkHostname` | boolean | not set (redis-py default: on) | `ssl_check_hostname` | Match the server certificate against the host name in `hosts`. |
+
+#### Redis clients
+
+The client arguments of each cluster are built in this order (later entries win):
+
+```python
+# 1. defaults
+decode_responses=True or False          # chosen by the tool
+lib_name="redis-py(mcp-server_v<version>)"
+socket_connect_timeout=5
+socket_timeout=10
+# 2. credentials: username and the <name>_pass password, or credential_provider with entraid: true
+# 3. tls: ssl=True, ssl_cert_reqs, ssl_ca_certs, ssl_ca_path, ssl_certfile, ssl_keyfile, ssl_check_hostname
+# 4. the cluster's options: map
+max_connections=10                      # only if options does not set it
+```
+
+- There is one client per cluster (two if tools ask for both `decode_responses` values). It is created on first
+  use and then reused. Each cluster has its own lock, so a cluster that is slow to connect does not hold up calls
+  for the others, and a failed creation is not cached: the next call tries again.
+- **Sentinel**: the Sentinel connections use the cluster's socket timeouts (including overrides from `options`),
+  its `tls` settings and the password `<name>_sentinel_pass` (no username). The other `options` apply only to the
+  connections to the primary.
+
+### Passwords
+
+Passwords are never part of the YAML (there is no password key, and `options.password` is rejected). At startup,
+for each cluster `<name>`, the server reads:
+
+1. the file `<passwordsDir>/<name>_pass` (for example `/etc/redis-mcp/passwords/cbdevrds_pass`) if it exists,
+2. otherwise the environment variable `<name>_pass`.
+
+Trailing line breaks are removed from a file's content; everything else, including spaces, is part of the password.
+With `mode: sentinel`, the password of the Sentinels themselves is read the same way from `<name>_sentinel_pass`.
+A cluster without a password (and without `entraid: true`) connects without AUTH, and the server logs a warning
+at startup:
+
+```
+cluster cbdevrds: no password (/etc/redis-mcp/passwords/cbdevrds_pass or env cbdevrds_pass); connecting without AUTH
+```
+
+The passwords are read only at startup. `clusters_list` reports `auth: password`, `none` or `entraid`, never the
+password.
+
+On OpenShift, the Secret `redis-mcp-passwords` is created from a `passwords.env` file
+(template: `deploy/openshift/passwords.env.example`) and mounted at `/etc/redis-mcp/passwords`, one file per key:
+
+```bash
+cp deploy/openshift/passwords.env.example passwords.env    # git-ignored; one <cluster>_pass=<password> line per cluster
+oc create secret generic redis-mcp-passwords --from-env-file=passwords.env
+```
+
+In an env file the value is everything after the first `=`: quotes are kept as part of the value, and so is a
+`# comment` at the end of a line. Lines that start with `#` are ignored. A key must not start with a digit; for
+such a cluster name use `--from-literal=<name>_pass=<password>` instead. For a local run, `export
+cbdevrds_pass=...` works in bash (names with `-` or `.` cannot be exported from a shell; use files then).
+
+### Redis ACL user per cluster
+
+`readOnly` only decides which tools are listed; it does not restrict what the server's Redis user may do. Give the
+server its own ACL user on every cluster, with only the rights it needs. A read-only user for the `core` and `data`
+toolsets:
+
+```
+ACL SETUSER mcp-reader on >REPLACE_ME ~* &* +@read +@connection -@dangerous +info +client|list +cluster|slots
+```
+
+and, on a writable cluster such as the sandbox, a user that may also write but still cannot flush, reconfigure or
+shut down the server:
+
+```
+ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@dangerous +info +client|list +cluster|slots
+```
+
+- The rules are applied from left to right. `-@dangerous` must come **before** `+info +client|list`: `INFO` and
+  `CLIENT LIST` (used by the `info`, `client_list` and `clusters_list` tools) are in the `@dangerous` category, so a
+  `-@dangerous` at the end would remove them again. `-@dangerous` also removes `KEYS`, `FLUSHALL`, `FLUSHDB`,
+  `CONFIG`, `SHUTDOWN` and `CLIENT KILL`.
+- `+cluster|slots` is needed on a Redis Cluster: redis-py reads the slot map when it connects, and without this
+  command the connection fails with `Cluster mode is not enabled on this node`. It does no harm elsewhere.
+- Checked on Redis 7.0 with the server's tools and `ACL DRYRUN`: `mcp-reader` can run `get`, `hgetall`, `scan_keys`,
+  `scan_all_keys`, `type`, `dbsize`, `info`, `client_list` and `clusters_list`, and `set`/`delete` fail with
+  `this user has no permissions to run the 'set' command`; `mcp-writer` can also run `set`, `delete`, `expire`,
+  `rename` and the stream group commands, but not `FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG` or `SHUTDOWN`.
+- The `pubsub` toolset needs `+subscribe +psubscribe +unsubscribe +punsubscribe` (and `+publish` for the write
+  tool `publish`): pub/sub commands are not in `@read` or `@write`.
+- The `json` and `search` tools use module commands (`JSON.GET`, `JSON.SET`, `JSON.DEL`, `FT._LIST`, `FT.INFO`,
+  `FT.SEARCH`, `FT.CREATE`). Their ACL categories depend on the Redis/module version, so check them with
+  `ACL DRYRUN mcp-reader JSON.GET somekey` and add the commands explicitly if needed.
+- ACL users are per node: on a Redis Cluster or a Sentinel setup, create the user on every node, replicas
+  included (or use an ACL file), so that it still exists after a failover. Persist it with `ACL SAVE` (with an
+  `aclfile`) or `CONFIG REWRITE`.
+- Set `username: mcp-reader` (or `mcp-writer`) on the cluster in the config, and put the password in
+  `<name>_pass`.
+
+### Drop-in files (`--config-dir`)
+
+- The server reads the regular `*.yaml` and `*.yml` files directly inside the directory. Hidden files are skipped
+  and subdirectories are not read, so the directory can be a mounted ConfigMap. The files are sorted by name and
+  merged over `--config` one after another.
+- Maps are merged deeply. `clusters` is merged **by `name`**: an entry with an existing name overrides only the
+  fields it sets (its `tls` and `options` maps are merged key by key), and an entry with a new name is appended.
+  Every other list, such as `toolsets`, `modules` or a `hosts` list, replaces the earlier value entirely. Scalars
+  replace the earlier value.
+- Validation runs after the merge.
+
+```yaml
+# conf.d/10-sandbox.yaml: the sandbox runs Redis 8 with the JSON and search modules
+clusters:
+  - name: cbsbxrds
+    modules: [json, search]
+```
+
+```yaml
+# conf.d/20-toolsets.yaml: replaces the whole toolsets list
+toolsets: [core, data, json, search]
+```
+
+The config is read once at startup, so restart the server to apply changes.
+
+### Toolsets
+
+| Toolset | Tools | Read | Write | Destructive | Available on |
+|---|---:|---|---|---|---|
+| `core` (enabled by default) | 10 | `clusters_list`, `type`, `scan_keys`, `scan_all_keys`, `dbsize`, `info`, `client_list` | `expire`, `rename` | `delete` | Every cluster. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
+| `data` | 29 | `get`, `hget`, `hgetall`, `hexists`, `get_vector_from_hash`, `lrange`, `llen`, `smembers`, `zrange`, `xrange` | `set`, `hset`, `set_vector_in_hash`, `lpush`, `rpush`, `sadd`, `zadd`, `xadd`, `xgroup_create`, `xreadgroup`, `xack` | `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy` | Every cluster |
+| `json` | 3 | `json_get` | `json_set` | `json_del` | Clusters with `modules: [json]` |
+| `search` | 6 | `get_indexes`, `get_index_info`, `get_indexed_keys_number`, `vector_search_hash`, `hybrid_search` | `create_vector_index_hash` | | Clusters with `modules: [search]` |
+| `pubsub` | 5 | `subscribe`, `psubscribe`, `read_messages`, `unsubscribe` | `publish` | | Every cluster. `read_messages` and `unsubscribe` take the `subscription_id` and no `cluster`. |
+| `docs` | 1 | `search_redis_documents` | | | Not tied to a cluster (no `cluster` parameter). Calls `MCP_DOCS_SEARCH_URL` (default `https://redis.io/convai/api/docs/search`), so the pod needs egress to it. |
+| **Total** | **54** | **28** | **16** | **10** | |
+
+Pub/sub subscriptions live in the server process (at most 50 at a time). They are lost when the pod restarts, and
+`read_messages` then answers `Subscription '<id>' was not found`; this is why the Deployment runs a single replica.
+
+### Which tools are listed
+
+For every tool, the server works out which clusters it may run on:
+
+1. Its toolset must be in `toolsets`.
+2. `json` and `search` tools need a cluster that lists the module in `modules`.
+3. **Write** tools (descriptions starting with `WRITE:`) need the cluster's effective `readOnly` to be `false`. The
+   cluster's own `readOnly` applies if it is set, otherwise the global one does.
+4. **Destructive** tools also need `disableDestructive: false`.
+
+A tool with no eligible cluster is **not listed at all** (calling it anyway returns `Unknown tool: <name>`). Every
+other tool is listed with its `cluster` enum **narrowed to the eligible clusters**, and a call that names any other
+cluster, or none, is rejected by schema validation (`Input should be 'cbsbxrds'`, `Field required`). The `cluster`
+parameter is required even when only one cluster is configured; only `clusters_list` (optional) and
+`read_messages`, `unsubscribe` and `search_redis_documents` (none) differ. With the example config, 30 of the 54
+tools are listed. For example:
+
+| Tool | `cluster` enum |
+|---|---|
+| `get`, `scan_keys`, `info` (read) | `cbdevrds`, `cbtstrds`, `cbprdrds`, `cbsbxrds` |
+| `set`, `hset`, `expire` (write) | `cbsbxrds` |
+| `delete`, `hdel`, `lpop` (destructive) | not listed |
+| `json_get`, `get_indexes` | not listed (toolsets `json`/`search` not enabled) |
+
+The `WRITE:` prefix is added to the description of every write and destructive tool. Tools also carry MCP
+annotations: `readOnlyHint: true` on read tools and `destructiveHint: true` on destructive tools (both are `false`
+on the other write tools).
+
+**Limits.** Every tool call runs for at most **15 s**; a call that runs longer returns
+`Tool did not finish within 15 s (timeout). Try a narrower pattern or a smaller count.` The client timeouts
+(5 s connect, 10 s socket) are below that, so an unreachable or hanging cluster normally reports its own
+connection error first. `clusters_list` checks all clusters in parallel; a cluster whose check does not finish in
+time shows `status: timeout`.
+
+### Transports and security
+
+- **Streamable HTTP** on `/mcp` (stateless, JSON responses). The server handles each request on its own and keeps no
+  MCP session, so a pod restart does not break connected clients (pub/sub subscriptions excepted). The health
+  endpoint `GET /healthz` returns `{"status":"UP"}`; it does not depend on Redis, so a cluster outage does not
+  restart the pod. Use `clusters_list` to check the clusters.
+- **stdio**: JSON-RPC on stdin/stdout, with logs on stderr. There is no HTTP listener and no API key check (the
+  config is still validated, so `apiKey` must not be the placeholder; use `""`).
+
+Security:
+
+- **API key (HTTP only)**: when `apiKey` is set, every request to `/mcp` (and anything below it) must carry the
+  header `X-Authorization: <api-key>` with exactly that value (compared in constant time). A missing or different
+  value gets **HTTP 401** with
+  `{"error": "unauthorized", "message": "X-Authorization header is missing or the API key does not match"}`.
+  The header is `X-Authorization`, not `Authorization`, and takes the raw key (no `Bearer` prefix). An empty
+  `apiKey` turns the check off. The startup log says `API key authentication enabled for /mcp (header
+  X-Authorization)`, or warns `API key authentication DISABLED (apiKey is empty): anyone who can reach /mcp can call
+  the tools`.
+- **Browser requests are refused**: a request to `/mcp` with an `Origin` header (that is, one sent by a web page)
+  gets **HTTP 403**
+  `{"error": "forbidden", "message": "Requests with an Origin header (from a web page) are not accepted"}`, even
+  with the right key. This stops a web page from driving the tools through the user's browser (CSRF, DNS
+  rebinding). MCP clients such as Claude Code send no `Origin` header; browser-based clients cannot connect.
+- `/healthz` is not behind the key, so probes work. It shows no details.
+- Run HTTP behind TLS. The OpenShift Route terminates TLS at the edge.
+- On the Redis side, the server can do what its ACL user can do (see
+  [Redis ACL user per cluster](#redis-acl-user-per-cluster)). `readOnly` controls which tools are listed; it does
+  not replace ACLs.
+- Keep secrets out of the repository. `redis-mcp.yaml` in the repository root, `*.local.yaml`, `passwords.env`,
+  `conf.d/`, and `deploy/openshift/redis-mcp.yaml`/`passwords.env` are git-ignored, and the image build context
+  contains only `src/`, `pyproject.toml`, `uv.lock` and `README.md`. Examples use `<...>` placeholders.
+- The pod does not mount a service account token (`automountServiceAccountToken: false`), because the server never
+  calls the Kubernetes API.
+
+### JSON logs
+
+Over HTTP, logs are JSON on **stdout**, one object per line with `@timestamp`, `level`, `logger`, `message` and any
+extra fields, at `INFO` (`MCP_REDIS_LOG_LEVEL` overrides it). The MCP SDK's own loggers are kept at `WARNING` and
+uvicorn's access log is off. Every tool call that passes the input schema validation produces one line with `tool`,
+`cluster`, `durationMs`, `outcome` (`ok`/`error`) and `error`, for example:
+
+```json
+{"@timestamp": "2026-10-20T06:25:24.482Z", "level": "INFO", "logger": "src.common.registry", "message": "tool call tool=set cluster=cbsbxrds durationMs=4 outcome=ok", "tool": "set", "cluster": "cbsbxrds", "durationMs": 4, "outcome": "ok", "error": null}
+```
+
+- `outcome` is `error` when the tool raises or hits the 15 s limit. Most data tools report Redis errors (for
+  example a missing ACL permission) in their result text instead, which is logged as `ok`.
+- Calls rejected before they reach the tool (a `cluster` outside the enum, a missing or mistyped parameter, an
+  unknown tool) produce no `tool call` line.
+- A rejected HTTP request logs `unauthorized request` at `WARNING` with `remoteAddr` and `headerPresent`, never
+  the key itself.
+- At startup the server logs `<n> tools listed for clusters [...] (readOnly=..., disableDestructive=...)` and a
+  warning for each cluster without a password.
+
+Over stdio, stdout carries the JSON-RPC stream, so logs go to stderr in the plain format of the legacy mode, at
+`WARNING` by default (see [Logging](#logging)); set `MCP_REDIS_LOG_LEVEL=INFO` to see the `tool call` lines.
+
+### Container image
+
+`Dockerfile` builds on `python:3.14-slim` and installs the locked dependencies into `/app/.venv` with
+`uv sync --locked --no-dev`. It is built to run under the OpenShift **restricted-v2** SCC:
+
+- It runs as non-root user 1001. `/app` and `/etc/redis-mcp` are group 0 with `g=u`, so a random UID in group 0
+  works.
+- It writes nothing at runtime: the bytecode is compiled during the build and `uv` is not used to start the
+  server, so the root filesystem can be read-only, with an `emptyDir` mounted at `/tmp`. (`uv run` inside the
+  container would fail as a non-root user: `Failed to initialize cache at /.cache/uv`.)
+- `CMD ["/app/.venv/bin/python", "src/main.py"]`: with `REDIS_MCP_CONFIG` (or `REDIS_MCP_CONFIG_DIR`) set it runs
+  the multi-cluster mode, otherwise the legacy single-cluster mode from the `REDIS_*` variables over stdio, as
+  before. The OpenShift Deployment runs `/app/.venv/bin/redis-mcp-server --config
+  /etc/redis-mcp/config/redis-mcp.yaml` instead. `/app/.venv/bin` is on `PATH`, so `redis-mcp-server` also works
+  as a command. Port 8080 is exposed.
+- Mount points: `/etc/redis-mcp/config` (redis-mcp.yaml), `/etc/redis-mcp/passwords` (`<cluster>_pass` files),
+  `/etc/redis-mcp/tls` (CA certificates).
+
+The image runs with `--user 12345:0 --read-only --tmpfs /tmp` (a random UID in group 0 and a read-only root
+filesystem, as on OpenShift), in both the multi-cluster (HTTP) and the legacy (stdio) mode.
+
+### OpenShift deployment
+
+`deploy/openshift/` is a kustomize directory:
+
+| File | Content |
+|---|---|
+| `deployment.yaml` | 1 replica (`Recreate`: pub/sub subscriptions and the client caches live in the process). Startup, liveness and readiness probes on `/healthz`. A restricted-v2 security context (non-root, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, read-only root filesystem). No service account token is mounted. A `/tmp` `emptyDir`. Requests of 50m CPU and 128Mi memory, with a 256Mi memory limit (the server uses under 100 MB at idle). The config is mounted at `/etc/redis-mcp/config`, the passwords at `/etc/redis-mcp/passwords` (mode `0440`); an optional CA Secret mount at `/etc/redis-mcp/tls` is commented out. |
+| `service.yaml` | `redis-mcp` Service on port 8080 (`http`). |
+| `route.yaml` | Edge TLS (HTTP redirects to HTTPS), `haproxy.router.openshift.io/timeout: 60s`. |
+| `kustomization.yaml` | The resources above, labels, and the `images:` entry that sets the image. |
+| `redis-mcp.yaml.example`, `passwords.env.example` | Templates for the ConfigMap and the Secret. |
+
+The ConfigMap `redis-mcp-config` (key `redis-mcp.yaml`) and the Secret `redis-mcp-passwords` (one `<cluster>_pass`
+key per cluster) hold environment-specific data, so `oc apply -k` does not create them. You create them with
+`oc create`.
+
+**0. Select the project** the server runs in. The commands below use the current project:
+
+```bash
+oc new-project redis-mcp      # or switch to an existing one: oc project <namespace>
+```
+
+**1. Build and push the image**, either to a registry the cluster can pull from:
+
+```bash
+docker build -t <registry>/<namespace>/redis-mcp:<tag> .     # or podman build
+docker push <registry>/<namespace>/redis-mcp:<tag>
+```
+
+or inside the cluster, into the internal registry (the build pod needs access to Docker Hub and PyPI):
+
+```bash
+oc new-build --name redis-mcp --binary --strategy docker
+oc start-build redis-mcp --from-repo . --follow   # -> image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp:latest
+```
+
+`--from-repo` uploads the committed files of the clone, so local config and password files are not sent to the
+cluster.
+
+**2. Set the image** in `deploy/openshift/kustomization.yaml`:
+
+```yaml
+images:
+  - name: redis-mcp
+    newName: image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp   # or <registry>/<namespace>/redis-mcp
+    newTag: latest
+```
+
+**3. Prepare the config and the passwords** from the templates. Keep `port: 8080` and
+`passwordsDir: /etc/redis-mcp/passwords`, which match the Deployment. Generate the API key with something like
+`openssl rand -hex 32`. Add one `<cluster>_pass` line per cluster to `passwords.env`.
+
+```bash
+cp deploy/openshift/redis-mcp.yaml.example redis-mcp.yaml   # set apiKey and the clusters (git-ignored)
+cp deploy/openshift/passwords.env.example passwords.env     # set the passwords (git-ignored)
+```
+
+**4. Create the ConfigMap and the Secret, then apply the manifests:**
+
+```bash
+oc create configmap redis-mcp-config --from-file=redis-mcp.yaml
+oc create secret generic redis-mcp-passwords --from-env-file=passwords.env
+oc apply -k deploy/openshift
+oc rollout status deployment/redis-mcp
+oc get route redis-mcp
+```
+
+For clusters with TLS and a private CA, create a Secret with the CA, uncomment the `tls-ca` volume and its mount in
+`deployment.yaml`, and set `tls: {caFile: /etc/redis-mcp/tls/ca.crt}` on those clusters:
+
+```bash
+oc create secret generic redis-mcp-tls --from-file=ca.crt=/path/to/ca.crt
+```
+
+The Route has no fixed host, so OpenShift generates `redis-mcp-<namespace>.<apps-domain>`. To use
+`redis-mcp.<apps-domain>`, uncomment `spec.host` in `route.yaml`. The 60 s router timeout leaves room above the
+15 s tool limit.
+
+The API key sits in the ConfigMap together with the rest of `redis-mcp.yaml`, so anyone who can read ConfigMaps in
+the namespace can read it. Limit access to the namespace accordingly.
+
+**Smoke test:**
+
+```bash
+curl -s https://redis-mcp.<apps-domain>/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H "X-Authorization: $REDIS_MCP_KEY" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"clusters_list","arguments":{}}}'
+```
+
+**Updating the config or the passwords.** Both are read only at startup, so replace the object and restart the pod:
+
+```bash
+oc create configmap redis-mcp-config --from-file=redis-mcp.yaml --dry-run=client -o yaml | oc replace -f -
+oc create secret generic redis-mcp-passwords --from-env-file=passwords.env --dry-run=client -o yaml | oc replace -f -
+oc rollout restart deployment/redis-mcp
+```
+
+With `Recreate`, the old pod stops before the new one starts, so there is a short gap, and open pub/sub
+subscriptions are lost.
+
+### Claude Code
+
+Add the server to `.mcp.json` (project scope). The key stays in an environment variable and never in the file:
+
+```json
+{
+  "mcpServers": {
+    "redis": {
+      "type": "http",
+      "url": "https://redis-mcp.<apps-domain>/mcp",
+      "headers": {
+        "X-Authorization": "${REDIS_MCP_KEY}"
+      }
+    }
+  }
+}
+```
+
+```bash
+export REDIS_MCP_KEY=<api-key>
+claude
+```
+
+If the Route certificate is signed by a corporate CA, Node.js (which Claude Code runs on) must trust that CA. Point
+`NODE_EXTRA_CA_CERTS` to the CA bundle in PEM format before you start `claude`:
+
+```bash
+export NODE_EXTRA_CA_CERTS=/path/to/corporate-ca.pem
+```
+
+Run `/mcp` inside Claude Code to check the connection. The tools appear as `mcp__redis__<tool>`.
+
+**stdio alternative.** Claude Code can also start the server locally. The clusters must then be reachable from your
+machine, and the passwords come from the environment. Pass `--transport stdio` explicitly, because a config with
+`port` set would otherwise start HTTP:
+
+```json
+{
+  "mcpServers": {
+    "redis": {
+      "type": "stdio",
+      "command": "/path/to/mcp-redis/.venv/bin/redis-mcp-server",
+      "args": ["--config", "/path/to/redis-mcp.local.yaml", "--transport", "stdio"],
+      "env": {
+        "cbsbxrds_pass": "${CBSBXRDS_PASS}"
+      }
+    }
+  }
+}
+```
+
+### Troubleshooting
+
+Start with `clusters_list`: it shows every cluster's mode, hosts, `readOnly`, modules and auth, and connects to each
+one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`, `role` and, for a Redis Cluster,
+`primaries`, or the `error`.
+
+| Symptom | Cause and fix |
+|---|---|
+| `redis-mcp: Invalid config: - apiKey: apiKey still holds a placeholder ...` | `apiKey` was not filled in. Set a real key (`openssl rand -hex 32`), or `""` to turn authentication off. |
+| `redis-mcp: Invalid config: - clusters[0]...` | Fix the named key, for example `clusters[0]: a standalone cluster takes exactly one host:port in hosts`, `clusters[0]: masterName is required when mode is sentinel`, `clusters[0].hosts: 'h' is not host:port` or `clusters[0].password: Extra inputs are not permitted` (passwords go into `<name>_pass`). |
+| `redis-mcp: Unknown toolset: [...]` | Valid toolsets are `core`, `data`, `json`, `search`, `pubsub` and `docs`. |
+| `redis-mcp: --host cannot be combined with --config/--config-dir; ...` | The legacy connection flags do not apply to the multi-cluster mode; define the clusters in the config file. |
+| HTTP 401 `X-Authorization header is missing or the API key does not match` | The key does not match `apiKey` exactly. Check that `REDIS_MCP_KEY` is exported in the shell that starts Claude Code and that it equals `apiKey` in the ConfigMap (no extra whitespace, no `Bearer` prefix, header name `X-Authorization`). The server log shows `unauthorized request` with `headerPresent`. |
+| HTTP 403 `Requests with an Origin header (from a web page) are not accepted` | The request came from a web page or a browser-based client. Use a non-browser MCP client such as Claude Code. |
+| Startup warning `cluster <name>: no password (...); connecting without AUTH`, then `Authentication required.` | The Secret has no `<name>_pass` key for this cluster (the name is case-sensitive and must match `name` exactly), or the Secret is not mounted at `passwordsDir`. |
+| `invalid username-password pair or user is disabled.` | Wrong password or `username`, or the ACL user is `off`. Check for quotes or a trailing comment that `--from-env-file` kept in the value. |
+| `this user has no permissions to run the '<command>' command` | The cluster's ACL user lacks the command. Expected for writes with `mcp-reader`; otherwise add the rule (see [Redis ACL user per cluster](#redis-acl-user-per-cluster)). |
+| `Redis Cluster cannot be connected. Please provide at least one reachable node: Cluster mode is not enabled on this node` | Either the cluster is not a Redis Cluster (use `mode: standalone` or `sentinel`), or its ACL user lacks `+cluster\|slots`. |
+| Results like `Error retrieving key a: 15495 127.0.0.1:17002` (a slot and an address: a `MOVED` redirect) | The cluster is a Redis Cluster but configured with `mode: standalone`. Set `mode: cluster`. |
+| `Error 111 connecting to <host>:<port>. Connection refused.` or `Timeout connecting to server` | Check `hosts` and the network path from the pod (egress, firewall). The connect timeout is 5 s; raise it with `options: {socket_connect_timeout: ...}` if needed. |
+| `status: timeout` in `clusters_list`, or TLS errors such as `CERTIFICATE_VERIFY_FAILED` | `tls` set on a port without TLS ends in a timeout. For certificate errors, set `caFile` to the CA that signed the server certificate (mounted at `/etc/redis-mcp/tls`), and use the host name the certificate is issued for in `hosts`. |
+| `Tool did not finish within 15 s (timeout). Try a narrower pattern or a smaller count.` | `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large databases use `scan_keys` and page through the keys with the `cursor` it returns, or use a more specific tool. |
+| A tool or cluster is missing from the list, or `Unknown tool: <name>` | Its toolset is not in `toolsets`, the cluster is read-only (write tools), `disableDestructive` is on (delete/pop/remove tools), or the cluster does not list the module (`json`/`search` tools). |
+| `Input should be '<cluster>'` | The tool is not available on the named cluster (for example a write tool on a read-only cluster); the error lists the allowed values. |
+| `Subscription '<id>' was not found` | The pod restarted (subscriptions live in the process) or the subscription was closed. Subscribe again. |
+
 ## Table of Contents
 - [Overview](#overview)
+- [Multi-cluster mode (fork)](#multi-cluster-mode-fork)
 - [Features](#features)
 - [Tools](#tools)
 - [Installation](#installation)
@@ -61,7 +674,7 @@ The Redis MCP Server is a **natural language interface** designed for agentic ap
 - **Search & Filtering**: Supports efficient data retrieval and searching in Redis.
 - **Scalable & Lightweight**: Designed for **high-performance** data operations.
 - **EntraID Authentication**: Native support for Azure Active Directory authentication with Azure Managed Redis.
-- The Redis MCP Server supports the `stdio` [transport](https://modelcontextprotocol.io/docs/concepts/transports#standard-input%2Foutput-stdio). Support to the `stremable-http` transport will be added in the future.
+- The Redis MCP Server supports the `stdio` [transport](https://modelcontextprotocol.io/docs/concepts/transports#standard-input%2Foutput-stdio). Support to the `stremable-http` transport will be added in the future. (This fork also serves Streamable HTTP; see [Multi-cluster mode (fork)](#multi-cluster-mode-fork).)
 
 ## Tools
 

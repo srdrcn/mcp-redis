@@ -37,8 +37,16 @@ def _create_server_process(project_root):
         text=True,
         encoding="utf-8",
         errors="replace",  # Replace invalid characters instead of failing
-        env={"REDIS_HOST": "localhost", "REDIS_PORT": "6379", **dict(os.environ)},
+        env=_legacy_env(),
     )
+
+
+def _legacy_env():
+    """The environment of the legacy (single-cluster) mode: no multi-cluster config from the caller's env."""
+    env = {"REDIS_HOST": "localhost", "REDIS_PORT": "6379", **dict(os.environ)}
+    env.pop("REDIS_MCP_CONFIG", None)
+    env.pop("REDIS_MCP_CONFIG_DIR", None)
+    return env
 
 
 @pytest.mark.integration
@@ -66,6 +74,8 @@ class TestMCPServerIntegration:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            pipe.close()
 
     def test_server_starts_successfully(self, server_process):
         """Test that the MCP server starts without crashing."""
@@ -194,6 +204,7 @@ class TestMCPServerIntegration:
 
         # Should have basic Redis operations
         expected_tools = [
+            "clusters_list",
             "hset",
             "hget",
             "hdel",
@@ -276,8 +287,8 @@ class TestMCPServerIntegration:
         tools = response["result"]["tools"]
         tool_names = [tool["name"] for tool in tools]
 
-        # Expected tool count (based on @mcp.tool() decorators in codebase)
-        expected_tool_count = 53
+        # Expected tool count (the @redis_tool declarations in src/tools; legacy mode lists every toolset)
+        expected_tool_count = 54
         assert len(tools) == expected_tool_count, (
             f"Expected {expected_tool_count} tools, but got {len(tools)}"
         )
@@ -285,6 +296,7 @@ class TestMCPServerIntegration:
         # Expected tool names (alphabetically sorted for easier verification)
         expected_tools = [
             "client_list",
+            "clusters_list",
             "create_vector_index_hash",
             "dbsize",
             "delete",
@@ -348,6 +360,7 @@ class TestMCPServerIntegration:
 
         # Verify tool categories are represented
         tool_categories = {
+            "clusters": ["clusters_list"],
             "string": ["get", "set"],
             "hash": ["hget", "hset", "hgetall", "hdel", "hexists"],
             "list": ["lpush", "rpush", "lpop", "rpop", "lrange", "llen"],
@@ -396,6 +409,27 @@ class TestMCPServerIntegration:
                 assert tool in tool_names, (
                     f"Tool '{tool}' from category '{category}' not found in registered tools"
                 )
+
+    def test_legacy_mode_has_a_single_default_cluster(self, server_process):
+        """Without a config file the env/CLI settings form one cluster named 'default'."""
+        self._initialize_server(server_process)
+
+        server_process.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}) + "\n"
+        )
+        server_process.stdin.flush()
+        response = json.loads(server_process.stdout.readline())
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+
+        get_schema = tools["get"]["inputSchema"]
+        assert get_schema["properties"]["cluster"]["enum"] == ["default"]
+        assert "cluster" in get_schema["required"]
+
+        clusters_list_schema = tools["clusters_list"]["inputSchema"]
+        assert "cluster" not in clusters_list_schema.get("required", [])
+
+        docs_schema = tools["search_redis_documents"]["inputSchema"]
+        assert "cluster" not in docs_schema["properties"]
 
     def _initialize_server(self, server_process):
         """Helper to initialize the MCP server."""
