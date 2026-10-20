@@ -2,6 +2,7 @@ import asyncio
 from typing import Any, Dict, Union, List
 import aiohttp
 
+from redis.cluster import RedisCluster
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
@@ -181,6 +182,12 @@ async def scan_all_keys(
     """
     try:
         r = RedisConnectionManager.get_connection()
+        if isinstance(r, RedisCluster):
+            # RedisCluster.scan returns one cursor per node; scan_iter walks every primary
+            return [
+                key.decode("utf-8") if isinstance(key, bytes) else key
+                for key in r.scan_iter(match=pattern, count=batch_size)
+            ]
         all_keys = []
         cursor = 0
 

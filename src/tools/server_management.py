@@ -1,3 +1,4 @@
+from redis.cluster import RedisCluster
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
@@ -9,6 +10,9 @@ async def dbsize() -> int:
     """Get the number of keys stored in the Redis database"""
     try:
         r = RedisConnectionManager.get_connection()
+        if isinstance(r, RedisCluster):
+            # redis-py sends DBSIZE to one node; count the keys of every primary
+            return r.dbsize(target_nodes=RedisCluster.PRIMARIES)
         return r.dbsize()
     except RedisError as e:
         return f"Error getting database size: {str(e)}"

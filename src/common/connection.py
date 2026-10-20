@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from contextvars import ContextVar
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -7,8 +8,9 @@ from redis import Redis
 from redis.backoff import NoBackoff
 from redis.cluster import ClusterNode, RedisCluster
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
-from redis.sentinel import Sentinel
+from redis.sentinel import MasterNotFoundError, Sentinel
 
 from src.common.config_loader import ClusterConfig, get_config
 from src.version import __version__
@@ -20,38 +22,51 @@ current_cluster: ContextVar[Optional[str]] = ContextVar(
     "redis_mcp_cluster", default=None
 )
 
-# A tool call has 15 s (see src.common.registry). With these timeouts and the retry policy below, a slow or
+# A tool call has 15 s (see src.common.registry). With these timeouts and no client retries, a slow or
 # unreachable standalone/sentinel cluster produces its own error within that time instead of the generic tool
 # timeout. `options` can override the timeouts per cluster.
 SOCKET_CONNECT_TIMEOUT_SECONDS = 5
 SOCKET_TIMEOUT_SECONDS = 10
-# Per cluster (per node for Redis Cluster): room for the concurrent tool calls the registry allows per cluster
-# plus open pub/sub subscriptions.
+# Each Sentinel is asked in turn for the master; a short limit per Sentinel keeps the lookup within the budget.
+SENTINEL_TIMEOUT_SECONDS = 2
+# Per cluster (per node for Redis Cluster): above the concurrent tool calls the registry allows per cluster.
 MAX_CONNECTIONS = 16
+# Pub/sub subscriptions hold their connection, so they get a client of their own and never take the
+# connections the tool calls need.
+MAX_PUBSUB_CONNECTIONS = 50
+# A failed client creation is reported to the callers waiting for it instead of being repeated by each one.
+FAILED_CREATION_SECONDS = 5
 
 
 class ClusterSelectionError(ValueError):
     """No cluster selected, or an unknown cluster name."""
 
 
+ClientKey = Tuple[str, bool, bool]
+
+
 class RedisConnectionManager:
-    """One client per (cluster, decode_responses), created on first use and then reused.
+    """One client per (cluster, decode_responses, pub/sub), created on first use and then reused.
 
     Each cluster has its own lock, so a cluster whose client is slow to create (e.g. a Redis Cluster that
-    does not answer CLUSTER SLOTS) does not hold up the others. A failed creation is not cached; the next
-    call tries again.
+    does not answer CLUSTER SLOTS) does not hold up the others. A failed creation is not kept: callers that
+    were waiting for it get the same error, and a call more than FAILED_CREATION_SECONDS later tries again.
     """
 
-    _clients: Dict[Tuple[str, bool], Union[Redis, RedisCluster]] = {}
-    _locks: Dict[Tuple[str, bool], threading.Lock] = {}
+    _clients: Dict[ClientKey, Union[Redis, RedisCluster]] = {}
+    _locks: Dict[ClientKey, threading.Lock] = {}
+    _failures: Dict[ClientKey, Tuple[float, Exception]] = {}
     _guard = threading.Lock()
 
     @classmethod
     def get_connection(
-        cls, decode_responses: bool = True, cluster: Optional[str] = None
+        cls,
+        decode_responses: bool = True,
+        cluster: Optional[str] = None,
+        pubsub: bool = False,
     ) -> Redis:
         config = cls.cluster_config(cluster)
-        key = (config.name, decode_responses)
+        key = (config.name, decode_responses, pubsub)
         client = cls._clients.get(key)
         if client is not None:
             return client
@@ -60,15 +75,27 @@ class RedisConnectionManager:
         with lock:
             client = cls._clients.get(key)
             if client is None:
+                failure = cls._failures.get(key)
+                if (
+                    failure is not None
+                    and time.monotonic() - failure[0] < FAILED_CREATION_SECONDS
+                ):
+                    raise failure[1]
                 try:
-                    client = create_client(config, decode_responses)
+                    client = create_client(
+                        config,
+                        decode_responses,
+                        max_connections=MAX_PUBSUB_CONNECTIONS if pubsub else None,
+                    )
                 except Exception as e:
+                    cls._failures[key] = (time.monotonic(), e)
                     _logger.error(
                         "Failed to create the Redis client for cluster %s: %s",
                         config.name,
                         e,
                     )
                     raise
+                cls._failures.pop(key, None)
                 cls._clients[key] = client
         return client
 
@@ -97,6 +124,7 @@ class RedisConnectionManager:
             clients = list(cls._clients.values())
             cls._clients.clear()
             cls._locks.clear()
+            cls._failures.clear()
         for client in clients:
             try:
                 client.close()
@@ -137,40 +165,79 @@ def client_kwargs(config: ClusterConfig, decode_responses: bool) -> Dict[str, An
     return kwargs
 
 
-def _retry() -> Retry:
-    """One immediate retry when a connection drops (e.g. after a Redis restart), none on timeouts: a command
-    that timed out may have run, and sending a write again would apply it twice. redis-py's default (3 retries
-    with backoff, timeouts included) could also outlast the tool's time limit."""
-    return Retry(NoBackoff(), 1, supported_errors=(RedisConnectionError,))
+def _no_retry() -> Retry:
+    """A single attempt per command. redis-py's default retries 3 times with backoff, timeouts included: a
+    command that timed out (or whose connection dropped) may already have run, so a write could be applied
+    twice, and the retries could outlast the tool's time limit. Stale pooled connections are still replaced:
+    the pool checks a connection before handing it out."""
+    return Retry(NoBackoff(), 0)
+
+
+class _Sentinel(Sentinel):
+    """Sentinel whose "no master found" error names each Sentinel by host:port. redis-py puts the repr of the
+    Sentinel clients into that message, and the repr lists the connection arguments, the password included."""
+
+    def discover_master(self, service_name):
+        collected_errors = []
+        for sentinel_no, sentinel in enumerate(self.sentinels):
+            try:
+                masters = sentinel.sentinel_masters()
+            except (RedisConnectionError, RedisTimeoutError) as e:
+                kwargs = sentinel.connection_pool.connection_kwargs
+                collected_errors.append(
+                    f"{kwargs.get('host')}:{kwargs.get('port')} - {type(e).__name__}: {e}"
+                )
+                continue
+            state = masters.get(service_name)
+            if state and self.check_master_state(state, service_name):
+                # same as redis-py: ask this Sentinel first next time
+                self.sentinels[0], self.sentinels[sentinel_no] = (
+                    sentinel,
+                    self.sentinels[0],
+                )
+                ip = (
+                    self._force_master_ip
+                    if self._force_master_ip is not None
+                    else state["ip"]
+                )
+                return ip, state["port"]
+        error_info = f" : {', '.join(collected_errors)}" if collected_errors else ""
+        raise MasterNotFoundError(f"No master found for {service_name!r}{error_info}")
 
 
 def create_client(
-    config: ClusterConfig, decode_responses: bool = True
+    config: ClusterConfig,
+    decode_responses: bool = True,
+    max_connections: Optional[int] = None,
 ) -> Union[Redis, RedisCluster]:
     kwargs = client_kwargs(config, decode_responses)
-    kwargs.setdefault("max_connections", MAX_CONNECTIONS)
+    if max_connections is not None:
+        kwargs["max_connections"] = max_connections
+    else:
+        kwargs.setdefault("max_connections", MAX_CONNECTIONS)
     addresses = config.addresses()
     if config.mode == "cluster":
-        # RedisCluster retries every attempt on connection errors and timeouts alike (with a topology refresh),
-        # so it gets a single attempt; the next call uses the refreshed topology.
+        # a single attempt; a failure still refreshes the topology for the next call
         return RedisCluster(
             startup_nodes=[ClusterNode(host, port) for host, port in addresses],
-            retry=Retry(NoBackoff(), 0),
+            retry=_no_retry(),
             **kwargs,
         )
     if config.mode == "sentinel":
         sentinel_kwargs: Dict[str, Any] = {
-            "socket_connect_timeout": kwargs["socket_connect_timeout"],
-            "socket_timeout": kwargs["socket_timeout"],
-            "retry": _retry(),
+            "socket_connect_timeout": min(
+                kwargs["socket_connect_timeout"], SENTINEL_TIMEOUT_SECONDS
+            ),
+            "socket_timeout": min(kwargs["socket_timeout"], SENTINEL_TIMEOUT_SECONDS),
+            "retry": _no_retry(),
         }
         if config.tls is not None:
             sentinel_kwargs.update(config.tls.client_kwargs())
         if config.sentinel_password:
             sentinel_kwargs["password"] = config.sentinel_password
-        sentinel = Sentinel(addresses, sentinel_kwargs=sentinel_kwargs)
+        sentinel = _Sentinel(addresses, sentinel_kwargs=sentinel_kwargs)
         return sentinel.master_for(
-            config.master_name, db=config.db, retry=_retry(), **kwargs
+            config.master_name, db=config.db, retry=_no_retry(), **kwargs
         )
     host, port = addresses[0]
-    return Redis(host=host, port=port, db=config.db, retry=_retry(), **kwargs)
+    return Redis(host=host, port=port, db=config.db, retry=_no_retry(), **kwargs)

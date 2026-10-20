@@ -64,6 +64,41 @@ MODE_OPTIONS = {
     ),
 }
 
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+# Value check and its description per option. A null timeout would remove the time bound for good.
+OPTION_VALUES = {
+    "socket_timeout": (lambda v: _is_number(v) and v > 0, "a number of seconds > 0"),
+    "socket_connect_timeout": (
+        lambda v: _is_number(v) and v > 0,
+        "a number of seconds > 0",
+    ),
+    "socket_keepalive": (lambda v: isinstance(v, bool), "true or false"),
+    "max_connections": (
+        lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 1,
+        "an integer >= 1",
+    ),
+    "client_name": (
+        lambda v: isinstance(v, str) and v != "" and not any(c.isspace() for c in v),
+        "a name without spaces",
+    ),
+    "protocol": (lambda v: v in (2, 3) and not isinstance(v, bool), "2 or 3"),
+    "health_check_interval": (
+        lambda v: _is_number(v) and v >= 0,
+        "a number of seconds >= 0",
+    ),
+    "read_from_replicas": (lambda v: isinstance(v, bool), "true or false"),
+    "require_full_coverage": (lambda v: isinstance(v, bool), "true or false"),
+    "reinitialize_steps": (
+        lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
+        "an integer >= 0",
+    ),
+    "dynamic_startup_nodes": (lambda v: isinstance(v, bool), "true or false"),
+}
+
 _INT = re.compile(r"[-+]?[0-9]+")
 _FLOAT = re.compile(r"[-+]?([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][-+]?[0-9]+)?")
 
@@ -73,7 +108,10 @@ class ConfigError(Exception):
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid", alias_generator=to_camel)
+    # hide_input_in_errors: a ValidationError (chained to ConfigError) must not carry a mistyped secret
+    model_config = ConfigDict(
+        extra="forbid", alias_generator=to_camel, hide_input_in_errors=True
+    )
 
 
 class TlsConfig(_Model):
@@ -163,7 +201,11 @@ class ClusterConfig(_Model):
     @field_validator("options")
     @classmethod
     def _convert_options(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        return {key: _option_value(v) for key, v in value.items()}
+        # client_name is a name: "0123" must stay "0123"
+        return {
+            key: v if key == "client_name" else _option_value(v)
+            for key, v in value.items()
+        }
 
     @model_validator(mode="after")
     def _check_mode(self) -> "ClusterConfig":
@@ -193,6 +235,10 @@ class ClusterConfig(_Model):
                 f" (supported: {', '.join(allowed)}; addresses, db, username and tls have their own keys,"
                 " passwords come from the passwords directory)"
             )
+        for key, value in self.options.items():
+            check, expected = OPTION_VALUES[key]
+            if not check(value):
+                raise ValueError(f"options.{key} must be {expected}")
         return self
 
     def addresses(self) -> List[Tuple[str, int]]:
@@ -311,24 +357,28 @@ def api_key_error(api_key: Optional[str]) -> Optional[str]:
 
 
 def parse_hosts(hosts: str) -> List[Tuple[str, int]]:
-    """Parses ``host:port,host:port`` (IPv6 as ``[addr]:port``)."""
+    """Parses ``host:port,host:port`` (IPv6 as ``[addr]:port``). Errors never echo the value: a password
+    pasted into hosts must not reach the log."""
+    if "@" in hosts or "://" in hosts:
+        raise ValueError(
+            "hosts takes host:port entries without a scheme or credentials (user:password@);"
+            " passwords come from the passwords directory"
+        )
     addresses = []
-    for item in hosts.split(","):
+    for number, item in enumerate(hosts.split(","), start=1):
         item = item.strip()
-        if "@" in item or "://" in item:
-            # the item is not echoed: it may hold a password
-            raise ValueError(
-                "hosts takes host:port entries without a scheme or credentials (user:password@);"
-                " passwords come from the passwords directory"
-            )
         host, sep, port = item.rpartition(":")
-        if not item or not sep or not host or not port.isdigit():
-            raise ValueError(f"'{item}' is not host:port")
+        if not sep or not host or not port.isdigit() or any(c.isspace() for c in host):
+            raise ValueError(
+                f"hosts entry {number} is not host:port (or [IPv6 address]:port)"
+            )
         if host.startswith("[") and host.endswith("]"):
             host = host[1:-1]
         port_number = int(port)
         if not 0 < port_number <= 65535:
-            raise ValueError(f"'{item}': port must be between 1 and 65535")
+            raise ValueError(
+                f"hosts entry {number}: the port must be between 1 and 65535"
+            )
         addresses.append((host, port_number))
     return addresses
 
@@ -369,15 +419,19 @@ _TextLoader.yaml_implicit_resolvers = {
 
 def _read(path: Path) -> Dict[str, Any]:
     try:
-        with open(path, encoding="utf-8") as f:
-            # _TextLoader is a SafeLoader
-            data = yaml.load(f, Loader=_TextLoader)  # nosec B506
+        raw = path.read_bytes()
     except OSError as e:
         raise ConfigError(f"Could not read config file: {path} ({e.strerror})") from e
+    try:
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as e:
+        line = raw[: e.start].count(b"\n") + 1
         raise ConfigError(
-            f"Could not read config file: {path} (not UTF-8: invalid byte at position {e.start})"
+            f"Could not read config file: {path} (not UTF-8: invalid byte on line {line})"
         ) from e
+    try:
+        # _TextLoader is a SafeLoader
+        data = yaml.load(text, Loader=_TextLoader)  # nosec B506
     except yaml.YAMLError as e:
         raise ConfigError(f"Could not parse config file: {path} ({e})") from e
     if data is None:
@@ -516,6 +570,15 @@ def resolve_passwords(config: ServerConfig) -> None:
 
 def from_legacy(redis_cfg: Dict[str, Any], entraid: bool = False) -> ServerConfig:
     """The single ``default`` cluster described by the REDIS_* environment variables / CLI flags."""
+    if (
+        redis_cfg.get("cluster_mode")
+        and redis_cfg.get("ssl")
+        and redis_cfg.get("ssl_ca_path")
+    ):
+        raise ConfigError(
+            "--ssl-ca-path / REDIS_SSL_CA_PATH is not supported with --cluster-mode (redis-py's RedisCluster"
+            " ignores it); use --ssl-ca-certs / REDIS_SSL_CA_CERTS"
+        )
     cluster: Dict[str, Any] = {
         "name": LEGACY_CLUSTER_NAME,
         "mode": "cluster" if redis_cfg.get("cluster_mode") else "standalone",

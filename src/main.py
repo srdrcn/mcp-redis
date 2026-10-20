@@ -97,6 +97,11 @@ def apply_api_key(config: ServerConfig, api_key: Optional[str]) -> None:
     An empty value changes nothing, so an empty variable cannot switch authentication off."""
     if not api_key:
         return
+    if not api_key.strip():
+        raise ConfigError(
+            "--api-key / REDIS_MCP_API_KEY is blank; set a key, or leave it empty or unset to keep apiKey"
+            " from the config"
+        )
     error = api_key_error(api_key)
     if error:
         raise ConfigError(f"--api-key / REDIS_MCP_API_KEY: {error}")

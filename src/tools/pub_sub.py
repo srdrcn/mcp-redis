@@ -41,7 +41,7 @@ async def subscribe(channel: str) -> Dict[str, Any]:
         A dictionary containing the subscription ID or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(pubsub=True)
         subscription = await asyncio.to_thread(
             SubscriptionManager.subscribe,
             r,
@@ -65,7 +65,7 @@ async def psubscribe(pattern: str) -> Dict[str, Any]:
         A dictionary containing the subscription ID or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(pubsub=True)
         subscription = await asyncio.to_thread(
             SubscriptionManager.psubscribe,
             r,

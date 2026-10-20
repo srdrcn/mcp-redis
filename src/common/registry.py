@@ -212,9 +212,14 @@ def wrap(
                 )
             )
 
+    # a call that leaves out the cluster of a single-cluster config still runs in that cluster's pool
+    implicit_pool = (
+        clusters[0] if single_cluster and spec.cluster == "required" else None
+    )
+
     async def tool(**kwargs: Any) -> Any:
         cluster = kwargs.pop("cluster", None)
-        return await call(spec, cluster, kwargs)
+        return await call(spec, cluster, kwargs, pool=cluster or implicit_pool)
 
     tool.__name__ = spec.name
     tool.__qualname__ = spec.name
@@ -248,7 +253,13 @@ def _run(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Any:
     return result
 
 
-async def call(spec: ToolSpec, cluster: Optional[str], kwargs: Dict[str, Any]) -> Any:
+async def call(
+    spec: ToolSpec,
+    cluster: Optional[str],
+    kwargs: Dict[str, Any],
+    pool: Optional[str] = None,
+) -> Any:
+    """Runs a tool with ``cluster`` selected, in the worker pool ``pool`` (default: the cluster's)."""
     start = time.monotonic()
     outcome, error = "ok", None
     token = current_cluster.set(cluster)
@@ -256,7 +267,7 @@ async def call(spec: ToolSpec, cluster: Optional[str], kwargs: Dict[str, Any]) -
         # the worker runs in a copy of this context, so it sees current_cluster
         context = contextvars.copy_context()
         future = asyncio.get_running_loop().run_in_executor(
-            _executor(cluster), context.run, _run, spec.fn, kwargs
+            _executor(pool or cluster), context.run, _run, spec.fn, kwargs
         )
         # on timeout the future is cancelled: a call still queued behind a hanging cluster never starts
         return await asyncio.wait_for(future, TOOL_TIMEOUT_SECONDS)
