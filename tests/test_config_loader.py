@@ -367,22 +367,17 @@ class TestYamlNumberTrap:
         "value, expected",
         [
             ("5", 5),
-            ("-2", -2),
             ("+3", 3),
+            ("007", 7),
             ("2.5", 2.5),
             (".5", 0.5),
             ("1e3", 1000.0),
             ("1.5E-1", 0.15),
-            ("abc", "abc"),
-            ("5s", "5s"),
-            (True, True),
-            (None, None),
             (7, 7),
-            ({"nested": "1"}, {"nested": "1"}),
+            (0.25, 0.25),
         ],
     )
-    def test_option_values(self, value, expected):
-        # the loader converts numbers but does not check the value types; redis-py does that
+    def test_number_text_in_options_is_converted(self, value, expected):
         options = (
             parse_config({"clusters": [cluster(options={"socket_timeout": value})]})
             .clusters[0]
@@ -390,6 +385,47 @@ class TestYamlNumberTrap:
         )
         assert options == {"socket_timeout": expected}
         assert type(options["socket_timeout"]) is type(expected)
+
+    @pytest.mark.parametrize(
+        "value", ["-2", "abc", "5s", "", True, None, {"nested": "1"}]
+    )
+    def test_option_value_that_is_no_valid_number_is_rejected(self, value):
+        # converted text is checked like any other value (see TestOptionValues)
+        error = config_error({"clusters": [cluster(options={"socket_timeout": value})]})
+        assert error == (
+            "Invalid config:\n - clusters[0]: options.socket_timeout must be a number of seconds > 0"
+        )
+
+    @pytest.mark.parametrize("value", ["0123", "0x1F", "1.5", "1e3", "-2", "42"])
+    def test_client_name_stays_text(self, value):
+        # a name: "0123" must not become 123
+        options = (
+            parse_config({"clusters": [cluster(options={"client_name": value})]})
+            .clusters[0]
+            .options
+        )
+        assert options == {"client_name": value}
+        assert type(options["client_name"]) is str
+
+    def test_client_name_stays_text_from_yaml(self, tmp_path):
+        config = load_config(
+            write(
+                tmp_path / "c.yaml",
+                """
+                clusters:
+                  - name: a
+                    hosts: h:6379
+                    options:
+                      client_name: 0123
+                  - name: b
+                    hosts: h:6380
+                    options:
+                      client_name: 1e3
+                """,
+            )
+        )
+        assert config.cluster("a").options == {"client_name": "0123"}
+        assert config.cluster("b").options == {"client_name": "1e3"}
 
     def test_option_values_from_yaml(self, tmp_path):
         config = load_config(
@@ -492,52 +528,57 @@ class TestValidationErrors:
             (
                 {"clusters": [cluster(hosts="h")]},
                 "clusters[0].hosts",
-                "'h' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts="h:")]},
                 "clusters[0].hosts",
-                "'h:' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts=":6379")]},
                 "clusters[0].hosts",
-                "':6379' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts="h:abc")]},
                 "clusters[0].hosts",
-                "'h:abc' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts="h:-1")]},
                 "clusters[0].hosts",
-                "'h:-1' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts="")]},
                 "clusters[0].hosts",
-                "'' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts=[])]},
                 "clusters[0].hosts",
-                "'' is not host:port",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(mode="cluster", hosts="h:1,")]},
                 "clusters[0].hosts",
-                "'' is not host:port",
+                "hosts entry 2 is not host:port (or [IPv6 address]:port)",
+            ),
+            (
+                {"clusters": [cluster(hosts="my host:6379")]},
+                "clusters[0].hosts",
+                "hosts entry 1 is not host:port (or [IPv6 address]:port)",
             ),
             (
                 {"clusters": [cluster(hosts="h:0")]},
                 "clusters[0].hosts",
-                "'h:0': port must be between 1 and 65535",
+                "hosts entry 1: the port must be between 1 and 65535",
             ),
             (
-                {"clusters": [cluster(hosts="h:65536")]},
+                {"clusters": [cluster(mode="cluster", hosts="h:1,h:65536")]},
                 "clusters[0].hosts",
-                "'h:65536': port must be between 1 and 65535",
+                "hosts entry 2: the port must be between 1 and 65535",
             ),
             # top-level port
             (
@@ -623,6 +664,12 @@ class TestValidationErrors:
                 {"clusters": [cluster(options=["socket_timeout"])]},
                 "clusters[0].options",
                 "Input should be a valid dictionary",
+            ),
+            # option values
+            (
+                {"clusters": [cluster(), cluster(name="b", options={"protocol": "4"})]},
+                "clusters[1]",
+                "options.protocol must be 2 or 3",
             ),
             # tls
             (
