@@ -2,17 +2,18 @@ import asyncio
 from typing import Any, Dict, Union, List
 import aiohttp
 
+from redis.cluster import RedisCluster
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 from src.common.config import MCP_DOCS_SEARCH_URL
 from src.version import __version__
 
 DOCS_SEARCH_TIMEOUT_SECONDS = 10
 
 
-@mcp.tool()
+@redis_tool("core", ToolKind.DESTRUCTIVE)
 async def delete(key: str) -> str:
     """Delete a Redis key.
 
@@ -30,7 +31,7 @@ async def delete(key: str) -> str:
         return f"Error deleting key {key}: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("core")
 async def type(key: str) -> Dict[str, Any]:
     """Returns the string representation of the type of the value stored at key
 
@@ -50,7 +51,7 @@ async def type(key: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@redis_tool("core", ToolKind.WRITE)
 async def expire(name: str, expire_seconds: int) -> str:
     """Set an expiration time for a Redis key.
 
@@ -73,7 +74,7 @@ async def expire(name: str, expire_seconds: int) -> str:
         return f"Error setting expiration for key '{name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("core", ToolKind.WRITE)
 async def rename(old_key: str, new_key: str) -> Dict[str, Any]:
     """
     Renames a Redis key from old_key to new_key.
@@ -105,7 +106,7 @@ async def rename(old_key: str, new_key: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@redis_tool("core")
 async def scan_keys(
     pattern: str = "*", count: int = 100, cursor: int = 0
 ) -> Union[str, Dict[str, Any]]:
@@ -139,9 +140,14 @@ async def scan_keys(
         First call: scan_keys("user:*") -> returns cursor=1234, keys=[...], scan_complete=False
         Next call: scan_keys("user:*", cursor=1234) -> continues from where it left off
         Final call: returns cursor=0, scan_complete=True when done
+
+    On a Redis Cluster each node has its own cursor, so a scan cannot be continued: call it with cursor 0
+    for one batch from every node, or use scan_all_keys().
     """
     try:
         r = RedisConnectionManager.get_connection()
+        if isinstance(r, RedisCluster):
+            return _scan_cluster_batch(r, pattern, count, cursor)
         cursor, keys = r.scan(cursor=cursor, match=pattern, count=count)
 
         # Convert bytes to strings if needed
@@ -159,7 +165,32 @@ async def scan_keys(
         return f"Error scanning keys with pattern '{pattern}': {str(e)}"
 
 
-@mcp.tool()
+def _scan_cluster_batch(
+    r: RedisCluster, pattern: str, count: int, cursor: int
+) -> Union[str, Dict[str, Any]]:
+    if cursor:
+        return (
+            "Error: scan_keys cannot continue a cursor on a Redis Cluster (every node has its own cursor);"
+            " call it with cursor 0, or use scan_all_keys"
+        )
+    cursors, keys = r.scan(cursor=0, match=pattern, count=count)
+    complete = all(c == 0 for c in cursors.values())
+    result: Dict[str, Any] = {
+        "cursor": 0,
+        "keys": [
+            key.decode("utf-8") if isinstance(key, bytes) else key for key in keys
+        ],
+        "total_scanned": len(keys),
+        "scan_complete": complete,
+    }
+    if not complete:
+        result["note"] = (
+            "Redis Cluster: these are the first keys of every node; scan_all_keys returns all matching keys"
+        )
+    return result
+
+
+@redis_tool("core")
 async def scan_all_keys(
     pattern: str = "*", batch_size: int = 100
 ) -> Union[str, List[str]]:
@@ -181,6 +212,12 @@ async def scan_all_keys(
     """
     try:
         r = RedisConnectionManager.get_connection()
+        if isinstance(r, RedisCluster):
+            # RedisCluster.scan returns one cursor per node; scan_iter walks every primary
+            return [
+                key.decode("utf-8") if isinstance(key, bytes) else key
+                for key in r.scan_iter(match=pattern, count=batch_size)
+            ]
         all_keys = []
         cursor = 0
 
@@ -202,7 +239,7 @@ async def scan_all_keys(
         return f"Error scanning all keys with pattern '{pattern}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("docs", cluster="none")
 async def search_redis_documents(
     question: str,
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:

@@ -29,6 +29,7 @@ dependencies = [
     "click>=8.0.0",
     "aiohttp>=3.13.0",
     "redis-entraid>=1.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

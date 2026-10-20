@@ -2,10 +2,24 @@
 Unit tests for src/tools/server_management.py
 """
 
+from unittest.mock import Mock, patch
+
 import pytest
+from redis.cluster import RedisCluster
 from redis.exceptions import ConnectionError, RedisError
 
 from src.tools.server_management import client_list, dbsize, info
+
+
+@pytest.fixture
+def mock_redis_cluster():
+    """get_connection returns a RedisCluster mock (a cluster in mode: cluster)."""
+    with patch(
+        "src.common.connection.RedisConnectionManager.get_connection"
+    ) as mock_get_conn:
+        mock_cluster = Mock(spec=RedisCluster)
+        mock_get_conn.return_value = mock_cluster
+        yield mock_cluster
 
 
 class TestServerManagementOperations:
@@ -19,8 +33,32 @@ class TestServerManagementOperations:
 
         result = await dbsize()
 
-        mock_redis.dbsize.assert_called_once()
+        # a standalone/sentinel client: the plain DBSIZE of its db
+        mock_redis.dbsize.assert_called_once_with()
         assert result == 1000
+
+    @pytest.mark.asyncio
+    async def test_dbsize_on_a_redis_cluster_counts_every_primary(
+        self, mock_redis_cluster
+    ):
+        """redis-py sends DBSIZE to one node by default; the tool asks every primary (redis-py sums
+        the replies)."""
+        mock_redis_cluster.dbsize.return_value = 3000
+
+        result = await dbsize()
+
+        mock_redis_cluster.dbsize.assert_called_once_with(
+            target_nodes=RedisCluster.PRIMARIES
+        )
+        assert result == 3000
+
+    @pytest.mark.asyncio
+    async def test_dbsize_on_a_redis_cluster_error(self, mock_redis_cluster):
+        mock_redis_cluster.dbsize.side_effect = RedisError("CLUSTERDOWN")
+
+        result = await dbsize()
+
+        assert result == "Error getting database size: CLUSTERDOWN"
 
     @pytest.mark.asyncio
     async def test_dbsize_zero_keys(self, mock_redis_connection_manager):

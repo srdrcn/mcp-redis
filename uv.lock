@@ -2341,6 +2341,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "redis" },
     { name = "redis-entraid" },
 ]
@@ -2374,6 +2375,7 @@ requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.26.0,<2" },
     { name = "numpy", specifier = ">=2.2.4" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=6.0.0" },
     { name = "redis-entraid", specifier = ">=1.0.0" },
 ]

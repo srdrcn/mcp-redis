@@ -88,8 +88,11 @@ class SubscriptionManager:
                     timeout=remaining,
                 )
 
+                # None also comes back for the skipped subscribe confirmation, so stop only at the deadline
                 if message is None:
-                    break
+                    if time.monotonic() >= deadline:
+                        break
+                    continue
 
                 messages.append(_decode_message_value(message))
 

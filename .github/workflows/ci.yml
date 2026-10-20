@@ -123,6 +123,19 @@ jobs:
         uv sync --all-extras --dev
         uv add --dev pytest pytest-cov pytest-asyncio coverage
 
+    # The real-server tests (tests/redis_servers.py) start their own redis-server processes and build a Redis
+    # Cluster with redis-cli. Install the binaries without starting the redis-server service: the redis service
+    # container above already uses port 6379 (policy-rc.d exit code 101 = "do not start services").
+    - name: ⚙️ Install redis-server and redis-tools (service not started)
+      run: |
+        printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d > /dev/null
+        sudo chmod +x /usr/sbin/policy-rc.d
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends redis-server redis-tools
+        sudo rm /usr/sbin/policy-rc.d
+        redis-server --version
+        redis-cli --version
+
     - name: ⚙️ Run tests with coverage
       run: |
         uv run pytest tests/ -v --cov=src --cov-report=xml --cov-report=html --cov-report=term
@@ -258,4 +271,4 @@ jobs:
 
     - name: ⚙️ Test Docker image
       run: |
-        docker run --rm redis-mcp-server:test uv run python -c "import src.main; print('Docker build successful')"
+        docker run --rm redis-mcp-server:test /app/.venv/bin/python -c "import src.main; print('Docker build successful')"

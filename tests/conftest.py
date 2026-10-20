@@ -98,12 +98,15 @@ def redis_error_scenarios():
 
 @pytest.fixture(autouse=True)
 def reset_connection_manager():
-    """Reset the RedisConnectionManager singleton before each test."""
+    """Reset the cached clients and the active config before each test."""
+    from src.common.config_loader import set_config
     from src.common.connection import RedisConnectionManager
 
-    RedisConnectionManager._instance = None
+    RedisConnectionManager.reset()
+    set_config(None)
     yield
-    RedisConnectionManager._instance = None
+    RedisConnectionManager.reset()
+    set_config(None)
 
 
 @pytest.fixture(autouse=True)

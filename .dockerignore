@@ -1,5 +1,23 @@
+# Allowlist: the build context holds only what the image needs.
 *
 !src
-!uv.lock
 !pyproject.toml
+!uv.lock
 !README.md
+
+# Never in the image, even if the allowlist grows: real configs and secrets, local state and caches.
+**/redis-mcp.yaml
+**/*.local.yaml
+**/passwords.env
+**/conf.d
+**/.env
+**/.venv
+**/.git
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.coverage
+**/coverage.xml
+**/htmlcov

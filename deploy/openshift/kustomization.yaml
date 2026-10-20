@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The ConfigMap "redis-mcp-config" (key redis-mcp.yaml) and the Secret "redis-mcp-passwords" (<cluster>_pass keys)
+# are not generated from this directory; they are environment-specific and created with `oc create configmap/secret`
+# (README, "OpenShift deployment"). Templates: redis-mcp.yaml.example, passwords.env.example
+resources:
+  - deployment.yaml
+  - service.yaml
+  - route.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/name: redis-mcp
+      app.kubernetes.io/component: mcp-server
+    includeSelectors: false
+# The image .github/workflows/docker-push.yml publishes (latest = main, X.Y.Z = tag vX.Y.Z, sha-<commit>).
+# For an image built inside the cluster use image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp.
+images:
+  - name: redis-mcp
+    newName: docker.io/chosenwar/redis-mcp
+    newTag: latest

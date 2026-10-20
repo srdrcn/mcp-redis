@@ -8,10 +8,10 @@ from redis.commands.search.query import Query
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
-from src.common.server import mcp
+from src.common.registry import ToolKind, redis_tool
 
 
-@mcp.tool()
+@redis_tool("search", requires="search")
 async def get_indexes() -> str:
     """List of indexes in the Redis database
 
@@ -25,7 +25,7 @@ async def get_indexes() -> str:
         return f"Error retrieving indexes: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("search", requires="search")
 async def get_index_info(index_name: str) -> str:
     """Retrieve schema and information about a specific Redis index using FT.INFO.
 
@@ -43,7 +43,7 @@ async def get_index_info(index_name: str) -> str:
         return f"Error retrieving index info: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("search", requires="search")
 async def get_indexed_keys_number(index_name: str) -> str:
     """Retrieve the number of indexed keys by the index
 
@@ -61,7 +61,7 @@ async def get_indexed_keys_number(index_name: str) -> str:
         return f"Error retrieving number of keys: {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("search", ToolKind.WRITE, requires="search")
 async def create_vector_index_hash(
     index_name: str = "vector_index",
     prefix: str = "doc:",
@@ -101,7 +101,7 @@ async def create_vector_index_hash(
         return f"Error creating index '{index_name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("search", requires="search")
 async def vector_search_hash(
     query_vector: List[float],
     index_name: str = "vector_index",
@@ -149,7 +149,7 @@ async def vector_search_hash(
         return f"Error performing vector search on index '{index_name}': {str(e)}"
 
 
-@mcp.tool()
+@redis_tool("search", requires="search")
 async def hybrid_search(
     query_vector: List[float],
     filter_expression: str = "*",

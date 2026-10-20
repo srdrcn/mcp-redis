@@ -1,29 +1,142 @@
-import sys
 import logging
+import os
+import sys
+from pathlib import Path
+from typing import Optional
 
 import click
+from click.core import ParameterSource
 
 from src.common.config import (
+    REDIS_CFG,
+    is_entraid_auth_enabled,
     parse_redis_uri,
     set_redis_config_from_cli,
     set_entraid_config_from_cli,
 )
-from src.common.server import mcp
-from src.common.logging_utils import configure_logging
+from src.common.config_loader import (
+    ConfigError,
+    ServerConfig,
+    api_key_error,
+    from_legacy,
+    get_config,
+    load_config,
+    resolve_passwords,
+    set_config,
+)
+from src.common import registry
+from src.common.logging_utils import configure_json_logging, configure_logging
+from src.common.server import build_server
+
+# Redis connection flags of the single-cluster mode; with --config the clusters come from the config file.
+LEGACY_CONNECTION_OPTIONS = (
+    "url",
+    "host",
+    "port",
+    "db",
+    "username",
+    "password",
+    "ssl",
+    "ssl_ca_path",
+    "ssl_keyfile",
+    "ssl_certfile",
+    "ssl_cert_reqs",
+    "ssl_ca_certs",
+    "cluster_mode",
+)
 
 
 class RedisMCPServer:
-    def __init__(self):
-        # Configure logging on server initialization (idempotent)
-        configure_logging()
+    def __init__(
+        self, config: Optional[ServerConfig] = None, transport: Optional[str] = None
+    ):
+        self.config = config or get_config()
+        set_config(self.config)
+        if transport is None:
+            transport = "http" if (self.config.port or 0) > 0 else "stdio"
+        self.transport = transport
+        # In stdio mode stdout carries JSON-RPC, so logs stay on stderr; over HTTP they are JSON on stdout.
+        if self.transport == "http":
+            configure_json_logging()
+        else:
+            configure_logging()
         self._logger = logging.getLogger(__name__)
         self._logger.info("Starting the Redis MCP Server")
+        if not self.config.passwords_resolved:
+            resolve_passwords(self.config)
+        self.mcp = build_server(self.config)
+        self._logger.info(
+            "%d tools listed for clusters %s (readOnly=%s, disableDestructive=%s)",
+            len(registry.select(self.config)),
+            self.config.cluster_names(),
+            self.config.read_only,
+            self.config.disable_destructive,
+        )
 
     def run(self):
-        mcp.run()
+        if self.transport == "http":
+            from src.common.http import run_http
+
+            run_http(self.mcp, self.config)
+        else:
+            self.mcp.run()
+
+
+def _fail(message: str):
+    click.echo(f"redis-mcp: {message}", err=True)
+    sys.exit(2)
+
+
+def _url_given(url: Optional[str]) -> bool:
+    # gemini-cli passes the raw "${REDIS_URL}" string when the env var is not set
+    return bool(url and url.strip() and url.strip() != "${REDIS_URL}")
+
+
+def apply_api_key(config: ServerConfig, api_key: Optional[str]) -> None:
+    """Sets the HTTP API key from --api-key / REDIS_MCP_API_KEY (e.g. from a Secret), over the config's apiKey.
+    An empty value changes nothing, so an empty variable cannot switch authentication off."""
+    if not api_key:
+        return
+    if not api_key.strip():
+        raise ConfigError(
+            "--api-key / REDIS_MCP_API_KEY is blank; set a key, or leave it empty or unset to keep apiKey"
+            " from the config"
+        )
+    error = api_key_error(api_key)
+    if error:
+        raise ConfigError(f"--api-key / REDIS_MCP_API_KEY: {error}")
+    config.api_key = api_key
 
 
 @click.command()
+@click.option(
+    "--config",
+    "config_file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    envvar="REDIS_MCP_CONFIG",
+    help="Multi-cluster config file (YAML). Env: REDIS_MCP_CONFIG",
+)
+@click.option(
+    "--config-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    envvar="REDIS_MCP_CONFIG_DIR",
+    help="Drop-in .yaml/.yml files merged over --config in file name order. Env: REDIS_MCP_CONFIG_DIR",
+)
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"]),
+    help="Transport (default: http if an HTTP port is set, otherwise stdio)",
+)
+@click.option(
+    "--api-key",
+    envvar="REDIS_MCP_API_KEY",
+    help="API key HTTP clients must send in X-Authorization (overrides apiKey in the config). Env: REDIS_MCP_API_KEY",
+)
+@click.option(
+    "--http-port",
+    type=click.IntRange(1, 65535),
+    help="HTTP port for Streamable HTTP on /mcp (overrides port in the config)",
+)
 @click.option(
     "--url",
     help="Redis connection URI (redis://user:pass@host:port/db or rediss:// for SSL)",
@@ -88,7 +201,14 @@ class RedisMCPServer:
     default=100,
     help="Retry delay in milliseconds",
 )
+@click.pass_context
 def cli(
+    ctx,
+    config_file,
+    config_dir,
+    transport,
+    api_key,
+    http_port,
     url,
     host,
     port,
@@ -115,10 +235,25 @@ def cli(
 ):
     """Redis MCP Server - Model Context Protocol server for Redis."""
 
-    # Handle Redis URI if provided (and not empty)
-    # Note: gemini-cli passes the raw "${REDIS_URL}" string when the env var is not set
+    multi_cluster = config_file is not None or config_dir is not None
+    if multi_cluster:
+        given = [
+            "--" + name.replace("_", "-")
+            for name in LEGACY_CONNECTION_OPTIONS
+            if ctx.get_parameter_source(name) is ParameterSource.COMMANDLINE
+            and (name != "url" or _url_given(url))
+        ]
+        if given:
+            _fail(
+                f"{', '.join(given)} cannot be combined with --config/--config-dir;"
+                " define the clusters in the config file"
+            )
 
-    if url and url.strip() and url.strip() != "${REDIS_URL}":
+    # Handle Redis URI if provided (and not empty)
+
+    if multi_cluster:
+        pass
+    elif _url_given(url):
         try:
             uri_config = parse_redis_uri(url)
             set_redis_config_from_cli(uri_config)
@@ -186,14 +321,41 @@ def cli(
     if entraid_config:
         set_entraid_config_from_cli(entraid_config)
 
-    # Start the server
-    server = RedisMCPServer()
+    try:
+        if multi_cluster:
+            config = load_config(config_file, config_dir)
+        else:
+            config = from_legacy(REDIS_CFG, entraid=is_entraid_auth_enabled())
+        apply_api_key(config, api_key)
+        if http_port is not None:
+            config.port = http_port
+        if transport == "http" and not config.port:
+            config.port = 8080
+        server = RedisMCPServer(config=config, transport=transport)
+    except ConfigError as e:
+        _fail(str(e))
     server.run()
 
 
 def main():
-    """Legacy main function for backward compatibility."""
-    server = RedisMCPServer()
+    """Entry point without CLI parsing: REDIS_MCP_CONFIG / REDIS_MCP_CONFIG_DIR select the multi-cluster
+    config, otherwise the REDIS_* environment variables describe a single cluster. REDIS_MCP_API_KEY sets the
+    HTTP API key."""
+    config_file = os.getenv("REDIS_MCP_CONFIG")
+    config_dir = os.getenv("REDIS_MCP_CONFIG_DIR")
+    try:
+        config = None
+        if config_file or config_dir:
+            config = load_config(
+                Path(config_file) if config_file else None,
+                Path(config_dir) if config_dir else None,
+            )
+        else:
+            config = get_config()
+        apply_api_key(config, os.getenv("REDIS_MCP_API_KEY"))
+        server = RedisMCPServer(config=config)
+    except ConfigError as e:
+        _fail(str(e))
     server.run()
 
 

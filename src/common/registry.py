@@ -1,0 +1,303 @@
+"""Tool registry: toolsets, tool kinds and the per-config tool list.
+
+Tools are declared with :func:`redis_tool`, which only records them. Once the config is known,
+:func:`build_tools` decides which tools are listed:
+
+- only the toolsets named in the config's ``toolsets`` list,
+- write tools only on clusters with an effective ``readOnly: false``,
+- destructive tools additionally only while ``disableDestructive`` is false,
+- json/search tools only on clusters that list the module in ``modules``.
+
+A tool with no eligible cluster left is not listed. For the others a ``cluster`` parameter is added as an enum of
+the eligible cluster names, so a call naming any other cluster fails schema validation.
+"""
+
+import asyncio
+import contextvars
+import enum
+import inspect
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Tuple
+
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field, WithJsonSchema
+
+from src.common.config_loader import ClusterConfig, ConfigError, ServerConfig
+from src.common.connection import current_cluster
+
+_logger = logging.getLogger(__name__)
+
+# Time limit of a tool call; the client socket timeouts are set below it.
+TOOL_TIMEOUT_SECONDS = 15
+
+# Tool calls run in a small thread pool per cluster (the tools use the blocking redis client). A cluster that
+# hangs ties up only its own workers: its queued calls fail at the time limit while other clusters carry on.
+MAX_CONCURRENT_CALLS_PER_CLUSTER = 8
+
+TOOLSETS: Dict[str, str] = {
+    "core": "Clusters, server info and generic key operations (type, scan, expire, rename, delete)",
+    "data": "Strings, hashes (including vectors), lists, sets, sorted sets and streams",
+    "json": "RedisJSON documents (clusters with modules: [json])",
+    "search": "Redis Query Engine: indexes, vector and hybrid search (clusters with modules: [search])",
+    "pubsub": "Publish and subscribe",
+    "docs": "Search the redis.io documentation (needs internet access; not tied to a cluster)",
+}
+
+
+class ToolKind(enum.Enum):
+    """READ: always listed. WRITE: only on readOnly=false clusters. DESTRUCTIVE: on top of WRITE, also
+    requires disableDestructive=false (deletes, pops, removals)."""
+
+    READ = "read"
+    WRITE = "write"
+    DESTRUCTIVE = "destructive"
+
+    @property
+    def writes(self) -> bool:
+        return self is not ToolKind.READ
+
+
+# required: the tool needs a cluster; optional: it may take one (e.g. clusters_list); none: no cluster at all
+ClusterParam = Literal["required", "optional", "none"]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    toolset: str
+    kind: ToolKind
+    fn: Callable[..., Any]
+    description: str
+    requires: Optional[str] = None
+    cluster: ClusterParam = "required"
+
+
+_SPECS: Dict[str, ToolSpec] = {}
+
+
+def redis_tool(
+    toolset: str,
+    kind: ToolKind = ToolKind.READ,
+    requires: Optional[str] = None,
+    cluster: ClusterParam = "required",
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Declares a tool. The function is returned unchanged; its name and docstring become the tool's.
+
+    ``requires`` names a module (json, search) the cluster must list in ``modules``.
+    """
+    if toolset not in TOOLSETS:
+        raise ValueError(f"Unknown toolset: {toolset}")
+
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        description = inspect.getdoc(fn) or ""
+        if kind.writes and not description.startswith("WRITE:"):
+            description = "WRITE: " + description
+        spec = ToolSpec(
+            name=fn.__name__,
+            toolset=toolset,
+            kind=kind,
+            fn=fn,
+            description=description,
+            requires=requires,
+            cluster=cluster,
+        )
+        existing = _SPECS.get(spec.name)
+        if existing is not None and existing.fn.__module__ != fn.__module__:
+            raise ValueError(f"Duplicate tool name: {spec.name}")
+        _SPECS[spec.name] = spec
+        return fn
+
+    return decorator
+
+
+def specs() -> List[ToolSpec]:
+    return list(_SPECS.values())
+
+
+def reason_unavailable(
+    config: ServerConfig, spec: ToolSpec, cluster: ClusterConfig
+) -> Optional[str]:
+    """Why the tool cannot run on this cluster; None if it can."""
+    if spec.requires and spec.requires not in cluster.modules:
+        return f"cluster {cluster.name} does not list the {spec.requires} module in modules"
+    if spec.kind.writes and config.is_read_only(cluster):
+        return f"cluster {cluster.name} is readOnly; write tools are disabled"
+    if spec.kind is ToolKind.DESTRUCTIVE and config.disable_destructive:
+        return "disableDestructive is on; delete/pop/remove tools are disabled"
+    return None
+
+
+def eligible_clusters(config: ServerConfig, spec: ToolSpec) -> List[str]:
+    return [
+        c.name for c in config.clusters if reason_unavailable(config, spec, c) is None
+    ]
+
+
+def enabled_toolsets(config: ServerConfig) -> List[str]:
+    if config.all_toolsets:
+        return list(TOOLSETS)
+    unknown = [t for t in config.toolsets if t not in TOOLSETS]
+    if unknown:
+        raise ConfigError(f"Unknown toolset: {unknown} (valid: {sorted(TOOLSETS)})")
+    return list(config.toolsets)
+
+
+def select(config: ServerConfig) -> List[Tuple[ToolSpec, List[str]]]:
+    """The listed tools with their eligible clusters, in toolset order."""
+    selected = []
+    for toolset in enabled_toolsets(config):
+        for spec in specs():
+            if spec.toolset != toolset:
+                continue
+            if spec.cluster == "none":
+                selected.append((spec, []))
+                continue
+            clusters = eligible_clusters(config, spec)
+            if clusters:
+                selected.append((spec, clusters))
+    return selected
+
+
+def annotations(spec: ToolSpec) -> ToolAnnotations:
+    return ToolAnnotations(
+        readOnlyHint=spec.kind is ToolKind.READ,
+        destructiveHint=spec.kind is ToolKind.DESTRUCTIVE,
+    )
+
+
+def wrap(
+    spec: ToolSpec, clusters: List[str], single_cluster: bool = False
+) -> Callable[..., Any]:
+    """The function FastMCP registers: the tool's own signature plus the ``cluster`` enum parameter. A call
+    runs the tool in a worker thread with the cluster selected and a time limit.
+
+    With ``single_cluster`` (only one cluster configured, e.g. the legacy env/CLI mode) the parameter is
+    optional, so calls written before multi-cluster support keep working."""
+    signature = inspect.signature(spec.fn)
+    parameters = list(signature.parameters.values())
+    if spec.cluster != "none":
+        # an enum even for a single cluster (pydantic would emit "const")
+        names = Annotated[
+            Literal[tuple(clusters)],  # type: ignore[valid-type]
+            WithJsonSchema({"type": "string", "enum": list(clusters)}),
+        ]
+        if spec.cluster == "required" and not single_cluster:
+            parameters.insert(
+                0,
+                inspect.Parameter(
+                    "cluster",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=Annotated[names, Field(description="Cluster name")],
+                ),
+            )
+        else:
+            parameters.append(
+                inspect.Parameter(
+                    "cluster",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=Annotated[
+                        Optional[names],
+                        Field(
+                            description="Cluster name (default: all clusters)"
+                            if spec.cluster == "optional"
+                            else "Cluster name (default: the only configured cluster)"
+                        ),
+                    ],
+                    default=None,
+                )
+            )
+
+    # a call that leaves out the cluster of a single-cluster config still runs in that cluster's pool
+    implicit_pool = (
+        clusters[0] if single_cluster and spec.cluster == "required" else None
+    )
+
+    async def tool(**kwargs: Any) -> Any:
+        cluster = kwargs.pop("cluster", None)
+        return await call(spec, cluster, kwargs, pool=cluster or implicit_pool)
+
+    tool.__name__ = spec.name
+    tool.__qualname__ = spec.name
+    tool.__doc__ = spec.description
+    tool.__signature__ = signature.replace(parameters=parameters)  # type: ignore[attr-defined]
+    return tool
+
+
+_executors: Dict[str, ThreadPoolExecutor] = {}
+_executors_lock = threading.Lock()
+
+
+def _executor(cluster: Optional[str]) -> ThreadPoolExecutor:
+    """The worker pool of a cluster; calls without a cluster share one pool."""
+    key = cluster or ""
+    with _executors_lock:
+        executor = _executors.get(key)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=MAX_CONCURRENT_CALLS_PER_CLUSTER,
+                thread_name_prefix=f"tool-{key or '-'}",
+            )
+            _executors[key] = executor
+    return executor
+
+
+def _run(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Any:
+    result = fn(**kwargs)
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
+
+
+async def call(
+    spec: ToolSpec,
+    cluster: Optional[str],
+    kwargs: Dict[str, Any],
+    pool: Optional[str] = None,
+) -> Any:
+    """Runs a tool with ``cluster`` selected, in the worker pool ``pool`` (default: the cluster's)."""
+    start = time.monotonic()
+    outcome, error = "ok", None
+    token = current_cluster.set(cluster)
+    try:
+        # the worker runs in a copy of this context, so it sees current_cluster
+        context = contextvars.copy_context()
+        future = asyncio.get_running_loop().run_in_executor(
+            _executor(pool or cluster), context.run, _run, spec.fn, kwargs
+        )
+        # on timeout the future is cancelled: a call still queued behind a hanging cluster never starts
+        return await asyncio.wait_for(future, TOOL_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        outcome = "error"
+        error = (
+            f"Tool did not finish within {TOOL_TIMEOUT_SECONDS} s (timeout). The cluster may be slow or"
+            " unreachable (check clusters_list), or the request too large (narrow the pattern or count)."
+        )
+        raise ToolError(error) from None
+    except asyncio.CancelledError:
+        outcome, error = "cancelled", "cancelled by the client"
+        raise
+    except Exception as e:
+        outcome, error = "error", str(e)
+        raise
+    finally:
+        current_cluster.reset(token)
+        duration_ms = int((time.monotonic() - start) * 1000)
+        _logger.info(
+            "tool call tool=%s cluster=%s durationMs=%d outcome=%s",
+            spec.name,
+            cluster,
+            duration_ms,
+            outcome,
+            extra={
+                "tool": spec.name,
+                "cluster": cluster,
+                "durationMs": duration_ms,
+                "outcome": outcome,
+                "error": error,
+            },
+        )
