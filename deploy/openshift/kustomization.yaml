@@ -12,7 +12,9 @@ labels:
       app.kubernetes.io/name: redis-mcp
       app.kubernetes.io/component: mcp-server
     includeSelectors: false
+# The image .github/workflows/docker-push.yml publishes (latest = main, X.Y.Z = tag vX.Y.Z, sha-<commit>).
+# For an image built inside the cluster use image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp.
 images:
   - name: redis-mcp
-    newName: image-registry.openshift-image-registry.svc:5000/<namespace>/redis-mcp
+    newName: docker.io/chosenwar/redis-mcp
     newTag: latest
