@@ -437,6 +437,7 @@ async def test_scan_keys_on_a_redis_cluster_starts_at_zero(mock_redis_cluster, c
         "n1:7000=-1",
         "n1:7000=1,n1:7000=2",
         "n1:7000=1,",
+        "n1:7000=" + "1" * 21,
     ],
 )
 async def test_scan_keys_on_a_redis_cluster_rejects_an_invalid_cursor(
@@ -491,7 +492,9 @@ async def test_scan_keys_accepts_a_cursor_given_as_text(mock_redis_connection_ma
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cursor", ["n1:7000=12", "abc", "-1", ""])
+@pytest.mark.parametrize(
+    "cursor", ["n1:7000=12", "abc", "-1", "", "1" * 21, "1" * 5000]
+)
 async def test_scan_keys_rejects_a_cursor_that_is_not_a_number(
     mock_redis_connection_manager, cursor
 ):

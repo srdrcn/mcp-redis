@@ -174,7 +174,8 @@ class _CursorError(ValueError):
     pass
 
 
-_CURSOR_NUMBER = re.compile(r"[0-9]+")
+# a SCAN cursor is an unsigned 64-bit number
+_CURSOR_NUMBER = re.compile(r"[0-9]{1,20}")
 _INVALID_CURSOR = "invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start"
 
 

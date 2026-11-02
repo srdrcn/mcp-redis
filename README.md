@@ -496,11 +496,14 @@ On a Redis Cluster, `dbsize` adds up the keys of every primary, and `scan_all_ke
 one is done. `scan_keys` runs one `SCAN` step on every primary that has not finished (`count` applies to each of
 them) and returns what they found together. Its `cursor` is then text that holds the position of every unfinished
 primary (`10.0.0.1:6379=1536,10.0.0.2:6379=96`): passing it back continues those primaries, and `cursor: 0` with
-`scan_complete: true` means every primary is done. A cursor that `scan_keys` did not return is rejected (`Error:
-invalid cursor: ...`), and so is one that names a node that is no longer a primary after a failover or resharding
-(`Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...`); start again with cursor 0. On
-standalone and Sentinel clusters the cursor is the number Redis returns. The example config lists no
-`scan_all_keys` (`excludeTools`), so keys are listed page by page with `scan_keys`.
+`scan_complete: true` means every primary is done. The cursor must be passed back unchanged: the server checks only
+its form and its nodes, so a cursor with an entry left out ends the scan of that primary early without an error. A
+malformed cursor is rejected (`Error: invalid cursor: ...`), and so is one that names a node that is no longer a
+primary after a failover or resharding (`Error: node <host:port> of the cursor is not a primary of this Redis
+Cluster ...`); start again with cursor 0. As with any `SCAN` on a Redis Cluster, keys whose slots move between
+primaries while the scan pages can be missed or returned twice. On standalone and Sentinel clusters the cursor is the
+number Redis returns. The example config lists no `scan_all_keys` (`excludeTools`), so keys are listed page by page
+with `scan_keys`.
 
 ### Which tools are listed
 
