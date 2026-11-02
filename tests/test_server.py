@@ -34,6 +34,7 @@ from src.common.server import (
     MCP_PATH,
     SERVER_NAME,
     build_server,
+    instructions,
     load_tools,
 )
 
@@ -170,6 +171,17 @@ class TestBuildServer:
 
         assert mcp.instructions == INSTRUCTIONS
         assert "cluster" in mcp.instructions
+
+    @pytest.mark.parametrize(
+        "root", [{"excludeTools": ["clusters_list"]}, {"toolsets": ["data"]}]
+    )
+    def test_instructions_without_clusters_list(self, root):
+        """The instructions name clusters_list only while it is listed."""
+        mcp = build_server(_config(**root))
+
+        assert mcp.instructions == instructions(status_tool=False)
+        assert "clusters_list" not in mcp.instructions
+        assert "schema enum" in mcp.instructions
 
     def test_streamable_http_settings(self):
         mcp = build_server(_config())

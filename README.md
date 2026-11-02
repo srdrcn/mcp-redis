@@ -256,7 +256,7 @@ clusters:
 | `readOnly` | boolean | `false` | `true` hides every write tool on clusters that do not override it with their own `readOnly`. |
 | `disableDestructive` | boolean | `false` | `true` hides the destructive tools (`delete`, `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy`, `json_del`) on every cluster. It is global only and does not affect the other write tools. |
 | `toolsets` | list of strings | `[core]` | Toolsets to enable, which also sets the order of `tools/list`. An unknown name stops the server at startup; an empty or duplicate entry is an invalid config. |
-| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 55 tools stops the server at startup; an empty or duplicate entry is an invalid config. |
+| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 55 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
 | `passwordsDir` | path | `/etc/redis-mcp/passwords` | Directory of the `<name>_pass` password files (see [Passwords](#passwords)). |
 | `clusters` | list | (required) | The Redis deployments. At least one is required, and names must be unique. |
 
@@ -493,15 +493,14 @@ time is up; a call right after `subscribe` waits like any other. Subscriptions a
 `read_messages` then answers `Subscription '<id>' was not found`; this is why the Deployment runs a single replica.
 
 On a Redis Cluster, `dbsize` adds up the keys of every primary, and `scan_all_keys` scans every primary until each
-one is done. `scan_keys` runs one `SCAN` step on every primary at once (`count` applies to each of them) and
-returns what they found together, with `cursor: 0`. `scan_complete` is `true` only when every primary has
-finished; otherwise a `note` points to `scan_all_keys`. Every primary has its own cursor, so such a scan cannot be
-continued: a call with a `cursor` other than 0 returns `Error: scan_keys cannot continue a cursor on a Redis
-Cluster (every node has its own cursor); call it with cursor 0, or use scan_all_keys`. On a Redis Cluster, use
-`scan_all_keys` with a narrow `pattern` (it still has to finish within the 15 s limit). The example config lists
-no `scan_all_keys` (`excludeTools`): there, a Redis Cluster returns only the first `scan_keys` batch of every
-primary (raise `count` or narrow the `pattern`), and the `note` and the error above still name `scan_all_keys`, which
-then answers `Unknown tool: scan_all_keys`. Remove it from `excludeTools` to list it again.
+one is done. `scan_keys` runs one `SCAN` step on every primary that has not finished (`count` applies to each of
+them) and returns what they found together. Its `cursor` is then text that holds the position of every unfinished
+primary (`10.0.0.1:6379=1536,10.0.0.2:6379=96`): passing it back continues those primaries, and `cursor: 0` with
+`scan_complete: true` means every primary is done. A cursor that `scan_keys` did not return is rejected (`Error:
+invalid cursor: ...`), and so is one that names a node that is no longer a primary after a failover or resharding
+(`Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...`); start again with cursor 0. On
+standalone and Sentinel clusters the cursor is the number Redis returns. The example config lists no
+`scan_all_keys` (`excludeTools`), so keys are listed page by page with `scan_keys`.
 
 ### Which tools are listed
 
@@ -1115,8 +1114,9 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `Error -2 connecting to <host>:<port>. Name or service not known.` (or `Error -3 ... Temporary failure in name resolution`) | The host name does not resolve from the pod. Check the name in `hosts` and the pod's DNS (see [DNS lookups](#dns-lookups)). |
 | `No master found for '<masterName>'` | Without anything after it: the Sentinels answered, but none of them knows a healthy primary named `masterName`; check `masterName`. With ` : <host>:<port> - <error type>: <message>, ...` after it: those Sentinels could not be asked. `ConnectionError` or `TimeoutError`: check the Sentinel addresses (usually port 26379) and the network path (each Sentinel gets at most 2 s). `AuthenticationError: Authentication required.` or `invalid username-password pair ...`: set or fix `<name>_sentinel_pass`. |
 | `Timeout connecting to server` after about 10 s on a cluster with `tls`, or TLS errors such as `CERTIFICATE_VERIFY_FAILED` | `tls` set on a port without TLS: the TLS handshake gets no answer. For certificate errors, set `caFile` to the CA that signed the server certificate (mounted at `/etc/redis-mcp/tls`), and use the host name the certificate is issued for in `hosts`. |
-| `Tool did not finish within 15 s (timeout). The cluster may be slow or unreachable (check clusters_list), or the request too large (narrow the pattern or count).` | Run `clusters_list`. If the cluster shows `status: timeout` or an error, the cluster or the path to it is the cause: Redis Cluster startup nodes that do not answer cost one timeout each and can add up to more than 15 s, and so can more than 8 simultaneous calls to a cluster that hangs, or a slow DNS lookup (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)); fix `hosts`, the network or DNS, or lower the timeouts in `options`. If the cluster is fine, the request is too large: `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large standalone or Sentinel databases use `scan_keys` and page through the keys with the `cursor` it returns, or use a more specific tool; on a Redis Cluster `scan_keys` cannot page (see [Toolsets](#toolsets)), so narrow the `pattern`. |
-| `Error: scan_keys cannot continue a cursor on a Redis Cluster ...` | Every primary of a Redis Cluster has its own cursor. Call `scan_keys` with cursor 0, or use `scan_all_keys` with a narrow `pattern`. |
+| `Tool did not finish within 15 s (timeout). The cluster may be slow or unreachable (check clusters_list), or the request too large (narrow the pattern or count).` | Run `clusters_list`. If the cluster shows `status: timeout` or an error, the cluster or the path to it is the cause: Redis Cluster startup nodes that do not answer cost one timeout each and can add up to more than 15 s, and so can more than 8 simultaneous calls to a cluster that hangs, or a slow DNS lookup (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)); fix `hosts`, the network or DNS, or lower the timeouts in `options`. If the cluster is fine, the request is too large: `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large databases use `scan_keys` and page through the keys with the `cursor` it returns (on a Redis Cluster too, see [Toolsets](#toolsets)), or use a more specific tool. Without `clusters_list` listed, the message has no `(check clusters_list)`. |
+| `Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start` | Pass the `cursor` of the previous `scan_keys` call as it is: a number on standalone and Sentinel clusters, text such as `10.0.0.1:6379=1536,10.0.0.2:6379=96` on a Redis Cluster. |
+| `Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...` | A failover or resharding changed the primaries while `scan_keys` was paging. Start again with cursor 0. |
 | `status: timeout` in `clusters_list` | The cluster's check did not finish within 13 s, for example two or more Redis Cluster startup nodes that accept connections but do not answer, or a slow DNS lookup. See the `Tool did not finish within 15 s` row. |
 | `Redis Cluster cannot be connected ...` again at once, right after the cluster was fixed | A failed Redis Cluster connection is remembered for 5 s (see [Redis clients](#redis-clients)). The first call after that tries again. |
 | A call fails once with `Error while reading from <host>:<port> : (104, 'Connection reset by peer')`, `Connection closed by server.` or `Timeout reading from socket`, and the next call works | The connection broke while the command was in flight, typically during a restart or a failover. The server sends no command twice, so a write in such a call may or may not have been applied: check before you repeat it. |

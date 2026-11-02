@@ -40,6 +40,9 @@ TOOL_TIMEOUT_SECONDS = 15
 # hangs ties up only its own workers: its queued calls fail at the time limit while other clusters carry on.
 MAX_CONCURRENT_CALLS_PER_CLUSTER = 8
 
+# the tool that reports each cluster's status; texts name it only while it is listed
+STATUS_TOOL = "clusters_list"
+
 TOOLSETS: Dict[str, str] = {
     "core": "Clusters, server info and generic key operations (type, scan, expire, rename, delete)",
     "data": "Strings, hashes (including vectors), lists, sets, sorted sets and streams",
@@ -182,13 +185,17 @@ def annotations(spec: ToolSpec) -> ToolAnnotations:
 
 
 def wrap(
-    spec: ToolSpec, clusters: List[str], single_cluster: bool = False
+    spec: ToolSpec,
+    clusters: List[str],
+    single_cluster: bool = False,
+    status_tool: bool = True,
 ) -> Callable[..., Any]:
     """The function FastMCP registers: the tool's own signature plus the ``cluster`` enum parameter. A call
     runs the tool in a worker thread with the cluster selected and a time limit.
 
     With ``single_cluster`` (only one cluster configured, e.g. the legacy env/CLI mode) the parameter is
-    optional, so calls written before multi-cluster support keep working."""
+    optional, so calls written before multi-cluster support keep working. ``status_tool``: whether
+    clusters_list is listed, so the timeout error may point to it."""
     signature = inspect.signature(spec.fn)
     parameters = list(signature.parameters.values())
     if spec.cluster != "none":
@@ -230,7 +237,13 @@ def wrap(
 
     async def tool(**kwargs: Any) -> Any:
         cluster = kwargs.pop("cluster", None)
-        return await call(spec, cluster, kwargs, pool=cluster or implicit_pool)
+        return await call(
+            spec,
+            cluster,
+            kwargs,
+            pool=cluster or implicit_pool,
+            status_tool=status_tool,
+        )
 
     tool.__name__ = spec.name
     tool.__qualname__ = spec.name
@@ -269,8 +282,10 @@ async def call(
     cluster: Optional[str],
     kwargs: Dict[str, Any],
     pool: Optional[str] = None,
+    status_tool: bool = True,
 ) -> Any:
-    """Runs a tool with ``cluster`` selected, in the worker pool ``pool`` (default: the cluster's)."""
+    """Runs a tool with ``cluster`` selected, in the worker pool ``pool`` (default: the cluster's). The timeout
+    error points to clusters_list if ``status_tool`` says it is listed."""
     start = time.monotonic()
     outcome, error = "ok", None
     token = current_cluster.set(cluster)
@@ -284,9 +299,10 @@ async def call(
         return await asyncio.wait_for(future, TOOL_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         outcome = "error"
+        check = f" (check {STATUS_TOOL})" if status_tool else ""
         error = (
             f"Tool did not finish within {TOOL_TIMEOUT_SECONDS} s (timeout). The cluster may be slow or"
-            " unreachable (check clusters_list), or the request too large (narrow the pattern or count)."
+            f" unreachable{check}, or the request too large (narrow the pattern or count)."
         )
         raise ToolError(error) from None
     except asyncio.CancelledError:

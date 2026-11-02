@@ -14,12 +14,19 @@ MCP_PATH = "/mcp"
 HEALTH_PATH = "/healthz"
 DEFAULT_HTTP_PORT = 8080
 
-INSTRUCTIONS = (
-    "MCP server for Redis clusters. Every tool that touches Redis takes a `cluster` parameter (valid names "
-    "are in the schema enum; clusters_list shows each cluster's status). Tools whose description starts "
-    'with "WRITE:" change data. Each tool call runs for at most '
-    f"{registry.TOOL_TIMEOUT_SECONDS} s."
-)
+
+def instructions(status_tool: bool = True) -> str:
+    """The server instructions; they name clusters_list only while it is listed (``status_tool``)."""
+    status = "; clusters_list shows each cluster's status" if status_tool else ""
+    return (
+        "MCP server for Redis clusters. Every tool that touches Redis takes a `cluster` parameter (valid names "
+        f"are in the schema enum{status}). Tools whose description starts "
+        'with "WRITE:" change data. Each tool call runs for at most '
+        f"{registry.TOOL_TIMEOUT_SECONDS} s."
+    )
+
+
+INSTRUCTIONS = instructions()
 
 
 def load_tools():
@@ -36,9 +43,11 @@ def build_server(
 ) -> FastMCP:
     """FastMCP server with the tools the config enables (see src.common.registry)."""
     load_tools()
+    selected = registry.select(config)
+    status_tool = any(spec.name == registry.STATUS_TOOL for spec, _ in selected)
     mcp = FastMCP(
         SERVER_NAME,
-        instructions=INSTRUCTIONS,
+        instructions=instructions(status_tool),
         dependencies=["redis", "python-dotenv", "numpy", "aiohttp", "pyyaml"],
         host=host,
         port=config.port or DEFAULT_HTTP_PORT,
@@ -50,9 +59,9 @@ def build_server(
     # FastMCP takes no version; without this, initialize reports the mcp package's version
     mcp._mcp_server.version = __version__
     single_cluster = len(config.clusters) == 1
-    for spec, clusters in registry.select(config):
+    for spec, clusters in selected:
         mcp.add_tool(
-            registry.wrap(spec, clusters, single_cluster),
+            registry.wrap(spec, clusters, single_cluster, status_tool),
             name=spec.name,
             description=spec.description,
             annotations=registry.annotations(spec),

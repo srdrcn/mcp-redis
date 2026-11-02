@@ -716,6 +716,41 @@ class TestRedisCluster:
         assert not result.get("isError"), _text(result)
         assert sorted(result["structuredContent"]["result"]) == sorted(keys)
 
+    def test_scan_keys_pages_through_every_node(self, cluster_stdio, empty_cluster):
+        """scan_keys continues every primary with the cursor it returns until all of them are done."""
+        client = empty_cluster.client()
+        try:
+            keys = [f"mcp:it:page:{i}" for i in range(60)]
+            for key in keys:
+                client.set(key, "1")
+            client.set("mcp:it:other", "1")
+        finally:
+            client.close()
+
+        seen, cursors, cursor = [], [], 0
+        for _ in range(500):
+            result = cluster_stdio.call(
+                "scan_keys",
+                cluster=REDIS_CLUSTER,
+                pattern="mcp:it:page:*",
+                count=5,
+                cursor=cursor,
+            )
+            assert not result.get("isError"), _text(result)
+            page = result["structuredContent"]["result"]
+            seen.extend(page["keys"])
+            cursor = page["cursor"]
+            if page["scan_complete"]:
+                break
+            cursors.append(cursor)
+        else:
+            raise AssertionError("scan_keys did not finish")
+
+        assert cursor == 0
+        assert sorted(set(seen)) == sorted(keys)
+        # more than one page, continued with the text cursor of the unfinished primaries
+        assert cursors and all(isinstance(c, str) and "=" in c for c in cursors)
+
     def test_scan_all_keys_on_an_empty_cluster(self, cluster_stdio, empty_cluster):
         result = cluster_stdio.call("scan_all_keys", cluster=REDIS_CLUSTER)
 

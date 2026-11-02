@@ -1,8 +1,9 @@
 import asyncio
-from typing import Any, Dict, Union, List
+import re
+from typing import Any, Dict, Union, List, Tuple
 import aiohttp
 
-from redis.cluster import RedisCluster
+from redis.cluster import ClusterNode, RedisCluster
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
@@ -108,14 +109,13 @@ async def rename(old_key: str, new_key: str) -> Dict[str, Any]:
 
 @redis_tool("core")
 async def scan_keys(
-    pattern: str = "*", count: int = 100, cursor: int = 0
+    pattern: str = "*", count: int = 100, cursor: Union[int, str] = 0
 ) -> Union[str, Dict[str, Any]]:
     """
     Scan keys in the Redis database using the SCAN command (non-blocking, production-safe).
 
-    ⚠️  IMPORTANT: This returns PARTIAL results from one iteration. Use scan_all_keys()
-    to get ALL matching keys, or call this function multiple times with the returned cursor
-    until cursor becomes 0.
+    ⚠️  IMPORTANT: This returns PARTIAL results from one iteration. Call it again with the returned cursor
+    until cursor becomes 0 (scan_complete is true) to see every matching key.
 
     The SCAN command iterates through the keyspace in small chunks, making it safe to use
     on large databases without blocking other operations.
@@ -125,8 +125,8 @@ async def scan_keys(
                 Common patterns: "user:*", "cache:*", "*:123", etc.
         count: Hint for the number of keys to return per iteration (default 100).
                Redis may return more or fewer keys than this hint.
-        cursor: The cursor position to start scanning from (0 to start from beginning).
-                To continue scanning, use the cursor value returned from previous call.
+        cursor: 0 to start from the beginning. To continue scanning, pass the cursor value returned
+                from the previous call unchanged.
 
     Returns:
         A dictionary containing:
@@ -141,14 +141,17 @@ async def scan_keys(
         Next call: scan_keys("user:*", cursor=1234) -> continues from where it left off
         Final call: returns cursor=0, scan_complete=True when done
 
-    On a Redis Cluster each node has its own cursor, so a scan cannot be continued: call it with cursor 0
-    for one batch from every node, or use scan_all_keys().
+    On a Redis Cluster each call runs one SCAN step on every primary that has not finished (count applies to
+    each of them), and the cursor is text that holds the position on each of those primaries, e.g.
+    "10.0.0.1:6379=1536,10.0.0.2:6379=96": pass it back as it is.
     """
     try:
         r = RedisConnectionManager.get_connection()
         if isinstance(r, RedisCluster):
-            return _scan_cluster_batch(r, pattern, count, cursor)
-        cursor, keys = r.scan(cursor=cursor, match=pattern, count=count)
+            return _scan_cluster_step(r, pattern, count, cursor)
+        cursor, keys = r.scan(
+            cursor=_standalone_cursor(cursor), match=pattern, count=count
+        )
 
         # Convert bytes to strings if needed
         decoded_keys = [
@@ -161,33 +164,76 @@ async def scan_keys(
             "total_scanned": len(decoded_keys),
             "scan_complete": cursor == 0,
         }
+    except _CursorError as e:
+        return f"Error: {e}"
     except RedisError as e:
         return f"Error scanning keys with pattern '{pattern}': {str(e)}"
 
 
-def _scan_cluster_batch(
-    r: RedisCluster, pattern: str, count: int, cursor: int
-) -> Union[str, Dict[str, Any]]:
-    if cursor:
-        return (
-            "Error: scan_keys cannot continue a cursor on a Redis Cluster (every node has its own cursor);"
-            " call it with cursor 0, or use scan_all_keys"
+class _CursorError(ValueError):
+    pass
+
+
+_CURSOR_NUMBER = re.compile(r"[0-9]+")
+_INVALID_CURSOR = "invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start"
+
+
+def _standalone_cursor(cursor: Union[int, str]) -> int:
+    if isinstance(cursor, int):
+        return cursor
+    if _CURSOR_NUMBER.fullmatch(cursor.strip()):
+        return int(cursor)
+    raise _CursorError(_INVALID_CURSOR)
+
+
+def _cluster_positions(
+    r: RedisCluster, cursor: Union[int, str]
+) -> Dict[str, Tuple[ClusterNode, int]]:
+    """The primaries still to be scanned with their SCAN cursors, by node name. The cursor of a Redis Cluster
+    scan is ``name=position`` for each of them, comma-separated; a primary that finished is left out."""
+    primaries = {
+        node.name: node for node in sorted(r.get_primaries(), key=lambda n: n.name)
+    }
+    if isinstance(cursor, int) or _CURSOR_NUMBER.fullmatch(cursor.strip()):
+        # a number other than 0 is the cursor of a standalone server, not of a Redis Cluster
+        if int(cursor) != 0:
+            raise _CursorError(_INVALID_CURSOR)
+        return {name: (node, 0) for name, node in primaries.items()}
+    positions: Dict[str, Tuple[ClusterNode, int]] = {}
+    for part in cursor.split(","):
+        name, _, position = part.strip().rpartition("=")
+        if not name or not _CURSOR_NUMBER.fullmatch(position) or name in positions:
+            raise _CursorError(_INVALID_CURSOR)
+        if name not in primaries:
+            raise _CursorError(
+                f"node {name} of the cursor is not a primary of this Redis Cluster (a failover or"
+                " resharding since the scan started?); start again with cursor 0"
+            )
+        positions[name] = (primaries[name], int(position))
+    return positions
+
+
+def _scan_cluster_step(
+    r: RedisCluster, pattern: str, count: int, cursor: Union[int, str]
+) -> Dict[str, Any]:
+    positions = _cluster_positions(r, cursor)
+    keys: List[Any] = []
+    remaining: Dict[str, int] = {}
+    for name, (node, position) in positions.items():
+        cursors, batch = r.scan(
+            cursor=position, match=pattern, count=count, target_nodes=node
         )
-    cursors, keys = r.scan(cursor=0, match=pattern, count=count)
-    complete = all(c == 0 for c in cursors.values())
-    result: Dict[str, Any] = {
-        "cursor": 0,
+        keys.extend(batch)
+        if cursors[name]:
+            remaining[name] = cursors[name]
+    return {
+        "cursor": ",".join(f"{name}={c}" for name, c in remaining.items()) or 0,
         "keys": [
             key.decode("utf-8") if isinstance(key, bytes) else key for key in keys
         ],
         "total_scanned": len(keys),
-        "scan_complete": complete,
+        "scan_complete": not remaining,
     }
-    if not complete:
-        result["note"] = (
-            "Redis Cluster: these are the first keys of every node; scan_all_keys returns all matching keys"
-        )
-    return result
 
 
 @redis_tool("core")
@@ -200,8 +246,8 @@ async def scan_all_keys(
     This function automatically handles the SCAN cursor iteration to collect all matching keys.
     It's safer than KEYS * for large databases but will still collect all results in memory.
 
-    ⚠️  WARNING: With very large datasets (millions of keys), this may consume significant memory.
-    For large-scale operations, consider using scan_keys() with manual iteration instead.
+    ⚠️  WARNING: With very large datasets (millions of keys), this may consume significant memory and
+    exceed the time limit of a tool call: narrow the pattern.
 
     Args:
         pattern: Pattern to match keys against (default is "*" for all keys).

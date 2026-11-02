@@ -143,10 +143,11 @@ def _tool_call_records(caplog):
     ]
 
 
-def _timeout_message(seconds) -> str:
+def _timeout_message(seconds, status_tool=True) -> str:
+    check = " (check clusters_list)" if status_tool else ""
     return (
         f"Tool did not finish within {seconds} s (timeout). The cluster may be slow or unreachable"
-        " (check clusters_list), or the request too large (narrow the pattern or count)."
+        f"{check}, or the request too large (narrow the pattern or count)."
     )
 
 
@@ -785,8 +786,14 @@ class TestWrap:
 
         # no cluster selected, but both calls run in the only cluster's worker pool
         assert [(c.args, c.kwargs) for c in mock_call.call_args_list] == [
-            ((spec, None, {"key": "k", "count": 10}), {"pool": "only"}),
-            ((spec, "only", {"key": "k", "count": 10}), {"pool": "only"}),
+            (
+                (spec, None, {"key": "k", "count": 10}),
+                {"pool": "only", "status_tool": True},
+            ),
+            (
+                (spec, "only", {"key": "k", "count": 10}),
+                {"pool": "only", "status_tool": True},
+            ),
         ]
 
     @pytest.mark.asyncio
@@ -800,8 +807,14 @@ class TestWrap:
             await wrapped(key="k", count=3, cluster="only")
 
         assert [(c.args, c.kwargs) for c in mock_call.call_args_list] == [
-            ((spec, None, {"key": "k", "count": 3}), {"pool": None}),
-            ((spec, "only", {"key": "k", "count": 3}), {"pool": "only"}),
+            (
+                (spec, None, {"key": "k", "count": 3}),
+                {"pool": None, "status_tool": True},
+            ),
+            (
+                (spec, "only", {"key": "k", "count": 3}),
+                {"pool": "only", "status_tool": True},
+            ),
         ]
 
     @pytest.mark.asyncio
@@ -840,7 +853,9 @@ class TestWrap:
             result = await wrapped(cluster="a", key="k", count=3)
 
         assert result == "done"
-        mock_call.assert_called_once_with(spec, "a", {"key": "k", "count": 3}, pool="a")
+        mock_call.assert_called_once_with(
+            spec, "a", {"key": "k", "count": 3}, pool="a", status_tool=True
+        )
 
     @pytest.mark.asyncio
     async def test_wrapper_with_several_clusters_uses_the_named_cluster_pool(self):
@@ -850,7 +865,9 @@ class TestWrap:
         with patch("src.common.registry.call", return_value="done") as mock_call:
             await wrapped(cluster="b", key="k")
 
-        mock_call.assert_called_once_with(spec, "b", {"key": "k"}, pool="b")
+        mock_call.assert_called_once_with(
+            spec, "b", {"key": "k"}, pool="b", status_tool=True
+        )
 
     @pytest.mark.asyncio
     async def test_wrapper_without_cluster_passes_none(self):
@@ -861,7 +878,7 @@ class TestWrap:
             await wrapped(key="k", count=3)
 
         mock_call.assert_called_once_with(
-            spec, None, {"key": "k", "count": 3}, pool=None
+            spec, None, {"key": "k", "count": 3}, pool=None, status_tool=True
         )
 
     @pytest.mark.asyncio
@@ -872,7 +889,9 @@ class TestWrap:
         with patch("src.common.registry.call", return_value="done") as mock_call:
             await wrapped(key="k")
 
-        mock_call.assert_called_once_with(spec, None, {"key": "k"}, pool=None)
+        mock_call.assert_called_once_with(
+            spec, None, {"key": "k"}, pool=None, status_tool=True
+        )
 
 
 class TestCall:
@@ -1025,6 +1044,21 @@ class TestCall:
         with pytest.raises(ToolError) as info:
             await call(_spec(probe), "a", {})
         assert str(info.value) == _timeout_message(0.05)
+
+    @pytest.mark.asyncio
+    async def test_timeout_without_clusters_list(self, monkeypatch, release):
+        """With clusters_list not listed, the error does not point to it."""
+        monkeypatch.setattr(registry, "TOOL_TIMEOUT_SECONDS", 0.05)
+
+        async def probe():
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+
+        tool = wrap(_spec(probe), ["a"], status_tool=False)
+        with pytest.raises(ToolError) as info:
+            await tool(cluster="a")
+        assert str(info.value) == _timeout_message(0.05, status_tool=False)
+        assert "clusters_list" not in str(info.value)
 
     @pytest.mark.asyncio
     async def test_cancelled_call_is_logged_as_cancelled(self, caplog, release):
