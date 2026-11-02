@@ -8,6 +8,7 @@ apiKey: <api-key>
 readOnly: true
 disableDestructive: true
 toolsets: [core, data]
+excludeTools: [scan_all_keys]   # never listed: it walks the whole keyspace in one call
 passwordsDir: /etc/redis-mcp/passwords   # <name>_pass files (the redis-mcp-passwords Secret); else env <name>_pass
 
 clusters:

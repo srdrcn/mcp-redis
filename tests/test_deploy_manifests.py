@@ -12,12 +12,14 @@ from pathlib import Path
 import pytest
 import yaml
 
+from src.common import registry
 from src.common.config_loader import (
     ConfigError,
     ServerConfig,
     api_key_error,
     load_config,
 )
+from src.common.server import load_tools
 from src.main import apply_api_key
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,6 +101,15 @@ def configmap_config(configmap, tmp_path) -> ServerConfig:
     path = tmp_path / CONFIG_KEY
     path.write_text(configmap["data"][CONFIG_KEY], encoding="utf-8")
     return load_config(path)
+
+
+@pytest.fixture
+def example_config(tmp_path) -> ServerConfig:
+    # The example sets apiKey: <api-key>, which the loader rejects; a drop-in clears it.
+    drop_in = tmp_path / "drop-in"
+    drop_in.mkdir()
+    (drop_in / "api-key.yaml").write_text('apiKey: ""\n', encoding="utf-8")
+    return load_config(EXAMPLE_CONFIG, drop_in)
 
 
 @pytest.fixture(scope="module")
@@ -189,16 +200,20 @@ class TestConfigMap:
         mount = by_name(container["volumeMounts"], "passwords")
         assert configmap_config.passwords_dir == mount["mountPath"]
 
-    def test_clusters_match_the_example_config(self, configmap_config, tmp_path):
-        # The example sets apiKey: <api-key>, which the loader rejects; a drop-in clears it so the example's
-        # clusters can be compared. The two examples must not drift apart.
-        drop_in = tmp_path / "drop-in"
-        drop_in.mkdir()
-        (drop_in / "api-key.yaml").write_text('apiKey: ""\n', encoding="utf-8")
-        example = load_config(EXAMPLE_CONFIG, drop_in)
+    def test_clusters_match_the_example_config(self, configmap_config, example_config):
+        # The two examples must not drift apart.
         assert [c.model_dump() for c in configmap_config.clusters] == [
-            c.model_dump() for c in example.clusters
+            c.model_dump() for c in example_config.clusters
         ]
+
+    def test_listed_tools_match_the_example_config(
+        self, configmap_config, example_config
+    ):
+        # select() rejects an excludeTools name that is not a tool
+        load_tools()
+        listed = [spec.name for spec, _ in registry.select(configmap_config)]
+        assert "scan_all_keys" not in listed
+        assert listed == [spec.name for spec, _ in registry.select(example_config)]
 
     def test_example_config_placeholder_is_rejected(self):
         with pytest.raises(ConfigError, match="placeholder"):

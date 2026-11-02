@@ -211,6 +211,7 @@ apiKey: <api-key>
 readOnly: true
 disableDestructive: true
 toolsets: [core, data]
+excludeTools: [scan_all_keys]   # never listed: it walks the whole keyspace in one call
 passwordsDir: /etc/redis-mcp/passwords   # <name>_pass files (the redis-mcp-passwords Secret); else env <name>_pass
 
 clusters:
@@ -255,6 +256,7 @@ clusters:
 | `readOnly` | boolean | `false` | `true` hides every write tool on clusters that do not override it with their own `readOnly`. |
 | `disableDestructive` | boolean | `false` | `true` hides the destructive tools (`delete`, `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy`, `json_del`) on every cluster. It is global only and does not affect the other write tools. |
 | `toolsets` | list of strings | `[core]` | Toolsets to enable, which also sets the order of `tools/list`. An unknown name stops the server at startup; an empty or duplicate entry is an invalid config. |
+| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 55 tools stops the server at startup; an empty or duplicate entry is an invalid config. |
 | `passwordsDir` | path | `/etc/redis-mcp/passwords` | Directory of the `<name>_pass` password files (see [Passwords](#passwords)). |
 | `clusters` | list | (required) | The Redis deployments. At least one is required, and names must be unique. |
 
@@ -496,7 +498,10 @@ returns what they found together, with `cursor: 0`. `scan_complete` is `true` on
 finished; otherwise a `note` points to `scan_all_keys`. Every primary has its own cursor, so such a scan cannot be
 continued: a call with a `cursor` other than 0 returns `Error: scan_keys cannot continue a cursor on a Redis
 Cluster (every node has its own cursor); call it with cursor 0, or use scan_all_keys`. On a Redis Cluster, use
-`scan_all_keys` with a narrow `pattern` (it still has to finish within the 15 s limit).
+`scan_all_keys` with a narrow `pattern` (it still has to finish within the 15 s limit). The example config lists
+no `scan_all_keys` (`excludeTools`): there, a Redis Cluster returns only the first `scan_keys` batch of every
+primary (raise `count` or narrow the `pattern`), and the `note` and the error above still name `scan_all_keys`, which
+then answers `Unknown tool: scan_all_keys`. Remove it from `excludeTools` to list it again.
 
 ### Which tools are listed
 
@@ -507,6 +512,7 @@ For every tool, the server works out which clusters it may run on:
 3. **Write** tools (descriptions starting with `WRITE:`) need the cluster's effective `readOnly` to be `false`. The
    cluster's own `readOnly` applies if it is set, otherwise the global one does.
 4. **Destructive** tools also need `disableDestructive: false`.
+5. Its name must not be in `excludeTools`.
 
 A tool with no eligible cluster is **not listed at all** (calling it anyway returns `Unknown tool: <name>`). Every
 other tool is listed with its `cluster` enum **narrowed to the eligible clusters**, and a call that names any other
@@ -515,7 +521,7 @@ cluster is rejected by schema validation (`Input should be 'cbsbxrds'`). With tw
 one cluster (a one-cluster config file or the [single-cluster mode](#single-cluster-mode)), `cluster` is optional
 and comes last, described as `Cluster name (default: the only configured cluster)`: a call without it runs on that
 cluster. `clusters_list` always takes an optional `cluster` (all clusters when omitted), and `read_messages`,
-`unsubscribe` and `search_redis_documents` take none. With the example config, 31 of the 55 tools are listed.
+`unsubscribe` and `search_redis_documents` take none. With the example config, 30 of the 55 tools are listed.
 For example:
 
 | Tool | `cluster` enum |
@@ -524,6 +530,7 @@ For example:
 | `set`, `hset`, `expire` (write) | `cbsbxrds` |
 | `delete`, `hdel`, `lpop` (destructive) | not listed |
 | `json_get`, `get_indexes` | not listed (toolsets `json`/`search` not enabled) |
+| `scan_all_keys` | not listed (`excludeTools`) |
 
 The `WRITE:` prefix is added to the description of every write and destructive tool. Tools also carry MCP
 annotations: `readOnlyHint: true` on read tools and `destructiveHint: true` on destructive tools (both are `false`
@@ -1095,6 +1102,7 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `redis-mcp: Could not read config file: <path> (not UTF-8: invalid byte on line <n>)` or `Could not read password file <path> (not UTF-8)` | Save the file as UTF-8 (a byte order mark is accepted in config files). The config message names the line of the first byte that is not UTF-8. |
 | `redis-mcp: Could not parse config file: <path> (... line <l>, column <c> ...)` | The file is not valid YAML; fix it at the line and column named. The message does not quote the line. |
 | `redis-mcp: Unknown toolset: [...]` | Valid toolsets are `core`, `data`, `json`, `search`, `pubsub` and `docs`. |
+| `redis-mcp: Unknown tool in excludeTools: [...]` | A name in `excludeTools` is not a tool; the message lists the valid names (see [Tool reference](#tool-reference)). |
 | `redis-mcp: --host cannot be combined with --config/--config-dir; ...` | The connection flags belong to the single-cluster mode; define the clusters in the config file. |
 | HTTP 401 `X-Authorization header is missing or the API key does not match` | The key does not match the server's key exactly. Check that `REDIS_MCP_KEY` is exported in the shell that starts Claude Code and that it equals `api-key` in the Secret `redis-mcp-api-key` (`oc extract secret/redis-mcp-api-key --keys=api-key --to=-`; after a change to the Secret, the pod needs `oc rollout restart deployment/redis-mcp`): no extra whitespace, no `Bearer` prefix, header name `X-Authorization`. The server log shows `unauthorized request` with `headerPresent`. |
 | HTTP 403 `Requests with an Origin header (from a web page) are not accepted` | The request came from a web page or a browser-based client. Use a non-browser MCP client such as Claude Code. |

@@ -6,7 +6,8 @@ Tools are declared with :func:`redis_tool`, which only records them. Once the co
 - only the toolsets named in the config's ``toolsets`` list,
 - write tools only on clusters with an effective ``readOnly: false``,
 - destructive tools additionally only while ``disableDestructive`` is false,
-- json/search tools only on clusters that list the module in ``modules``.
+- json/search tools only on clusters that list the module in ``modules``,
+- never the tools named in ``excludeTools``.
 
 A tool with no eligible cluster left is not listed. For the others a ``cluster`` parameter is added as an enum of
 the eligible cluster names, so a call naming any other cluster fails schema validation.
@@ -147,12 +148,22 @@ def enabled_toolsets(config: ServerConfig) -> List[str]:
     return list(config.toolsets)
 
 
+def excluded_tools(config: ServerConfig) -> List[str]:
+    unknown = [t for t in config.exclude_tools if t not in _SPECS]
+    if unknown:
+        raise ConfigError(
+            f"Unknown tool in excludeTools: {unknown} (valid: {sorted(_SPECS)})"
+        )
+    return list(config.exclude_tools)
+
+
 def select(config: ServerConfig) -> List[Tuple[ToolSpec, List[str]]]:
     """The listed tools with their eligible clusters, in toolset order."""
+    excluded = excluded_tools(config)
     selected = []
     for toolset in enabled_toolsets(config):
         for spec in specs():
-            if spec.toolset != toolset:
+            if spec.toolset != toolset or spec.name in excluded:
                 continue
             if spec.cluster == "none":
                 selected.append((spec, []))

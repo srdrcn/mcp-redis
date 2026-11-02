@@ -277,6 +277,8 @@ class ServerConfig(_Model):
     read_only: bool = False
     disable_destructive: bool = False
     toolsets: List[str] = ["core"]
+    # tools that are never listed, whatever their toolset (the names are checked when the tools are selected)
+    exclude_tools: List[str] = []
     passwords_dir: str = DEFAULT_PASSWORDS_DIR
     clusters: List[ClusterConfig]
 
@@ -308,6 +310,16 @@ class ServerConfig(_Model):
         duplicates = sorted({t for t in value if value.count(t) > 1})
         if duplicates:
             raise ValueError(f"duplicate toolset: {', '.join(duplicates)}")
+        return value
+
+    @field_validator("exclude_tools")
+    @classmethod
+    def _check_exclude_tools(cls, value: List[str]) -> List[str]:
+        if any(not t or not t.strip() for t in value):
+            raise ValueError("the excludeTools list contains an empty value")
+        duplicates = sorted({t for t in value if value.count(t) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate tool in excludeTools: {', '.join(duplicates)}")
         return value
 
     @field_validator("clusters")

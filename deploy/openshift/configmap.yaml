@@ -13,6 +13,7 @@ data:
     readOnly: true                 # write tools only on clusters that set readOnly: false
     disableDestructive: true       # no delete/pop/remove tools on any cluster
     toolsets: [core, data]         # also: json, search, pubsub, docs
+    excludeTools: [scan_all_keys]  # never listed: it walks the whole keyspace in one call
     passwordsDir: /etc/redis-mcp/passwords   # <cluster>_pass files of the redis-mcp-passwords Secret
     # The API key comes from the redis-mcp-api-key Secret (REDIS_MCP_API_KEY in deployment.yaml).
 

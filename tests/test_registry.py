@@ -452,6 +452,33 @@ class TestSelect:
         for name in TOOLSETS:
             assert f"'{name}'" in valid
 
+    def test_exclude_tools(self, tools):
+        names = [
+            name
+            for name, _ in _selected(
+                _config(toolsets=["core", "data"], excludeTools=["c_write", "d_read"])
+            )
+        ]
+
+        assert names == ["c_read", "c_delete", "c_optional"]
+
+    def test_exclude_a_tool_of_a_disabled_toolset(self, tools):
+        names = [name for name, _ in _selected(_config(excludeTools=["d_read"]))]
+
+        assert names == ["c_read", "c_write", "c_delete", "c_optional"]
+
+    def test_unknown_excluded_tool(self, tools):
+        config = _config(excludeTools=["c_read", "scan_all_key"])
+
+        with pytest.raises(ConfigError) as info:
+            select(config)
+        message = str(info.value)
+        unknown, _, valid = message.partition("valid")
+        assert "Unknown tool in excludeTools" in unknown
+        assert "scan_all_key" in unknown
+        assert "c_read" not in unknown
+        assert "'c_read'" in valid and "'d_read'" in valid
+
     def test_enabled_toolsets(self):
         assert enabled_toolsets(_config()) == ["core"]
         assert enabled_toolsets(_config(toolsets=["pubsub", "core"])) == [

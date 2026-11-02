@@ -755,6 +755,22 @@ class TestValidationErrors:
                 "toolsets",
                 "duplicate toolset: core, data",
             ),
+            # excludeTools
+            (
+                {"excludeTools": ["get", ""], "clusters": [cluster()]},
+                "excludeTools",
+                "the excludeTools list contains an empty value",
+            ),
+            (
+                {"excludeTools": ["get", "set", "get"], "clusters": [cluster()]},
+                "excludeTools",
+                "duplicate tool in excludeTools: get",
+            ),
+            (
+                {"excludeTools": "scan_all_keys", "clusters": [cluster()]},
+                "excludeTools",
+                "Input should be a valid list",
+            ),
             # clusters
             ({"clusters": []}, "clusters", "at least one cluster must be defined"),
             ({}, "clusters", "Field required"),
