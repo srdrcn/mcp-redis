@@ -13,7 +13,7 @@ Built with Python 3.10+ (the image uses Python 3.14), FastMCP from the MCP Pytho
 - **Many clusters, one server**: standalone servers, Redis Cluster and Sentinel-managed primaries side by side.
   Every tool that works on Redis takes a `cluster` parameter whose enum lists exactly the clusters the tool may run
   on. When only one cluster is configured, the parameter is optional.
-- **55 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
+- **58 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
 - **Read-only in the example config**: `readOnly: true` hides every write tool (one sandbox cluster opts back in),
   and `disableDestructive: true` hides the delete/pop/remove tools.
 - **Passwords stay out of the config**: each cluster's password comes from a mounted Secret file
@@ -256,7 +256,7 @@ clusters:
 | `readOnly` | boolean | `false` | `true` hides every write tool on clusters that do not override it with their own `readOnly`. |
 | `disableDestructive` | boolean | `false` | `true` hides the destructive tools (`delete`, `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy`, `json_del`) on every cluster. It is global only and does not affect the other write tools. |
 | `toolsets` | list of strings | `[core]` | Toolsets to enable, which also sets the order of `tools/list`. An unknown name stops the server at startup; an empty or duplicate entry is an invalid config. |
-| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 55 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
+| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 58 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
 | `passwordsDir` | path | `/etc/redis-mcp/passwords` | Directory of the `<name>_pass` password files (see [Passwords](#passwords)). |
 | `clusters` | list | (required) | The Redis deployments. At least one is required, and names must be unique. |
 
@@ -477,7 +477,7 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
 
 | Toolset | Tools | What it covers | Available on |
 |---|---:|---|---|
-| `core` (enabled by default) | 11 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`) and key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`) | Every cluster. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
+| `core` (enabled by default) | 14 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`), key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`) and what the Sentinels see (`sentinel_status`, `sentinel_replicas`, `sentinel_masters`) | Every cluster; the three Sentinel tools only on clusters with `mode: sentinel`. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
 | `data` | 29 | Strings, hashes (including vectors stored as binary fields), lists, sets, sorted sets, and streams with consumer groups | Every cluster |
 | `json` | 3 | RedisJSON documents: get, set and delete at a path | Clusters with `modules: [json]` |
 | `search` | 6 | Redis Query Engine: indexes, index information, indexed key count, vector index creation on hashes, vector (KNN) and hybrid search | Clusters with `modules: [search]` |
@@ -505,12 +505,38 @@ primaries while the scan pages can be missed or returned twice. On standalone an
 number Redis returns. The example config lists no `scan_all_keys` (`excludeTools`), so keys are listed page by page
 with `scan_keys`.
 
+### Sentinel tools
+
+`sentinel_status`, `sentinel_replicas` and `sentinel_masters` are listed only for clusters with `mode: sentinel`.
+They ask the cluster's Sentinels directly and never connect to the master or the replicas, so they need no master
+password: a Sentinel gets the `<name>_sentinel_pass` password if one is set (and no username), the cluster's
+`tls` settings, and 2 s per connect and per reply.
+
+- `sentinel_status` asks every Sentinel in `hosts` and then the other Sentinels they report (`SENTINEL
+  SENTINELS`, at most 8 more, marked `"source": "discovered"` with the flags they are reported with); a
+  Sentinel found under another address is recognised by its id (`SENTINEL MYID`). Each Sentinel's entry has the
+  master address it names, the master's flags, `quorum`, `ckquorum` (`SENTINEL CKQUORUM`), the other Sentinels and
+  replicas it knows, `configEpoch` (grows with every failover), the milliseconds since the master last answered
+  its ping, `downAfterMs` and `tilt`. `agreement` is `true` when every Sentinel that answered names the same
+  master, and `warnings` lists disagreement, TILT, master flags such as `s_down`/`o_down`, a failed quorum check
+  and Sentinels that did not answer. The configured Sentinels and then the discovered ones each get 5 s.
+- `sentinel_replicas` lists the replicas as the first configured Sentinel that answers sees them (`SENTINEL
+  REPLICAS`): flags, link to the master, offset and priority.
+- `sentinel_masters` lists every master that Sentinel monitors (`SENTINEL MASTERS`), with `configuredAs`: the
+  `mode: sentinel` clusters of this config that use the master through a Sentinel with the same `host:port`.
+
+The discovered Sentinels are reached at the address they announce, usually an IP: the pod needs network access
+to those addresses too, otherwise they show up with `status: error` while their peers report them healthy
+(`reportedFlags: sentinel`). Sentinels with ACLs must allow the default user `SENTINEL MASTER`, `SENTINEL
+SENTINELS`, `SENTINEL REPLICAS`, `SENTINEL MASTERS`, `SENTINEL CKQUORUM`, `SENTINEL MYID` and `INFO`.
+
 ### Which tools are listed
 
 For every tool, the server works out which clusters it may run on:
 
 1. Its toolset must be in `toolsets`.
-2. `json` and `search` tools need a cluster that lists the module in `modules`.
+2. `json` and `search` tools need a cluster that lists the module in `modules`; the Sentinel tools need a
+   cluster with `mode: sentinel`.
 3. **Write** tools (descriptions starting with `WRITE:`) need the cluster's effective `readOnly` to be `false`. The
    cluster's own `readOnly` applies if it is set, otherwise the global one does.
 4. **Destructive** tools also need `disableDestructive: false`.
@@ -523,7 +549,7 @@ cluster is rejected by schema validation (`Input should be 'cbsbxrds'`). With tw
 one cluster (a one-cluster config file or the [single-cluster mode](#single-cluster-mode)), `cluster` is optional
 and comes last, described as `Cluster name (default: the only configured cluster)`: a call without it runs on that
 cluster. `clusters_list` always takes an optional `cluster` (all clusters when omitted), and `read_messages`,
-`unsubscribe` and `search_redis_documents` take none. With the example config, 30 of the 55 tools are listed.
+`unsubscribe` and `search_redis_documents` take none. With the example config, 30 of the 58 tools are listed.
 For example:
 
 | Tool | `cluster` enum |
@@ -547,15 +573,15 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 
 | Toolset | Tools | Read | Write | Destructive |
 |---|---:|---:|---:|---:|
-| [core](#core-11-tools) | 11 | 8 | 2 | 1 |
+| [core](#core-14-tools) | 14 | 11 | 2 | 1 |
 | [data](#data-29-tools) | 29 | 10 | 11 | 8 |
 | [json](#json-3-tools) | 3 | 1 | 1 | 1 |
 | [search](#search-6-tools) | 6 | 5 | 1 | 0 |
 | [pubsub](#pubsub-5-tools) | 5 | 4 | 1 | 0 |
 | [docs](#docs-1-tool) | 1 | 1 | 0 | 0 |
-| **Total** | **55** | **29** | **16** | **10** |
+| **Total** | **58** | **32** | **16** | **10** |
 
-### core (11 tools)
+### core (14 tools)
 
 | Tool | Kind | Needs | Description |
 |---|---|---|---|
@@ -570,6 +596,9 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 | `dbsize` | read | — | Get the number of keys stored in the Redis database |
 | `info` | read | — | Get Redis server information and statistics |
 | `client_list` | read | — | Get a list of connected clients to the Redis server |
+| `sentinel_status` | read | `mode: sentinel` | Ask the Sentinels (configured and discovered) how they see the master: address, flags, quorum and quorum check, other Sentinels, replicas, config epoch, TILT, whether they agree, and warnings |
+| `sentinel_replicas` | read | `mode: sentinel` | The master's replicas as a Sentinel sees them: flags, link to the master, offset, priority |
+| `sentinel_masters` | read | `mode: sentinel` | Every master the cluster's Sentinel monitors, with the configured clusters that use each |
 
 ### data (29 tools)
 

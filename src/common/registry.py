@@ -7,6 +7,7 @@ Tools are declared with :func:`redis_tool`, which only records them. Once the co
 - write tools only on clusters with an effective ``readOnly: false``,
 - destructive tools additionally only while ``disableDestructive`` is false,
 - json/search tools only on clusters that list the module in ``modules``,
+- Sentinel tools only on clusters in mode sentinel,
 - never the tools named in ``excludeTools``.
 
 A tool with no eligible cluster left is not listed. For the others a ``cluster`` parameter is added as an enum of
@@ -79,6 +80,7 @@ class ToolSpec:
     description: str
     requires: Optional[str] = None
     cluster: ClusterParam = "required"
+    mode: Optional[str] = None
 
 
 _SPECS: Dict[str, ToolSpec] = {}
@@ -89,10 +91,12 @@ def redis_tool(
     kind: ToolKind = ToolKind.READ,
     requires: Optional[str] = None,
     cluster: ClusterParam = "required",
+    mode: Optional[str] = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declares a tool. The function is returned unchanged; its name and docstring become the tool's.
 
-    ``requires`` names a module (json, search) the cluster must list in ``modules``.
+    ``requires`` names a module (json, search) the cluster must list in ``modules``; ``mode`` restricts the tool
+    to clusters in that mode (e.g. sentinel).
     """
     if toolset not in TOOLSETS:
         raise ValueError(f"Unknown toolset: {toolset}")
@@ -109,6 +113,7 @@ def redis_tool(
             description=description,
             requires=requires,
             cluster=cluster,
+            mode=mode,
         )
         existing = _SPECS.get(spec.name)
         if existing is not None and existing.fn.__module__ != fn.__module__:
@@ -127,6 +132,8 @@ def reason_unavailable(
     config: ServerConfig, spec: ToolSpec, cluster: ClusterConfig
 ) -> Optional[str]:
     """Why the tool cannot run on this cluster; None if it can."""
+    if spec.mode and cluster.mode != spec.mode:
+        return f"cluster {cluster.name} is not in mode {spec.mode}"
     if spec.requires and spec.requires not in cluster.modules:
         return f"cluster {cluster.name} does not list the {spec.requires} module in modules"
     if spec.kind.writes and config.is_read_only(cluster):

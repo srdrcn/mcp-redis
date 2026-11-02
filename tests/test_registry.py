@@ -80,7 +80,9 @@ DESTRUCTIVE_TOOLS = {
     "xgroup_destroy",
 }
 NO_CLUSTER_TOOLS = {"search_redis_documents", "read_messages", "unsubscribe"}
-REAL_TOOL_COUNT = 55
+REAL_TOOL_COUNT = 58
+# listed only for clusters in mode sentinel
+SENTINEL_TOOLS = {"sentinel_status", "sentinel_replicas", "sentinel_masters"}
 ONLY_CLUSTER_DESCRIPTION = "Cluster name (default: the only configured cluster)"
 ALL_CLUSTERS_DESCRIPTION = "Cluster name (default: all clusters)"
 
@@ -594,10 +596,13 @@ class TestRealTools:
         } == DESTRUCTIVE_TOOLS
 
     def test_legacy_config_lists_every_tool(self, real_tools, redis_config):
+        """Every tool but the Sentinel ones: the legacy cluster is a standalone server."""
         selected = select(from_legacy(redis_config))
 
-        assert len(selected) == REAL_TOOL_COUNT
-        assert {spec.name for spec, _ in selected} == {s.name for s in real_tools}
+        assert len(selected) == REAL_TOOL_COUNT - len(SENTINEL_TOOLS)
+        assert {spec.name for spec, _ in selected} == {
+            s.name for s in real_tools
+        } - SENTINEL_TOOLS
         for spec, clusters in selected:
             assert clusters == ([] if spec.cluster == "none" else ["default"])
 
@@ -630,7 +635,34 @@ class TestRealTools:
 
         names = {spec.name for spec, _ in select(config)}
 
-        assert names == {s.name for s in real_tools} - DESTRUCTIVE_TOOLS
+        assert (
+            names == {s.name for s in real_tools} - DESTRUCTIVE_TOOLS - SENTINEL_TOOLS
+        )
+
+    def test_sentinel_tools_only_on_sentinel_clusters(self, real_tools):
+        config = _config(
+            readOnly=True,
+            clusters=[
+                _cluster("plain"),
+                _cluster("s", mode="sentinel", masterName="m"),
+            ],
+        )
+
+        selected = {spec.name: clusters for spec, clusters in select(config)}
+
+        assert {name: selected[name] for name in SENTINEL_TOOLS} == {
+            name: ["s"] for name in SENTINEL_TOOLS
+        }
+        assert selected["type"] == ["plain", "s"]
+
+    def test_mode_reason(self, real_tools):
+        config = _config(clusters=[_cluster("plain")])
+        spec = next(s for s in real_tools if s.name == "sentinel_status")
+
+        assert (
+            reason_unavailable(config, spec, config.clusters[0])
+            == "cluster plain is not in mode sentinel"
+        )
 
 
 class TestAnnotations:

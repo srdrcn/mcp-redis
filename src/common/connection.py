@@ -166,6 +166,29 @@ def client_kwargs(config: ClusterConfig, decode_responses: bool) -> Dict[str, An
     return kwargs
 
 
+def sentinel_client_kwargs(config: ClusterConfig) -> Dict[str, Any]:
+    """Connection arguments for the Sentinels of a cluster in mode sentinel: the cluster's timeouts capped at
+    SENTINEL_TIMEOUT_SECONDS, no retries, its TLS settings and the Sentinels' own password (no username)."""
+    kwargs: Dict[str, Any] = {
+        "socket_connect_timeout": min(
+            config.options.get(
+                "socket_connect_timeout", SOCKET_CONNECT_TIMEOUT_SECONDS
+            ),
+            SENTINEL_TIMEOUT_SECONDS,
+        ),
+        "socket_timeout": min(
+            config.options.get("socket_timeout", SOCKET_TIMEOUT_SECONDS),
+            SENTINEL_TIMEOUT_SECONDS,
+        ),
+        "retry": _no_retry(),
+    }
+    if config.tls is not None:
+        kwargs.update(config.tls.client_kwargs())
+    if config.sentinel_password:
+        kwargs["password"] = config.sentinel_password
+    return kwargs
+
+
 def _no_retry() -> Retry:
     """A single attempt per command. redis-py's default retries 3 times with backoff, timeouts included: a
     command that timed out (or whose connection dropped) may already have run, so a write could be applied
@@ -225,18 +248,7 @@ def create_client(
             **kwargs,
         )
     if config.mode == "sentinel":
-        sentinel_kwargs: Dict[str, Any] = {
-            "socket_connect_timeout": min(
-                kwargs["socket_connect_timeout"], SENTINEL_TIMEOUT_SECONDS
-            ),
-            "socket_timeout": min(kwargs["socket_timeout"], SENTINEL_TIMEOUT_SECONDS),
-            "retry": _no_retry(),
-        }
-        if config.tls is not None:
-            sentinel_kwargs.update(config.tls.client_kwargs())
-        if config.sentinel_password:
-            sentinel_kwargs["password"] = config.sentinel_password
-        sentinel = _Sentinel(addresses, sentinel_kwargs=sentinel_kwargs)
+        sentinel = _Sentinel(addresses, sentinel_kwargs=sentinel_client_kwargs(config))
         return sentinel.master_for(
             config.master_name, db=config.db, retry=_no_retry(), **kwargs
         )

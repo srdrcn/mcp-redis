@@ -358,6 +358,98 @@ def running_cluster(directory: Path, size: int = 3) -> Iterator[RedisClusterNode
         cluster.stop()
 
 
+@dataclass
+class SentinelServer:
+    """A redis-server in Sentinel mode."""
+
+    port: int
+    password: Optional[str]
+    process: subprocess.Popen
+    directory: Path
+
+    @property
+    def address(self) -> str:
+        return f"{HOST}:{self.port}"
+
+    def client(self, **kwargs: Any) -> redis.Redis:
+        return _client(self.port, self.password, **kwargs)
+
+    def stop(self) -> None:
+        stop(self.process)
+
+
+def start_sentinel(
+    directory: Path,
+    master: RedisServer,
+    master_name: str,
+    quorum: int = 1,
+    password: Optional[str] = None,
+) -> SentinelServer:
+    """Starts a Sentinel that monitors ``master`` as ``master_name`` (with the master's password as auth-pass);
+    ``password`` is the Sentinel's own requirepass. Waits until it answers PING."""
+    if REDIS_SERVER is None:
+        raise RuntimeError("redis-server binary not found")
+    directory.mkdir(parents=True, exist_ok=True)
+    port = free_port()
+    lines = [
+        f"port {port}",
+        f"bind {HOST}",
+        f"dir {directory}",
+        f"logfile {directory / 'sentinel.log'}",
+        f"sentinel monitor {master_name} {HOST} {master.port} {quorum}",
+        f"sentinel down-after-milliseconds {master_name} 5000",
+    ]
+    if master.password:
+        lines.append(f"sentinel auth-pass {master_name} {master.password}")
+    if password:
+        lines.append(f"requirepass {password}")
+    conf = directory / "sentinel.conf"
+    conf.write_text("\n".join(lines) + "\n")
+    process = subprocess.Popen(
+        [REDIS_SERVER, str(conf), "--sentinel"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with _processes_lock:
+        _processes.add(process)
+    sentinel = SentinelServer(port, password, process, directory)
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while time.monotonic() < deadline and process.poll() is None:
+        probe = sentinel.client(socket_connect_timeout=0.5, socket_timeout=0.5)
+        try:
+            if probe.ping():
+                return sentinel
+        except redis.RedisError:
+            pass
+        finally:
+            probe.close()
+        time.sleep(0.05)
+    stop(process)
+    raise RuntimeError(f"redis-sentinel did not start on port {port}")
+
+
+def wait_for_sentinels(sentinels: List[SentinelServer], master_name: str) -> None:
+    """Waits until every Sentinel knows all the others (they find each other through the master, every 2 s)."""
+    deadline = time.monotonic() + STARTUP_TIMEOUT * 2
+    while time.monotonic() < deadline:
+        known = []
+        for s in sentinels:
+            probe = s.client()
+            try:
+                known.append(
+                    len(probe.execute_command("SENTINEL", "SENTINELS", master_name))
+                )
+            except redis.RedisError:
+                known.append(-1)
+            finally:
+                probe.close()
+        if all(n == len(sentinels) - 1 for n in known):
+            return
+        time.sleep(0.2)
+    raise RuntimeError("the Sentinels did not discover each other")
+
+
 # How long the busy probe waits for a reply, and how many of these waits in a row must pass without one: a
 # single slow reply on a loaded machine must not pass for the hang of DEBUG SLEEP.
 PROBE_TIMEOUT = 0.25
