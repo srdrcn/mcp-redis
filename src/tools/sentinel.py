@@ -9,10 +9,10 @@ that does not answer is reported, not fatal.
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from redis import Redis
-from redis.exceptions import RedisError, ResponseError
+from redis.exceptions import ResponseError
 
 from src.common.config_loader import ClusterConfig, get_config
 from src.common.connection import (
@@ -55,31 +55,44 @@ def _ask_all(
 ) -> List[Dict[str, Any]]:
     """Runs ``ask`` on a client of every Sentinel at once and returns one result per address, in order:
     ``{"address", "status": "ok", **ask(...)}``, or ``status`` error/timeout with the error."""
-    if not addresses:
+    return _ask_targets([(config, address) for address in addresses], ask)
+
+
+def _ask_targets(
+    targets: List[Tuple[ClusterConfig, Address]],
+    ask: Callable[[Redis], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """:func:`_ask_all` for Sentinels of different clusters: each is reached with its own cluster's password
+    and TLS settings."""
+    if not targets:
         return []
 
-    def run(address: Address) -> Dict[str, Any]:
-        client = Redis(
-            host=address[0],
-            port=address[1],
-            decode_responses=True,
-            **sentinel_client_kwargs(config),
-        )
+    def run(target: Tuple[ClusterConfig, Address]) -> Dict[str, Any]:
+        config, (host, port) = target
+        client = None
         try:
+            client = Redis(
+                host=host,
+                port=port,
+                decode_responses=True,
+                **sentinel_client_kwargs(config),
+            )
             return {"status": "ok", **ask(client)}
-        except RedisError as e:
+        except Exception as e:
+            # one Sentinel's failure, whatever it is (an unresolvable name, a TLS error), is only its own row
             return {"status": "error", "error": f"{type(e).__name__}: {e}"}
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
     pool = ThreadPoolExecutor(
-        max_workers=len(addresses), thread_name_prefix="sentinel-check"
+        max_workers=len(targets), thread_name_prefix="sentinel-check"
     )
     try:
-        futures = [pool.submit(run, address) for address in addresses]
+        futures = [pool.submit(run, target) for target in targets]
         deadline = time.monotonic() + ROUND_SECONDS
         results = []
-        for address, future in zip(addresses, futures):
+        for (_, address), future in zip(targets, futures):
             try:
                 result = future.result(max(0.0, deadline - time.monotonic()))
             except FutureTimeoutError:
@@ -117,6 +130,14 @@ def _first_answer(
     return {"error": "no Sentinel answered", "unansweredSentinels": errors}
 
 
+def _myid(client: Redis) -> Optional[str]:
+    """The Sentinel's id (SENTINEL MYID), the runid its peers report it with; None before Redis 6.2."""
+    try:
+        return client.execute_command("SENTINEL", "MYID")
+    except ResponseError:
+        return None
+
+
 def _sentinel_view(master_name: str) -> Callable[[Redis], Dict[str, Any]]:
     def ask(client: Redis) -> Dict[str, Any]:
         master = _pairs(client.execute_command("SENTINEL", "MASTER", master_name))
@@ -129,13 +150,9 @@ def _sentinel_view(master_name: str) -> Callable[[Redis], Dict[str, Any]]:
         except ResponseError as e:
             # NOQUORUM / NOAUTH ... come back as errors
             quorum_check = str(e)
-        try:
-            sentinel_id = client.execute_command("SENTINEL", "MYID")
-        except ResponseError:
-            sentinel_id = None  # before Redis 6.2
         info = client.info("sentinel")
         view: Dict[str, Any] = {
-            "id": sentinel_id,
+            "id": _myid(client),
             "master": _address(master.get("ip"), master.get("port")),
             "flags": master.get("flags"),
             "quorum": _int(master.get("quorum")),
@@ -155,15 +172,19 @@ def _sentinel_view(master_name: str) -> Callable[[Redis], Dict[str, Any]]:
     return ask
 
 
+_DOWN_FLAGS = {"s_down", "o_down", "disconnected"}
+
+
 def _discovered(
     rows: List[Dict[str, Any]], known: List[Address]
-) -> Tuple[List[Address], Dict[str, str], int]:
+) -> Tuple[List[Address], Dict[str, Dict[str, str]], List[Dict[str, str]]]:
     """The Sentinels the answering ones report (SENTINEL SENTINELS) that are not already known, by id or by
-    address; the flags they are reported with; and how many were left out over MAX_DISCOVERED_SENTINELS."""
+    address, at most MAX_DISCOVERED_SENTINELS of them: those reported healthy first, since a Sentinel keeps the
+    peers it has ever seen (a replaced host stays listed as s_down). Also returns how each was reported (runid,
+    flags) and the ones left out."""
     known_ids = {row.get("id") for row in rows if row.get("id")}
     known_addresses = {_address(*a) for a in known}
-    found: List[Address] = []
-    flags: Dict[str, str] = {}
+    found: List[Tuple[Address, Dict[str, str]]] = []
     for row in rows:
         for peer in row.get("_peers", []):
             address = _address(peer.get("ip"), peer.get("port"))
@@ -175,28 +196,40 @@ def _discovered(
             known_addresses.add(address)
             if peer.get("runid"):
                 known_ids.add(peer["runid"])
-            found.append((peer["ip"], port))
-            flags[address] = peer.get("flags", "")
-    return (
-        found[:MAX_DISCOVERED_SENTINELS],
-        flags,
-        max(0, len(found) - MAX_DISCOVERED_SENTINELS),
-    )
+            found.append(
+                (
+                    (peer["ip"], port),
+                    {"runid": peer.get("runid", ""), "flags": peer.get("flags", "")},
+                )
+            )
+    # stable: the healthy ones first, each group in reply order
+    found.sort(key=lambda f: bool(set(f[1]["flags"].split(",")) & _DOWN_FLAGS))
+    reported = {_address(*address): seen for address, seen in found}
+    asked = [address for address, _ in found[:MAX_DISCOVERED_SENTINELS]]
+    left_out = [
+        {"address": _address(*address), "reportedFlags": seen["flags"]}
+        for address, seen in found[MAX_DISCOVERED_SENTINELS:]
+    ]
+    return asked, reported, left_out
 
 
 def _warnings(rows: List[Dict[str, Any]], masters: Dict[str, List[str]]) -> List[str]:
     warnings = []
-    answered = [r for r in rows if r["status"] == "ok"]
-    if not answered:
-        return ["no Sentinel answered"]
+    if not any(r["status"] == "ok" for r in rows):
+        warnings.append("no Sentinel reported the master's state")
     if len(masters) > 1:
         views = "; ".join(f"{m} ({', '.join(s)})" for m, s in masters.items())
         warnings.append(f"the Sentinels disagree on the master: {views}")
     for row in rows:
         address = row["address"]
         if row["status"] != "ok":
-            warnings.append(f"{address} did not answer ({row['status']})")
+            warnings.append(f"{address}: {row['error']}")
             continue
+        if row.get("reportedId"):
+            warnings.append(
+                f"{address} answers as Sentinel {row['id']} but was reported as {row['reportedId']}: the address"
+                " now belongs to another Sentinel, left out of the agreement"
+            )
         if row["tilt"]:
             warnings.append(
                 f"{address} is in TILT mode and does not act until it leaves it"
@@ -230,30 +263,30 @@ async def sentinel_status() -> Dict[str, Any]:
     rows = [
         {"source": "configured", **row} for row in _ask_all(config, configured, ask)
     ]
-    found, peer_flags, left_out = _discovered(rows, configured)
+    found, reported, left_out = _discovered(rows, configured)
     for row in _ask_all(config, found, ask):
-        rows.append(
-            {
-                "source": "discovered",
-                "reportedFlags": peer_flags.get(row["address"], ""),
-                **row,
-            }
-        )
+        seen = reported[row["address"]]
+        row = {"source": "discovered", "reportedFlags": seen["flags"], **row}
+        # the address was reused: whoever answers there is not the Sentinel that was reported
+        if row.get("id") and seen["runid"] and row["id"] != seen["runid"]:
+            row["reportedId"] = seen["runid"]
+        rows.append(row)
     masters: Dict[str, List[str]] = {}
     for row in rows:
         row.pop("_peers", None)
-        if row["status"] == "ok":
+        if row["status"] == "ok" and not row.get("reportedId"):
             masters.setdefault(row["master"], []).append(row["address"])
     warnings = _warnings(rows, masters)
     if left_out:
         warnings.append(
-            f"{left_out} more Sentinels were reported and not asked (at most {MAX_DISCOVERED_SENTINELS})"
+            f"{len(left_out)} more reported Sentinels were not asked (at most {MAX_DISCOVERED_SENTINELS}):"
+            " see notAsked"
         )
     # each row: address and source first
     ordered = [
         {"address": r.pop("address"), "source": r.pop("source"), **r} for r in rows
     ]
-    return {
+    result = {
         "cluster": config.name,
         "masterName": config.master_name,
         "master": next(iter(masters)) if len(masters) == 1 else None,
@@ -261,6 +294,9 @@ async def sentinel_status() -> Dict[str, Any]:
         "sentinels": ordered,
         "warnings": warnings,
     }
+    if left_out:
+        result["notAsked"] = left_out
+    return result
 
 
 @redis_tool("core", mode="sentinel")
@@ -306,37 +342,90 @@ async def sentinel_replicas() -> Dict[str, Any]:
 async def sentinel_masters() -> Dict[str, Any]:
     """List every master the Sentinels of a Sentinel cluster monitor (SENTINEL MASTERS), not only this
     cluster's. A Sentinel often monitors several masters: this shows their names (the masterName to configure),
-    addresses, flags, quorum and the replicas and Sentinels each has, and which configured clusters use them.
-    The first configured Sentinel that answers is asked.
+    addresses, flags, quorum and the replicas and Sentinels each has, and in "configuredAs" the configured
+    Sentinel clusters that use the same master through the same Sentinels (matched by Sentinel id, so a
+    Sentinel named by another host name or another member of the group still counts). The first configured
+    Sentinel that answers is asked.
 
     Returns:
         The Sentinel asked and its masters, or the errors of the Sentinels that did not answer.
     """
     config = RedisConnectionManager.cluster_config()
-    sentinel_addresses = {_address(*a) for a in config.addresses()}
-    # sentinel clusters that share a Sentinel with this one, by master name
-    configured: Dict[str, List[str]] = {}
-    for c in get_config().clusters:
-        if c.mode == "sentinel" and sentinel_addresses & {
-            _address(*a) for a in c.addresses()
-        }:
-            configured.setdefault(c.master_name, []).append(c.name)
 
     def ask(client: Redis) -> Dict[str, Any]:
+        sentinel_id = _myid(client)
         masters = []
+        groups: Dict[str, Tuple[Set[str], Set[str]]] = {}
         for reply in client.execute_command("SENTINEL", "MASTERS"):
             m = _pairs(reply)
+            name = m.get("name")
+            peers = [
+                _pairs(p) for p in client.execute_command("SENTINEL", "SENTINELS", name)
+            ]
+            # the Sentinels monitoring this master: by id, and by the addresses they are reported with
+            groups[name] = (
+                {i for i in [sentinel_id, *(p.get("runid") for p in peers)] if i},
+                {_address(p.get("ip"), p.get("port")) for p in peers},
+            )
             masters.append(
                 {
-                    "name": m.get("name"),
+                    "name": name,
                     "address": _address(m.get("ip"), m.get("port")),
                     "flags": m.get("flags"),
                     "quorum": _int(m.get("quorum")),
                     "replicas": _int(m.get("num-slaves")),
                     "otherSentinels": _int(m.get("num-other-sentinels")),
-                    "configuredAs": configured.get(m.get("name"), []),
                 }
             )
-        return {"masters": masters}
+        return {"masters": masters, "_groups": groups}
 
-    return {"cluster": config.name, **_first_answer(config, ask)}
+    answer = _first_answer(config, ask)
+    groups = answer.pop("_groups", None)
+    if groups is not None:
+        matched, unverified = _configured_as(groups, answer["sentinel"])
+        for master in answer["masters"]:
+            master["configuredAs"] = matched.get(master["name"], [])
+        if unverified:
+            answer["unverifiedClusters"] = unverified
+    return {"cluster": config.name, **answer}
+
+
+def _configured_as(
+    groups: Dict[str, Tuple[Set[str], Set[str]]], asked: str
+) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
+    """For each master name, the configured Sentinel clusters (in config order) whose Sentinels belong to the
+    group that monitors it: one of their hosts is the Sentinel asked or a reported peer, or else answers
+    SENTINEL MYID with an id of the group. Clusters none of whose Sentinels answered are returned apart."""
+    candidates = [
+        c
+        for c in get_config().clusters
+        if c.mode == "sentinel" and c.master_name in groups
+    ]
+    members: Dict[str, bool] = {}
+    pending = []
+    for c in candidates:
+        ids, addresses = groups[c.master_name]
+        if {_address(*a) for a in c.addresses()} & (addresses | {asked}):
+            members[c.name] = True
+        else:
+            pending.append(c)
+    targets = [(c, address) for c in pending for address in c.addresses()]
+    replies = iter(_ask_targets(targets, lambda client: {"id": _myid(client)}))
+    unverified = []
+    for c in pending:
+        ids, _ = groups[c.master_name]
+        rows = [next(replies) for _ in c.addresses()]
+        answered = [r for r in rows if r["status"] == "ok" and r.get("id")]
+        members[c.name] = any(r["id"] in ids for r in answered)
+        if not answered:
+            unverified.append(
+                {
+                    "cluster": c.name,
+                    "error": rows[0].get("error", "SENTINEL MYID is not supported"),
+                }
+            )
+    matched: Dict[str, List[str]] = {}
+    for c in candidates:
+        if members.get(c.name):
+            matched.setdefault(c.master_name, []).append(c.name)
+    return matched, unverified

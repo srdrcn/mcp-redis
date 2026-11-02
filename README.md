@@ -513,17 +513,24 @@ password: a Sentinel gets the `<name>_sentinel_pass` password if one is set (and
 `tls` settings, and 2 s per connect and per reply.
 
 - `sentinel_status` asks every Sentinel in `hosts` and then the other Sentinels they report (`SENTINEL
-  SENTINELS`, at most 8 more, marked `"source": "discovered"` with the flags they are reported with); a
-  Sentinel found under another address is recognised by its id (`SENTINEL MYID`). Each Sentinel's entry has the
-  master address it names, the master's flags, `quorum`, `ckquorum` (`SENTINEL CKQUORUM`), the other Sentinels and
-  replicas it knows, `configEpoch` (grows with every failover), the milliseconds since the master last answered
-  its ping, `downAfterMs` and `tilt`. `agreement` is `true` when every Sentinel that answered names the same
-  master, and `warnings` lists disagreement, TILT, master flags such as `s_down`/`o_down`, a failed quorum check
-  and Sentinels that did not answer. The configured Sentinels and then the discovered ones each get 5 s.
+  SENTINELS`, marked `"source": "discovered"` with `reportedFlags`, the flags they are reported with). A
+  reported Sentinel whose id (`SENTINEL MYID`) is that of a configured Sentinel that answered is not asked again.
+  At most 8 are asked, those not reported `s_down`/`o_down`/`disconnected` first (a Sentinel keeps every peer it
+  has ever seen, so replaced hosts stay listed as down); the others are listed in `notAsked`. Each Sentinel's
+  entry has the master address it names, the master's flags, `quorum`, `ckquorum` (`SENTINEL CKQUORUM`), the
+  other Sentinels and replicas it knows, `configEpoch` (grows with every failover), `msSinceLastOkPing`,
+  `downAfterMs` and `tilt`. `agreement` is `true` when every Sentinel that answered names the same master. A
+  discovered Sentinel that answers with another id than it was reported with (its address now belongs to
+  another Sentinel) gets `reportedId` and is left out of the agreement. `warnings` lists disagreement, TILT,
+  master flags such as `s_down`/`o_down`, a failed quorum check, reused addresses and every Sentinel that failed
+  or did not answer, with its error. The configured Sentinels and then the discovered ones each get 5 s.
 - `sentinel_replicas` lists the replicas as the first configured Sentinel that answers sees them (`SENTINEL
   REPLICAS`): flags, link to the master, offset and priority.
 - `sentinel_masters` lists every master that Sentinel monitors (`SENTINEL MASTERS`), with `configuredAs`: the
-  `mode: sentinel` clusters of this config that use the master through a Sentinel with the same `host:port`.
+  `mode: sentinel` clusters of this config with that `masterName` whose Sentinels belong to the group that
+  monitors it, by address (the Sentinel asked or one it reports) or else by id (`SENTINEL MYID`, Redis 6.2+),
+  so a cluster that names another Sentinel of the group, or the same one by another host name, counts too. A
+  cluster none of whose Sentinels answered the id check is listed in `unverifiedClusters` with the error.
 
 The discovered Sentinels are reached at the address they announce, usually an IP: the pod needs network access
 to those addresses too, otherwise they show up with `status: error` while their peers report them healthy

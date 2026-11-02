@@ -272,7 +272,19 @@ class TestSentinelStatus:
             "error": "ConnectionError: Error 111 connecting to s1:26379.",
         }
         assert result["agreement"] is True
-        assert result["warnings"] == ["s1:26379 did not answer (error)"]
+        assert result["warnings"] == [
+            "s1:26379: ConnectionError: Error 111 connecting to s1:26379."
+        ]
+
+    def test_any_failure_of_one_sentinel_is_its_own_row(self, fakes):
+        _use(_sentinel_cluster(hosts="s1:26379,s2:26379"))
+        fakes["s1:26379"] = FakeSentinel(error=UnicodeError("label too long"))
+        fakes["s2:26379"] = FakeSentinel(id="id2")
+
+        result = _call(sentinel_tools.sentinel_status)
+
+        assert result["sentinels"][0]["error"] == "UnicodeError: label too long"
+        assert result["master"] == "10.0.0.1:6379"
 
     def test_unknown_master_name(self, fakes):
         _use(_sentinel_cluster(hosts="s1:26379", master="nope"))
@@ -288,7 +300,10 @@ class TestSentinelStatus:
         )
         assert result["master"] is None
         assert result["agreement"] is False
-        assert result["warnings"] == ["no Sentinel answered"]
+        assert result["warnings"] == [
+            "no Sentinel reported the master's state",
+            "s1:26379: ResponseError: No such master with that name",
+        ]
 
     def test_a_sentinel_that_does_not_answer_in_time(self, fakes, monkeypatch):
         monkeypatch.setattr(sentinel_tools, "ROUND_SECONDS", 0.2)
@@ -303,6 +318,7 @@ class TestSentinelStatus:
         assert result["sentinels"][0]["status"] == "timeout"
         assert result["sentinels"][0]["error"] == "no answer within 0.2 s"
         assert result["sentinels"][1]["status"] == "ok"
+        assert result["warnings"] == ["s1:26379: no answer within 0.2 s"]
 
     def test_discovered_sentinels_are_capped(self, fakes, monkeypatch):
         monkeypatch.setattr(sentinel_tools, "MAX_DISCOVERED_SENTINELS", 1)
@@ -319,8 +335,63 @@ class TestSentinelStatus:
             "s1:26379",
             "10.0.0.2:26379",
         ]
+        assert result["notAsked"] == [
+            {"address": "10.0.0.3:26379", "reportedFlags": "sentinel"}
+        ]
         assert result["warnings"] == [
-            "1 more Sentinels were reported and not asked (at most 1)"
+            "1 more reported Sentinels were not asked (at most 1): see notAsked"
+        ]
+
+    def test_healthy_peers_are_asked_before_the_ones_reported_down(
+        self, fakes, monkeypatch
+    ):
+        """A Sentinel keeps every peer it has seen: replaced hosts stay listed as s_down."""
+        monkeypatch.setattr(sentinel_tools, "MAX_DISCOVERED_SENTINELS", 2)
+        _use(_sentinel_cluster(hosts="s1:26379"))
+        fakes["s1:26379"] = FakeSentinel(
+            id="id1",
+            peers=[
+                _peer("10.0.0.7", 26379, "old1", flags="s_down,sentinel,disconnected"),
+                _peer("10.0.0.8", 26379, "old2", flags="s_down,sentinel"),
+                _peer("10.0.0.2", 26379, "id2"),
+                _peer("10.0.0.3", 26379, "id3"),
+            ],
+        )
+        fakes["10.0.0.2:26379"] = FakeSentinel(id="id2")
+        fakes["10.0.0.3:26379"] = FakeSentinel(id="id3")
+
+        result = _call(sentinel_tools.sentinel_status)
+
+        assert [r["address"] for r in result["sentinels"]] == [
+            "s1:26379",
+            "10.0.0.2:26379",
+            "10.0.0.3:26379",
+        ]
+        assert result["notAsked"] == [
+            {
+                "address": "10.0.0.7:26379",
+                "reportedFlags": "s_down,sentinel,disconnected",
+            },
+            {"address": "10.0.0.8:26379", "reportedFlags": "s_down,sentinel"},
+        ]
+
+    def test_a_reused_address_is_left_out_of_the_agreement(self, fakes):
+        _use(_sentinel_cluster(hosts="s1:26379"))
+        fakes["s1:26379"] = FakeSentinel(
+            id="id1", peers=[_peer("10.0.0.2", 26379, "id2")]
+        )
+        # another Sentinel now listens at the reported address and names another master
+        fakes["10.0.0.2:26379"] = FakeSentinel(id="other", master="10.9.9.9:6379")
+
+        result = _call(sentinel_tools.sentinel_status)
+
+        row = result["sentinels"][1]
+        assert (row["id"], row["reportedId"]) == ("other", "id2")
+        assert result["agreement"] is True
+        assert result["master"] == "10.0.0.1:6379"
+        assert result["warnings"] == [
+            "10.0.0.2:26379 answers as Sentinel other but was reported as id2: the address now belongs to"
+            " another Sentinel, left out of the agreement"
         ]
 
     def test_connects_with_the_sentinel_password_and_short_timeouts(
@@ -485,6 +556,59 @@ class TestSentinelMasters:
         ]
 
 
+class TestConfiguredAs:
+    MASTERS = [
+        {
+            "name": "vpos",
+            "ip": "10.0.0.1",
+            "port": "6381",
+            "flags": "master",
+            "quorum": "2",
+            "num-slaves": "1",
+            "num-other-sentinels": "2",
+        },
+    ]
+
+    def test_another_member_of_the_group_is_matched_by_its_id(self, fakes):
+        _use(
+            _sentinel_cluster(name="s", hosts="s1:26379", master="other"),
+            # the same group through another of its Sentinels, named by host name
+            _sentinel_cluster(name="by-name", hosts="s2.example:26379", master="vpos"),
+            # a Sentinel of another group with a master of the same name
+            _sentinel_cluster(name="elsewhere", hosts="s9:26379", master="vpos"),
+            # its Sentinel does not answer
+            _sentinel_cluster(name="down", hosts="s8:26379", master="vpos"),
+        )
+        fakes["s1:26379"] = FakeSentinel(
+            id="id1", peers=[_peer("10.0.0.2", 26379, "id2")], masters=self.MASTERS
+        )
+        fakes["s2.example:26379"] = FakeSentinel(id="id2")
+        fakes["s9:26379"] = FakeSentinel(id="id9")
+        fakes["s8:26379"] = FakeSentinel(error=RedisConnectionError("refused"))
+
+        result = _call(sentinel_tools.sentinel_masters)
+
+        assert result["masters"][0]["configuredAs"] == ["by-name"]
+        assert result["unverifiedClusters"] == [
+            {"cluster": "down", "error": "ConnectionError: refused"}
+        ]
+
+    def test_without_myid_a_cluster_cannot_be_verified(self, fakes):
+        _use(
+            _sentinel_cluster(name="s", hosts="s1:26379", master="other"),
+            _sentinel_cluster(name="old", hosts="s2:26379", master="vpos"),
+        )
+        fakes["s1:26379"] = FakeSentinel(id=None, masters=self.MASTERS)
+        fakes["s2:26379"] = FakeSentinel(id=None)
+
+        result = _call(sentinel_tools.sentinel_masters)
+
+        assert result["masters"][0]["configuredAs"] == []
+        assert result["unverifiedClusters"] == [
+            {"cluster": "old", "error": "SENTINEL MYID is not supported"}
+        ]
+
+
 class TestRegistration:
     NAMES = {"sentinel_status", "sentinel_replicas", "sentinel_masters"}
 
@@ -602,7 +726,10 @@ class TestWithRealSentinels:
             assert row["otherSentinels"] == 1
             assert row["flags"] == "master"
             assert row["tilt"] is False
-            assert len(row["id"]) == 40
+            if redis_servers.server_version() >= (6, 2):
+                assert len(row["id"]) == 40
+            else:  # no SENTINEL MYID
+                assert row["id"] is None
 
     def test_status_reports_a_sentinel_that_is_down(self, sentinel_setup, real_cluster):
         master, _, sentinels, _ = sentinel_setup
@@ -615,14 +742,15 @@ class TestWithRealSentinels:
         assert (down["address"], down["status"]) == (closed, "error")
         assert down["error"].startswith("ConnectionError: ")
         assert result["master"] == master.address
-        assert result["warnings"] == [f"{closed} did not answer (error)"]
+        (warning,) = result["warnings"]
+        assert warning.startswith(f"{closed}: ConnectionError: ")
 
     def test_unknown_master_name(self, real_cluster, sentinel_setup):
         real_cluster(master_name="nope")
 
         result = _call(sentinel_tools.sentinel_status)
 
-        assert result["warnings"] == ["no Sentinel answered"]
+        assert result["warnings"][0] == "no Sentinel reported the master's state"
         assert "No such master" in result["sentinels"][0]["error"]
 
     def test_replicas(self, sentinel_setup, real_cluster):
@@ -653,6 +781,23 @@ class TestWithRealSentinels:
         assert row["name"] == MASTER
         assert row["address"] == master.address
         assert row["configuredAs"] == ["s"]
+
+    def test_masters_matches_a_cluster_by_sentinel_id(self, sentinel_setup, tmp_path):
+        """A cluster that names the other Sentinel by host name (not an address a Sentinel reports) still uses
+        the same master: SENTINEL MYID tells."""
+        if redis_servers.server_version() < (6, 2):
+            pytest.skip("SENTINEL MYID needs Redis 6.2")
+        _, _, sentinels, _ = sentinel_setup
+        _use(
+            _sentinel_cluster(name="s", hosts=sentinels[0].address),
+            _sentinel_cluster(name="t", hosts=f"localhost:{sentinels[1].port}"),
+            tmp_path=tmp_path,
+        )
+
+        result = _call(sentinel_tools.sentinel_masters)
+
+        assert result["masters"][0]["configuredAs"] == ["s", "t"]
+        assert "unverifiedClusters" not in result
 
     def test_sentinel_password(self, sentinel_setup, real_cluster):
         master, _, _, guarded = sentinel_setup
