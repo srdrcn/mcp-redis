@@ -57,14 +57,22 @@ class TestBinary:
             "head": "00 8e 41 42 ff",
         }
 
-    def test_long_values_are_cut(self):
-        value = b"\xff" + b"a" * (values.PREVIEW_BYTES + 10)
+    def test_a_binary_value_is_shown_whole(self):
+        """e.g. a 31 KB .NET BinaryFormatter session object: every byte, not a preview."""
+        value = b"\x00\x01\xff" + b"customer data " * 2500
 
         result = readable(value)
 
-        assert result["length"] == values.PREVIEW_BYTES + 11
-        assert result["truncated"] is True
-        assert result["text"] == "\\xff" + "a" * (values.PREVIEW_BYTES - 1)
+        assert result["text"] == "\x00\x01\\xff" + "customer data " * 2500
+        assert "truncated" not in result
+
+    def test_a_large_binary_value_is_not_cut(self):
+        value = b"\xff" + b"a" * (2 * 1024 * 1024)
+
+        result = readable(value)
+
+        assert result["length"] == len(value)
+        assert result["text"] == "\\xff" + "a" * (2 * 1024 * 1024)
         assert result["head"] == ("ff " + "61 " * (values.HEAD_BYTES - 1)).strip()
 
     def test_java_serialization_is_named(self):
@@ -181,7 +189,7 @@ class TestAspNetSession:
             "👨\u200d👩\u200d👧",  # zero-width joiner
             "\ufeffmerhaba",  # byte order mark
             "東京\u3000駅",  # ideographic space
-            '{"cart": "' + "ürün\u00a0" * 2000 + '"}',  # longer than the binary preview
+            '{"cart": "' + "ürün\u00a0" * 2000 + '"}',  # long, with no-break spaces
         ],
     )
     def test_any_utf8_entry_is_text(self, value):

@@ -38,7 +38,7 @@ async def zadd(
 async def zrange(key: str, start: int, end: int, with_scores: bool = False) -> str:
     """Retrieve a range of members from a Redis sorted set.
 
-    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+    Values that are not UTF-8 text are described as in get (binary, format, the value as text).
 
     Args:
         key (str): The sorted set key.

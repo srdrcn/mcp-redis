@@ -5,7 +5,7 @@ instead of a decode error. Known binary formats are recognised by their content:
 - ASP.NET Core session payloads (the ``data`` field of the hash Microsoft.Extensions.Caching.StackExchangeRedis
   writes, next to ``absexp`` and ``sldexp``) are unpacked into their entries,
 - gzip is unpacked, up to MAX_GUNZIP_BYTES per tool call (see :class:`Unpacking`),
-- Java serialization is named; its class and field names show in the text preview.
+- Java serialization is named; its class and field names show in the text.
 """
 
 import unicodedata
@@ -13,8 +13,6 @@ import uuid
 import zlib
 from typing import Any, Dict, Optional, Union
 
-# bytes of a binary value shown as text, with \\xNN for the bytes that are not UTF-8
-PREVIEW_BYTES = 4096
 # leading bytes shown in hex, to tell the format
 HEAD_BYTES = 32
 # gzip unpacked by one tool call, over all the values it returns
@@ -92,9 +90,8 @@ def _binary(value: bytes, unpacking: Optional[Unpacking]) -> Dict[str, Any]:
                 "not unpacked: not valid gzip, or over the"
                 f" {MAX_GUNZIP_BYTES // 1024} KB one call may unpack"
             )
-    result["text"] = text(value[:PREVIEW_BYTES])
-    if len(value) > PREVIEW_BYTES:
-        result["truncated"] = True
+    # the whole value, however large
+    result["text"] = text(value)
     result["head"] = value[:HEAD_BYTES].hex(" ")
     return result
 

@@ -53,9 +53,9 @@ async def set(
 async def get(key: str) -> Union[str, Dict[str, Any]]:
     """Get a Redis string value.
 
-    A value that is not UTF-8 text comes back as a description instead: binary, length, format, a text preview
-    with \\xNN for the other bytes and the leading bytes in hex. An ASP.NET Core session payload (the data field
-    of a cache hash, next to absexp and sldexp) is unpacked into its entries, and gzip is unpacked.
+    A value that is not UTF-8 text comes back as a description instead: binary, length, format, the whole value
+    as text with \\xNN for the other bytes, and the leading bytes in hex. An ASP.NET Core session payload (the
+    data field of a cache hash, next to absexp and sldexp) is unpacked into its entries, and gzip is unpacked.
 
     Args:
         key (str): The key to retrieve.

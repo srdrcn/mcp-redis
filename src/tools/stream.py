@@ -37,7 +37,7 @@ async def xadd(
 async def xrange(key: str, count: int = 1) -> str:
     """Read entries from a Redis stream.
 
-    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+    Values that are not UTF-8 text are described as in get (binary, format, the value as text).
 
     Args:
         key (str): The stream key.

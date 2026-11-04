@@ -61,7 +61,7 @@ async def rpop(name: str) -> str:
 async def lrange(name: str, start: int, stop: int) -> Union[str, List[str]]:
     """Get elements from a Redis list within a specific range.
 
-    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+    Values that are not UTF-8 text are described as in get (binary, format, the value as text).
 
     Returns:
     str: A JSON string containing the list of elements or an error message.

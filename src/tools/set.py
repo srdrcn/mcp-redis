@@ -60,7 +60,7 @@ async def srem(name: str, value: str) -> str:
 async def smembers(name: str) -> Union[str, List[Union[str, Dict[str, Any]]]]:
     """Get all members of a Redis set.
 
-    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+    Values that are not UTF-8 text are described as in get (binary, format, the value as text).
 
     Args:
         name: The Redis set key.

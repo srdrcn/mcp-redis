@@ -541,8 +541,8 @@ SENTINELS`, `SENTINEL REPLICAS`, `SENTINEL MASTERS`, `SENTINEL CKQUORUM`, `SENTI
 
 `get`, `hget`, `hgetall`, `lrange`, `smembers`, `zrange` and `xrange` read values as bytes. A UTF-8 value comes
 back as text. Any other value comes back as a description instead of a decode error: `binary: true`, `length`,
-`text` (the first 4096 bytes, with `\xNN` for the bytes that are not UTF-8; `truncated: true` when there is
-more), `head` (the first 32 bytes in hex) and, when the content is recognised, `format`:
+`text` (the whole value, with `\xNN` for the bytes that are not UTF-8), `head` (the first 32 bytes in hex) and,
+when the content is recognised, `format`:
 
 - `aspnet-core-session`: the payload an ASP.NET Core session keeps in the `data` field of the hash
   Microsoft.Extensions.Caching.StackExchangeRedis writes (next to `absexp`, the absolute expiry, and `sldexp`,
@@ -552,7 +552,7 @@ more), `head` (the first 32 bytes in hex) and, when the content is recognised, `
   readings: `{"int32": n, "text": "..."}`, or `{"int32": n}` when the bytes are not text.
 - `gzip`: unpacked into `unpacked`. One tool call unpacks at most 1 MB in total over all the values it returns
   (a list, a hash, a session's entries); a gzip value over that, or one that is not valid gzip, keeps
-  `format: gzip` with a `note` and the preview instead.
+  `format: gzip` with a `note` and its bytes in `text` instead.
 - `java-serialization`: Java's `ObjectOutputStream` format; class and field names show in `text`.
 
 `scan_keys` and `scan_all_keys` read key names as bytes too: a name that is not UTF-8 is shown with `\xNN` for
