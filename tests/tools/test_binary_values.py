@@ -41,6 +41,8 @@ def server(tmp_path_factory):
             client.zadd("zset", {BLOB: 1.5})
             client.xadd("stream", {"payload": BLOB})
             client.rpush("packed-list", PACKED, PACKED)
+            client.set(b"odd:\x8e", b"1")
+            client.set(b"odd:plain", b"1")
             client.hset("packed-hash", mapping={"a": PACKED, "b": PACKED})
         finally:
             client.close()
@@ -51,7 +53,7 @@ def server(tmp_path_factory):
 def mcp(server):
     config = parse_config(
         {
-            "toolsets": ["data"],
+            "toolsets": ["core", "data"],
             "clusters": [{"name": "local", "hosts": server.address}],
         }
     )
@@ -131,3 +133,21 @@ def test_one_call_unpacks_at_most_1_mb(mcp):
 
     fields = _call(mcp, "hgetall", name="packed-hash")
     assert sum("unpacked" in v for v in fields.values()) == 1
+
+
+def test_scan_keys_lists_a_key_name_that_is_not_utf8(mcp):
+    page = _call(mcp, "scan_keys", pattern="odd:*", count=1000)
+
+    assert sorted(page["keys"]) == ["odd:\\x8e", "odd:plain"]
+    assert page["nonUtf8Keys"] == ["odd:\\x8e"]
+    assert sorted(_call(mcp, "scan_all_keys", pattern="odd:*")) == [
+        "odd:\\x8e",
+        "odd:plain",
+    ]
+
+
+def test_scan_keys_without_odd_names_has_no_extra_field(mcp):
+    page = _call(mcp, "scan_keys", pattern="text", count=1000)
+
+    assert page["keys"] == ["text"]
+    assert "nonUtf8Keys" not in page

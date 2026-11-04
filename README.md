@@ -555,7 +555,9 @@ more), `head` (the first 32 bytes in hex) and, when the content is recognised, `
   `format: gzip` with a `note` and the preview instead.
 - `java-serialization`: Java's `ObjectOutputStream` format; class and field names show in `text`.
 
-Key names are still read as text: `scan_keys` fails on a key name that is not UTF-8.
+`scan_keys` and `scan_all_keys` read key names as bytes too: a name that is not UTF-8 is shown with `\xNN` for
+those bytes (as redis-cli shows it) and, in `scan_keys`, also listed in `nonUtf8Keys`. The other tools cannot
+read such a key by name.
 
 ### Which tools are listed
 

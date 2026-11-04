@@ -8,6 +8,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import text
 from src.common.config import MCP_DOCS_SEARCH_URL
 from src.version import __version__
 
@@ -144,30 +145,48 @@ async def scan_keys(
     On a Redis Cluster each call runs one SCAN step on every primary that has not finished (count applies to
     each of them), and the cursor is text that holds the position on each of those primaries, e.g.
     "10.0.0.1:6379=1536,10.0.0.2:6379=96": pass it back as it is.
+
+    A key name that is not UTF-8 is shown with \\xNN for those bytes and also listed in 'nonUtf8Keys'; the
+    other tools cannot read such a key by name.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         if isinstance(r, RedisCluster):
             return _scan_cluster_step(r, pattern, count, cursor)
         cursor, keys = r.scan(
             cursor=_standalone_cursor(cursor), match=pattern, count=count
         )
-
-        # Convert bytes to strings if needed
-        decoded_keys = [
-            key.decode("utf-8") if isinstance(key, bytes) else key for key in keys
-        ]
-
-        return {
-            "cursor": cursor,
-            "keys": decoded_keys,
-            "total_scanned": len(decoded_keys),
-            "scan_complete": cursor == 0,
-        }
+        return _scan_page(cursor, keys, cursor == 0)
     except _CursorError as e:
         return f"Error: {e}"
     except RedisError as e:
         return f"Error scanning keys with pattern '{pattern}': {str(e)}"
+
+
+def _scan_page(
+    cursor: Union[int, str], keys: List[Any], complete: bool
+) -> Dict[str, Any]:
+    names = [text(key) for key in keys]
+    page: Dict[str, Any] = {
+        "cursor": cursor,
+        "keys": names,
+        "total_scanned": len(names),
+        "scan_complete": complete,
+    }
+    not_utf8 = [name for key, name in zip(keys, names) if not _is_utf8(key)]
+    if not_utf8:
+        page["nonUtf8Keys"] = not_utf8
+    return page
+
+
+def _is_utf8(key: Any) -> bool:
+    if not isinstance(key, bytes):
+        return True
+    try:
+        key.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
 
 
 class _CursorError(ValueError):
@@ -227,14 +246,11 @@ def _scan_cluster_step(
         keys.extend(batch)
         if cursors[name]:
             remaining[name] = cursors[name]
-    return {
-        "cursor": ",".join(f"{name}={c}" for name, c in remaining.items()) or 0,
-        "keys": [
-            key.decode("utf-8") if isinstance(key, bytes) else key for key in keys
-        ],
-        "total_scanned": len(keys),
-        "scan_complete": not remaining,
-    }
+    return _scan_page(
+        ",".join(f"{name}={c}" for name, c in remaining.items()) or 0,
+        keys,
+        not remaining,
+    )
 
 
 @redis_tool("core")
@@ -250,6 +266,9 @@ async def scan_all_keys(
     ⚠️  WARNING: With very large datasets (millions of keys), this may consume significant memory and
     exceed the time limit of a tool call: narrow the pattern.
 
+    A key name that is not UTF-8 is shown with \\xNN for those bytes; the other tools cannot read such a key
+    by name.
+
     Args:
         pattern: Pattern to match keys against (default is "*" for all keys).
         batch_size: Number of keys to scan per iteration (default 100).
@@ -258,24 +277,16 @@ async def scan_all_keys(
         A list of all keys matching the pattern or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         if isinstance(r, RedisCluster):
             # RedisCluster.scan returns one cursor per node; scan_iter walks every primary
-            return [
-                key.decode("utf-8") if isinstance(key, bytes) else key
-                for key in r.scan_iter(match=pattern, count=batch_size)
-            ]
+            return [text(key) for key in r.scan_iter(match=pattern, count=batch_size)]
         all_keys = []
         cursor = 0
 
         while True:
             cursor, keys = r.scan(cursor=cursor, match=pattern, count=batch_size)
-
-            # Convert bytes to strings if needed and add to results
-            decoded_keys = [
-                key.decode("utf-8") if isinstance(key, bytes) else key for key in keys
-            ]
-            all_keys.extend(decoded_keys)
+            all_keys.extend(text(key) for key in keys)
 
             # Break when scan is complete (cursor returns to 0)
             if cursor == 0:
