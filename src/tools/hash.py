@@ -1,10 +1,11 @@
-from typing import List, Union, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import readable, text
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -37,8 +38,12 @@ async def hset(
 
 
 @redis_tool("data")
-async def hget(name: str, key: str) -> str:
+async def hget(name: str, key: str) -> Union[str, Dict[str, Any]]:
     """Get the value of a field in a Redis hash.
+
+    A value that is not UTF-8 text comes back as a description instead: binary, length, format, a text preview
+    with \\xNN for the other bytes and the leading bytes in hex. An ASP.NET Core session payload (the data field
+    of a cache hash, next to absexp and sldexp) is unpacked into its entries, and gzip is unpacked.
 
     Args:
         name: The Redis hash key.
@@ -48,9 +53,11 @@ async def hget(name: str, key: str) -> str:
         The field value or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         value = r.hget(name, key)
-        return value if value else f"Field '{key}' not found in hash '{name}'."
+        if value is None:
+            return f"Field '{key}' not found in hash '{name}'."
+        return readable(value)
     except RedisError as e:
         return f"Error getting field '{key}' from hash '{name}': {str(e)}"
 
@@ -79,8 +86,8 @@ async def hdel(name: str, key: str) -> str:
 
 
 @redis_tool("data")
-async def hgetall(name: str) -> dict:
-    """Get all fields and values from a Redis hash.
+async def hgetall(name: str) -> Union[str, Dict[str, Any]]:
+    """Get all fields and values from a Redis hash. Values that are not UTF-8 text are described as in hget.
 
     Args:
         name: The Redis hash key.
@@ -89,10 +96,10 @@ async def hgetall(name: str) -> dict:
         A dictionary of field-value pairs or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         hash_data = r.hgetall(name)
         return (
-            {k: v for k, v in hash_data.items()}
+            {text(k): readable(v) for k, v in hash_data.items()}
             if hash_data
             else f"Hash '{name}' is empty or does not exist."
         )

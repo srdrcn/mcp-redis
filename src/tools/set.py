@@ -1,9 +1,10 @@
-from typing import Union, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import readable
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -56,8 +57,10 @@ async def srem(name: str, value: str) -> str:
 
 
 @redis_tool("data")
-async def smembers(name: str) -> Union[str, List[str]]:
+async def smembers(name: str) -> Union[str, List[Union[str, Dict[str, Any]]]]:
     """Get all members of a Redis set.
+
+    Values that are not UTF-8 text are described as in get (binary, format, text preview).
 
     Args:
         name: The Redis set key.
@@ -66,8 +69,12 @@ async def smembers(name: str) -> Union[str, List[str]]:
         A list of values in the set or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         members = r.smembers(name)
-        return list(members) if members else f"Set '{name}' is empty or does not exist."
+        return (
+            [readable(m) for m in members]
+            if members
+            else f"Set '{name}' is empty or does not exist."
+        )
     except RedisError as e:
         return f"Error retrieving members of set '{name}': {str(e)}"

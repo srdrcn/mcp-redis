@@ -4,6 +4,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import readable, text
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -36,6 +37,8 @@ async def xadd(
 async def xrange(key: str, count: int = 1) -> str:
     """Read entries from a Redis stream.
 
+    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+
     Args:
         key (str): The stream key.
         count (int, optional): Number of entries to retrieve.
@@ -44,9 +47,16 @@ async def xrange(key: str, count: int = 1) -> str:
         str: The retrieved stream entries or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         entries = r.xrange(key, count=count)
-        return str(entries) if entries else f"Stream {key} is empty or does not exist"
+        if not entries:
+            return f"Stream {key} is empty or does not exist"
+        return str(
+            [
+                (text(entry_id), {text(k): readable(v) for k, v in fields.items()})
+                for entry_id, fields in entries
+            ]
+        )
     except RedisError as e:
         return f"Error reading from stream {key}: {str(e)}"
 

@@ -4,6 +4,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import readable
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -37,6 +38,8 @@ async def zadd(
 async def zrange(key: str, start: int, end: int, with_scores: bool = False) -> str:
     """Retrieve a range of members from a Redis sorted set.
 
+    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+
     Args:
         key (str): The sorted set key.
         start (int): The starting index.
@@ -47,11 +50,13 @@ async def zrange(key: str, start: int, end: int, with_scores: bool = False) -> s
         str: The sorted set members in the given range or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         members = r.zrange(key, start, end, withscores=with_scores)
-        return (
-            str(members) if members else f"Sorted set {key} is empty or does not exist"
-        )
+        if not members:
+            return f"Sorted set {key} is empty or does not exist"
+        if with_scores:
+            return str([(readable(member), score) for member, score in members])
+        return str([readable(member) for member in members])
     except RedisError as e:
         return f"Error retrieving sorted set {key}: {str(e)}"
 

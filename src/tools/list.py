@@ -6,6 +6,7 @@ from redis.typing import FieldT
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import readable
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -60,16 +61,18 @@ async def rpop(name: str) -> str:
 async def lrange(name: str, start: int, stop: int) -> Union[str, List[str]]:
     """Get elements from a Redis list within a specific range.
 
+    Values that are not UTF-8 text are described as in get (binary, format, text preview).
+
     Returns:
     str: A JSON string containing the list of elements or an error message.
     """
     try:
-        r = RedisConnectionManager.get_connection()
+        r = RedisConnectionManager.get_connection(decode_responses=False)
         values = r.lrange(name, start, stop)
         if not values:
             return f"List '{name}' is empty or does not exist."
         else:
-            return json.dumps(values)
+            return json.dumps([readable(v) for v in values])
     except RedisError as e:
         return f"Error retrieving values from list '{name}': {str(e)}"
 

@@ -537,6 +537,22 @@ to those addresses too, otherwise they show up with `status: error` while their 
 (`reportedFlags: sentinel`). Sentinels with ACLs must allow the default user `SENTINEL MASTER`, `SENTINEL
 SENTINELS`, `SENTINEL REPLICAS`, `SENTINEL MASTERS`, `SENTINEL CKQUORUM`, `SENTINEL MYID` and `INFO`.
 
+### Binary values
+
+`get`, `hget`, `hgetall`, `lrange`, `smembers`, `zrange` and `xrange` read values as bytes. A UTF-8 value comes
+back as text. Any other value comes back as a description instead of a decode error: `binary: true`, `length`,
+`text` (the first 4096 bytes, with `\xNN` for the bytes that are not UTF-8; `truncated: true` when there is
+more), `head` (the first 32 bytes in hex) and, when the content is recognised, `format`:
+
+- `aspnet-core-session`: the payload an ASP.NET Core session keeps in the `data` field of the hash
+  Microsoft.Extensions.Caching.StackExchangeRedis writes (next to `absexp`, the absolute expiry, and `sldexp`,
+  the sliding expiry, both in .NET ticks of 100 ns, `-1` for none). It comes back unpacked: `sessionId` and
+  `entries`, each entry as text, as `{"int32": n}` for a 4-byte number (`SetInt32`) or as a description.
+- `gzip`: unpacked into `unpacked` (up to 1 MB).
+- `java-serialization`: Java's `ObjectOutputStream` format; class and field names show in `text`.
+
+Key names are still read as text: `scan_keys` fails on a key name that is not UTF-8.
+
 ### Which tools are listed
 
 For every tool, the server works out which clusters it may run on:

@@ -1,11 +1,12 @@
 import json
-from typing import Union, Optional
+from typing import Any, Dict, Optional, Union
 
 from redis.exceptions import RedisError
 from redis import Redis
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
+from src.common.values import readable
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -49,29 +50,26 @@ async def set(
 
 
 @redis_tool("data")
-async def get(key: str) -> Union[str, bytes]:
+async def get(key: str) -> Union[str, Dict[str, Any]]:
     """Get a Redis string value.
+
+    A value that is not UTF-8 text comes back as a description instead: binary, length, format, a text preview
+    with \\xNN for the other bytes and the leading bytes in hex. An ASP.NET Core session payload (the data field
+    of a cache hash, next to absexp and sldexp) is unpacked into its entries, and gzip is unpacked.
 
     Args:
         key (str): The key to retrieve.
 
     Returns:
-        str, bytes: The stored value or an error message.
+        The stored value or an error message.
     """
     try:
-        r: Redis = RedisConnectionManager.get_connection()
+        r: Redis = RedisConnectionManager.get_connection(decode_responses=False)
         value = r.get(key)
 
         if value is None:
             return f"Key {key} does not exist"
 
-        if isinstance(value, bytes):
-            try:
-                text = value.decode("utf-8")
-                return text
-            except UnicodeDecodeError:
-                return value
-
-        return value
+        return readable(value)
     except RedisError as e:
         return f"Error retrieving key {key}: {str(e)}"
