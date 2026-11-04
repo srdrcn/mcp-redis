@@ -4,10 +4,11 @@ instead of a decode error. Known binary formats are recognised by their content:
 
 - ASP.NET Core session payloads (the ``data`` field of the hash Microsoft.Extensions.Caching.StackExchangeRedis
   writes, next to ``absexp`` and ``sldexp``) are unpacked into their entries,
-- gzip is unpacked (up to MAX_GUNZIP_BYTES),
+- gzip is unpacked, up to MAX_GUNZIP_BYTES per tool call (see :class:`Unpacking`),
 - Java serialization is named; its class and field names show in the text preview.
 """
 
+import unicodedata
 import uuid
 import zlib
 from typing import Any, Dict, Optional, Union
@@ -16,7 +17,7 @@ from typing import Any, Dict, Optional, Union
 PREVIEW_BYTES = 4096
 # leading bytes shown in hex, to tell the format
 HEAD_BYTES = 32
-# a gzip value is unpacked only up to this size
+# gzip unpacked by one tool call, over all the values it returns
 MAX_GUNZIP_BYTES = 1024 * 1024
 
 Readable = Union[str, Dict[str, Any]]
@@ -28,12 +29,25 @@ _ASPNET_REVISION = 2
 _ASPNET_HEADER = 20
 
 
-def readable(value: Union[bytes, str]) -> Readable:
+class Unpacking:
+    """What one tool call may still unpack: MAX_GUNZIP_BYTES over all its values, so a call that returns many
+    small gzip values (a list, a hash, a session's entries) cannot expand them past the pod's memory. A tool
+    that returns several values passes one instance to every :func:`readable` call."""
+
+    def __init__(self) -> None:
+        self.left = MAX_GUNZIP_BYTES
+
+
+def readable(
+    value: Union[bytes, str], unpacking: Optional[Unpacking] = None
+) -> Readable:
     """The value as text if it is UTF-8 (and not an ASP.NET Core session payload), else its description. Text
     (from a client that decodes) is returned as it is."""
     if isinstance(value, str):
         return value
-    session = _aspnet_session(value)
+    if unpacking is None:
+        unpacking = Unpacking()
+    session = _aspnet_session(value, unpacking)
     if session is not None:
         return {
             "binary": True,
@@ -44,7 +58,7 @@ def readable(value: Union[bytes, str]) -> Readable:
     try:
         return value.decode("utf-8")
     except UnicodeDecodeError:
-        return _binary(value)
+        return _binary(value, unpacking)
 
 
 def text(value: Union[bytes, str]) -> str:
@@ -54,19 +68,30 @@ def text(value: Union[bytes, str]) -> str:
     return value.decode("utf-8", "backslashreplace")
 
 
-def _binary(value: bytes, unpack: bool = True) -> Dict[str, Any]:
+def _binary(value: bytes, unpacking: Optional[Unpacking]) -> Dict[str, Any]:
+    """The description of bytes that are not UTF-8; ``unpacking`` is None inside an unpacked value."""
     result: Dict[str, Any] = {"binary": True, "length": len(value)}
     if value.startswith(_JAVA_SERIALIZATION):
         result["format"] = "java-serialization"
-    elif value.startswith(_GZIP) and unpack:
-        unpacked = _gunzip(value)
+    elif value.startswith(_GZIP):
+        result["format"] = "gzip"
+        unpacked = (
+            _gunzip(value, unpacking.left)
+            if unpacking is not None and unpacking.left > 0
+            else None
+        )
         if unpacked is not None:
-            result["format"] = "gzip"
+            unpacking.left -= len(unpacked)
             try:
                 result["unpacked"] = unpacked.decode("utf-8")
             except UnicodeDecodeError:
-                result["unpacked"] = _binary(unpacked, unpack=False)
+                result["unpacked"] = _binary(unpacked, None)
             return result
+        if unpacking is not None:
+            result["note"] = (
+                "not unpacked: not valid gzip, or over the"
+                f" {MAX_GUNZIP_BYTES // 1024} KB one call may unpack"
+            )
     result["text"] = text(value[:PREVIEW_BYTES])
     if len(value) > PREVIEW_BYTES:
         result["truncated"] = True
@@ -74,11 +99,11 @@ def _binary(value: bytes, unpack: bool = True) -> Dict[str, Any]:
     return result
 
 
-def _gunzip(value: bytes) -> Optional[bytes]:
-    """The unpacked bytes, or None if they are not gzip or larger than MAX_GUNZIP_BYTES."""
+def _gunzip(value: bytes, limit: int) -> Optional[bytes]:
+    """The unpacked bytes, or None if they are not gzip or larger than ``limit`` (> 0)."""
     unpacker = zlib.decompressobj(16 + zlib.MAX_WBITS)
     try:
-        unpacked = unpacker.decompress(value, MAX_GUNZIP_BYTES)
+        unpacked = unpacker.decompress(value, limit)
     except zlib.error:
         return None
     # larger than the limit, cut off, or followed by more data
@@ -87,7 +112,7 @@ def _gunzip(value: bytes) -> Optional[bytes]:
     return unpacked
 
 
-def _aspnet_session(value: bytes) -> Optional[Dict[str, Any]]:
+def _aspnet_session(value: bytes, unpacking: Unpacking) -> Optional[Dict[str, Any]]:
     """The entries of an ASP.NET Core session payload (Microsoft.AspNetCore.Session, revision 2): after the
     header, per entry a 2-byte key length, the UTF-8 key, a 4-byte value length and the value (lengths
     big-endian). None unless the bytes are exactly that."""
@@ -95,7 +120,7 @@ def _aspnet_session(value: bytes) -> Optional[Dict[str, Any]]:
         return None
     count = int.from_bytes(value[1:4], "big")
     position = _ASPNET_HEADER
-    entries: Dict[str, Any] = {}
+    spans: Dict[str, slice] = {}
     for _ in range(count):
         if position + 2 > len(value):
             return None
@@ -110,27 +135,38 @@ def _aspnet_session(value: bytes) -> Optional[Dict[str, Any]]:
         position += key_length
         value_length = int.from_bytes(value[position : position + 4], "big")
         position += 4
-        if position + value_length > len(value) or key in entries:
+        if position + value_length > len(value) or key in spans:
             return None
-        entries[key] = _session_value(value[position : position + value_length])
+        spans[key] = slice(position, position + value_length)
         position += value_length
     if position != len(value):
         return None
-    # .NET writes a Guid with its first three fields little-endian
+    # the entries are read only once the whole payload is known to be a session
     return {
+        # .NET writes a Guid with its first three fields little-endian
         "sessionId": str(uuid.UUID(bytes_le=bytes(value[4:_ASPNET_HEADER]))),
-        "entries": entries,
+        "entries": {
+            key: _session_value(value[span], unpacking) for key, span in spans.items()
+        },
     }
 
 
-def _session_value(value: bytes) -> Readable:
-    """A session entry: text (SetString), a 4-byte number (SetInt32, big-endian) or other bytes."""
+def _session_value(value: bytes, unpacking: Unpacking) -> Readable:
+    """A session entry. The payload does not say how an entry was written: UTF-8 is text (SetString), and a
+    4-byte entry may also be a number (SetInt32, big-endian), so it gets both readings."""
     try:
-        decoded = value.decode("utf-8")
+        decoded: Optional[str] = value.decode("utf-8")
     except UnicodeDecodeError:
         decoded = None
-    if decoded is not None and all(c.isprintable() or c in "\t\r\n" for c in decoded):
-        return decoded
     if len(value) == 4:
-        return {"int32": int.from_bytes(value, "big", signed=True)}
-    return _binary(value)
+        readings: Dict[str, Any] = {"int32": int.from_bytes(value, "big", signed=True)}
+        if decoded is not None and not _has_control_characters(decoded):
+            readings["text"] = decoded
+        return readings
+    if decoded is not None:
+        return decoded
+    return _binary(value, unpacking)
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(unicodedata.category(c) == "Cc" and c not in "\t\r\n" for c in value)

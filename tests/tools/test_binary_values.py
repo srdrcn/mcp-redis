@@ -2,6 +2,7 @@
 of each tool must accept the descriptions)."""
 
 import asyncio
+import gzip
 import json
 
 import pytest
@@ -12,6 +13,8 @@ from tests import redis_servers
 from tests.test_values import SESSION_ID, aspnet_session
 
 BLOB = b"\x00\x8e\xffabc"
+# 600 KB each when unpacked: one call may unpack 1 MB in total, so only the first of two
+PACKED = gzip.compress(b"x" * 600 * 1024)
 
 
 @pytest.fixture(scope="module")
@@ -37,6 +40,8 @@ def server(tmp_path_factory):
             client.sadd("set", BLOB)
             client.zadd("zset", {BLOB: 1.5})
             client.xadd("stream", {"payload": BLOB})
+            client.rpush("packed-list", PACKED, PACKED)
+            client.hset("packed-hash", mapping={"a": PACKED, "b": PACKED})
         finally:
             client.close()
         yield redis_server
@@ -113,3 +118,16 @@ def test_zrange_and_xrange(mcp):
     assert "1.5" in _call(mcp, "zrange", key="zset", start=0, end=-1, with_scores=True)
     entries = _call(mcp, "xrange", key="stream", count=10)
     assert "'payload': {'binary': True" in entries
+
+
+def test_one_call_unpacks_at_most_1_mb(mcp):
+    first, second = json.loads(
+        _call(mcp, "lrange", name="packed-list", start=0, stop=-1)
+    )
+
+    assert len(first["unpacked"]) == 600 * 1024
+    assert "unpacked" not in second
+    assert second["note"].startswith("not unpacked")
+
+    fields = _call(mcp, "hgetall", name="packed-hash")
+    assert sum("unpacked" in v for v in fields.values()) == 1

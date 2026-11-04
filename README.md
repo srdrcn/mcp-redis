@@ -547,8 +547,12 @@ more), `head` (the first 32 bytes in hex) and, when the content is recognised, `
 - `aspnet-core-session`: the payload an ASP.NET Core session keeps in the `data` field of the hash
   Microsoft.Extensions.Caching.StackExchangeRedis writes (next to `absexp`, the absolute expiry, and `sldexp`,
   the sliding expiry, both in .NET ticks of 100 ns, `-1` for none). It comes back unpacked: `sessionId` and
-  `entries`, each entry as text, as `{"int32": n}` for a 4-byte number (`SetInt32`) or as a description.
-- `gzip`: unpacked into `unpacked` (up to 1 MB).
+  `entries`. A UTF-8 entry is text, any other entry a description. The payload does not record how an entry
+  was written, and a 4-byte entry may be a number (`SetInt32`) as well as text, so it comes back with both
+  readings: `{"int32": n, "text": "..."}`, or `{"int32": n}` when the bytes are not text.
+- `gzip`: unpacked into `unpacked`. One tool call unpacks at most 1 MB in total over all the values it returns
+  (a list, a hash, a session's entries); a gzip value over that, or one that is not valid gzip, keeps
+  `format: gzip` with a `note` and the preview instead.
 - `java-serialization`: Java's `ObjectOutputStream` format; class and field names show in `text`.
 
 Key names are still read as text: `scan_keys` fails on a key name that is not UTF-8.

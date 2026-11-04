@@ -4,7 +4,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
-from src.common.values import readable
+from src.common.values import Unpacking, readable
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -54,9 +54,12 @@ async def zrange(key: str, start: int, end: int, with_scores: bool = False) -> s
         members = r.zrange(key, start, end, withscores=with_scores)
         if not members:
             return f"Sorted set {key} is empty or does not exist"
+        unpacking = Unpacking()
         if with_scores:
-            return str([(readable(member), score) for member, score in members])
-        return str([readable(member) for member in members])
+            return str(
+                [(readable(member, unpacking), score) for member, score in members]
+            )
+        return str([readable(member, unpacking) for member in members])
     except RedisError as e:
         return f"Error retrieving sorted set {key}: {str(e)}"
 

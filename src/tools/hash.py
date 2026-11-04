@@ -5,7 +5,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
-from src.common.values import readable, text
+from src.common.values import Unpacking, readable, text
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -98,8 +98,9 @@ async def hgetall(name: str) -> Union[str, Dict[str, Any]]:
     try:
         r = RedisConnectionManager.get_connection(decode_responses=False)
         hash_data = r.hgetall(name)
+        unpacking = Unpacking()
         return (
-            {text(k): readable(v) for k, v in hash_data.items()}
+            {text(k): readable(v, unpacking) for k, v in hash_data.items()}
             if hash_data
             else f"Hash '{name}' is empty or does not exist."
         )

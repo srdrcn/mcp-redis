@@ -4,7 +4,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
-from src.common.values import readable
+from src.common.values import Unpacking, readable
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -71,8 +71,9 @@ async def smembers(name: str) -> Union[str, List[Union[str, Dict[str, Any]]]]:
     try:
         r = RedisConnectionManager.get_connection(decode_responses=False)
         members = r.smembers(name)
+        unpacking = Unpacking()
         return (
-            [readable(m) for m in members]
+            [readable(m, unpacking) for m in members]
             if members
             else f"Set '{name}' is empty or does not exist."
         )

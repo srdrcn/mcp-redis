@@ -6,7 +6,7 @@ import uuid
 import pytest
 
 from src.common import values
-from src.common.values import readable, text
+from src.common.values import Unpacking, readable, text
 
 SESSION_ID = uuid.UUID("8e81c174-8094-fb59-2eb9-58438479aea4")
 
@@ -91,25 +91,57 @@ class TestBinary:
         assert result["format"] == "gzip"
         assert result["unpacked"]["head"] == "ff fe"
 
+    NOT_UNPACKED = (
+        "not unpacked: not valid gzip, or over the 1024 KB one call may unpack"
+    )
+
     def test_gzip_over_the_limit_is_not_unpacked(self, monkeypatch):
         monkeypatch.setattr(values, "MAX_GUNZIP_BYTES", 10)
         value = gzip.compress(b"x" * 100)
 
         result = readable(value)
 
-        assert "format" not in result
+        assert result["format"] == "gzip"
+        assert "unpacked" not in result
+        assert result["note"].startswith("not unpacked")
         assert result["head"].startswith("1f 8b")
 
     def test_gzip_followed_by_more_data_is_not_unpacked(self):
         result = readable(gzip.compress(b"x") + b"\xff more")
 
-        assert "format" not in result
+        assert result["note"] == self.NOT_UNPACKED
+        assert "unpacked" not in result
 
     def test_broken_gzip_is_described(self):
         result = readable(b"\x1f\x8b\x00\x00garbage\xff")
 
-        assert "format" not in result
+        assert result["format"] == "gzip"
+        assert result["note"] == self.NOT_UNPACKED
         assert result["head"].startswith("1f 8b")
+
+    def test_one_call_unpacks_at_most_the_limit_in_total(self, monkeypatch):
+        """Many small gzip values must not add up past the limit: a list or a hash shares one Unpacking."""
+        monkeypatch.setattr(values, "MAX_GUNZIP_BYTES", 150)
+        unpacking = Unpacking()
+        value = gzip.compress(b"x" * 100)
+
+        first = readable(value, unpacking)
+        second = readable(value, unpacking)
+
+        assert first["unpacked"] == "x" * 100
+        assert "unpacked" not in second
+        assert second["note"].startswith("not unpacked")
+        assert unpacking.left == 50
+        # a call of its own starts with the whole limit again
+        assert readable(value)["unpacked"] == "x" * 100
+
+    def test_gzip_inside_gzip_is_unpacked_once(self):
+        inner = gzip.compress(b"\xff payload")
+        result = readable(gzip.compress(inner))
+
+        assert result["unpacked"]["format"] == "gzip"
+        assert "unpacked" not in result["unpacked"]
+        assert "note" not in result["unpacked"]
 
 
 class TestAspNetSession:
@@ -119,6 +151,8 @@ class TestAspNetSession:
             ("Profile", b'{"role": "admin"}'),
             ("LoginCount", (5).to_bytes(4, "big")),
             ("Negative", (-2).to_bytes(4, "big", signed=True)),
+            ("LastSeen", (1730822480).to_bytes(4, "big")),
+            ("Year", b"2024"),
             ("Blob", b"\x00\x8e\x01\x02\x03"),
             ("Empty", b""),
         )
@@ -134,8 +168,35 @@ class TestAspNetSession:
         assert entries["Profile"] == '{"role": "admin"}'
         assert entries["LoginCount"] == {"int32": 5}
         assert entries["Negative"] == {"int32": -2}
+        # 4 bytes may be SetInt32 or a 4-byte SetString: both readings when the bytes are text
+        assert entries["LastSeen"] == {"int32": 1730822480, "text": "g*AP"}
+        assert entries["Year"] == {"int32": 842019380, "text": "2024"}
         assert entries["Blob"]["head"] == "00 8e 01 02 03"
         assert entries["Empty"] == ""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Fiyat:\u00a01.234\u00a0TL",  # no-break space
+            "👨\u200d👩\u200d👧",  # zero-width joiner
+            "\ufeffmerhaba",  # byte order mark
+            "東京\u3000駅",  # ideographic space
+            '{"cart": "' + "ürün\u00a0" * 2000 + '"}',  # longer than the binary preview
+        ],
+    )
+    def test_any_utf8_entry_is_text(self, value):
+        result = readable(aspnet_session(("Entry", value.encode())))
+
+        assert result["entries"]["Entry"] == value
+
+    def test_entries_share_the_unpack_limit(self, monkeypatch):
+        monkeypatch.setattr(values, "MAX_GUNZIP_BYTES", 150)
+        packed = gzip.compress(b"x" * 100)
+
+        entries = readable(aspnet_session(("a", packed), ("b", packed)))["entries"]
+
+        assert entries["a"]["unpacked"] == "x" * 100
+        assert "unpacked" not in entries["b"]
 
     def test_an_empty_session(self):
         result = readable(aspnet_session())

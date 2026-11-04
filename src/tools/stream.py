@@ -4,7 +4,7 @@ from redis.exceptions import RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
-from src.common.values import readable, text
+from src.common.values import Unpacking, readable, text
 
 
 @redis_tool("data", ToolKind.WRITE)
@@ -51,9 +51,13 @@ async def xrange(key: str, count: int = 1) -> str:
         entries = r.xrange(key, count=count)
         if not entries:
             return f"Stream {key} is empty or does not exist"
+        unpacking = Unpacking()
         return str(
             [
-                (text(entry_id), {text(k): readable(v) for k, v in fields.items()})
+                (
+                    text(entry_id),
+                    {text(k): readable(v, unpacking) for k, v in fields.items()},
+                )
                 for entry_id, fields in entries
             ]
         )
