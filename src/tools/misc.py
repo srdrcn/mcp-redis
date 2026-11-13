@@ -1,13 +1,14 @@
 import asyncio
 import heapq
 import re
+import socket
 import time
 from typing import Any, Dict, Optional, Union, List, Tuple
 import aiohttp
 
 from redis import Redis
 from redis.cluster import ClusterNode, RedisCluster
-from redis.exceptions import RedisError
+from redis.exceptions import AskError, RedisError
 
 from src.common.connection import RedisConnectionManager
 from src.common.registry import ToolKind, redis_tool
@@ -140,13 +141,19 @@ async def rename(old_key: str, new_key: str) -> Dict[str, Any]:
 
 @redis_tool("core")
 async def scan_keys(
-    pattern: str = "*", count: int = 100, cursor: Union[int, str] = 0
+    pattern: str = "*",
+    count: int = 100,
+    cursor: Union[int, str] = 0,
+    node: Optional[str] = None,
 ) -> Union[str, Dict[str, Any]]:
     """
     Scan keys in the Redis database using the SCAN command (non-blocking, production-safe).
 
     ⚠️  IMPORTANT: This returns PARTIAL results from one iteration. Call it again with the returned cursor
     until cursor becomes 0 (scan_complete is true) to see every matching key.
+
+    ⚠️  SCAN ONLY WHERE THE USER ASKED: the cluster they named and, on a Redis Cluster, the node they named.
+    If either is missing, ask the user; do not try the clusters or the nodes one after another.
 
     The SCAN command iterates through the keyspace in small chunks, making it safe to use
     on large databases without blocking other operations.
@@ -157,7 +164,10 @@ async def scan_keys(
         count: Hint for the number of keys to return per iteration (default 100).
                Redis may return more or fewer keys than this hint.
         cursor: 0 to start from the beginning. To continue scanning, pass the cursor value returned
-                from the previous call unchanged.
+                from the previous call unchanged, with the same node.
+        node: REQUIRED on a Redis Cluster: the one node to scan, as host:port. The keys of a Redis Cluster
+              are spread over its primaries, and a replica holds the keys of its primary. A call without it
+              is rejected with the list of the cluster's nodes. Leave it out on any other cluster.
 
     Returns:
         A dictionary containing:
@@ -165,6 +175,7 @@ async def scan_keys(
         - 'keys': List of keys found in this iteration (PARTIAL RESULTS)
         - 'total_scanned': Number of keys returned in this batch
         - 'scan_complete': Boolean indicating if scan is finished
+        - 'node': The node that was scanned (on a Redis Cluster)
         Or an error message if something goes wrong.
 
     Example usage:
@@ -172,22 +183,19 @@ async def scan_keys(
         Next call: scan_keys("user:*", cursor=1234) -> continues from where it left off
         Final call: returns cursor=0, scan_complete=True when done
 
-    On a Redis Cluster each call runs one SCAN step on every primary that has not finished (count applies to
-    each of them), and the cursor is text that holds the position on each of those primaries, e.g.
-    "10.0.0.1:6379=1536,10.0.0.2:6379=96": pass it back as it is.
-
     A key name that is not UTF-8 is shown with \\xNN for those bytes and also listed in 'nonUtf8Keys'; the
     other tools cannot read such a key by name.
     """
     try:
-        r = RedisConnectionManager.get_connection(decode_responses=False)
-        if isinstance(r, RedisCluster):
-            return _scan_cluster_step(r, pattern, count, cursor)
-        cursor, keys = r.scan(
-            cursor=_standalone_cursor(cursor, "scan_keys"), match=pattern, count=count
+        server, scanned_node = _scan_server(node)
+        cursor, keys = server.scan(
+            cursor=_cursor_number(cursor, "scan_keys"), match=pattern, count=count
         )
-        return _scan_page(cursor, keys, cursor == 0)
-    except _CursorError as e:
+        page = _scan_page(cursor, keys, cursor == 0)
+        if scanned_node:
+            page["node"] = scanned_node
+        return page
+    except (_CursorError, _NodeError) as e:
         return f"Error: {e}"
     except RedisError as e:
         return f"Error scanning keys with pattern '{pattern}': {str(e)}"
@@ -227,64 +235,113 @@ class _CursorError(ValueError):
 _CURSOR_NUMBER = re.compile(r"[0-9]{1,20}")
 
 
-def _invalid_cursor(tool: str) -> str:
-    return f"invalid cursor: pass the cursor returned by the previous {tool} call unchanged, or 0 to start"
-
-
-def _standalone_cursor(cursor: Union[int, str], tool: str) -> int:
+def _cursor_number(cursor: Union[int, str], tool: str) -> int:
+    """The SCAN cursor a call was given; ``tool`` is the scanning tool, named in the error."""
     if isinstance(cursor, int):
         return cursor
     if _CURSOR_NUMBER.fullmatch(cursor.strip()):
         return int(cursor)
-    raise _CursorError(_invalid_cursor(tool))
-
-
-def _cluster_positions(
-    r: RedisCluster, cursor: Union[int, str], tool: str
-) -> Dict[str, Tuple[ClusterNode, int]]:
-    """The primaries still to be scanned with their SCAN cursors, by node name. The cursor of a Redis Cluster
-    scan is ``name=position`` for each of them, comma-separated; a primary that finished is left out. ``tool``
-    is the scanning tool, named in the error of an invalid cursor."""
-    primaries = {
-        node.name: node for node in sorted(r.get_primaries(), key=lambda n: n.name)
-    }
-    if isinstance(cursor, int) or _CURSOR_NUMBER.fullmatch(cursor.strip()):
-        # a number other than 0 is the cursor of a standalone server, not of a Redis Cluster
-        if int(cursor) != 0:
-            raise _CursorError(_invalid_cursor(tool))
-        return {name: (node, 0) for name, node in primaries.items()}
-    positions: Dict[str, Tuple[ClusterNode, int]] = {}
-    for part in cursor.split(","):
-        name, _, position = part.strip().rpartition("=")
-        if not name or not _CURSOR_NUMBER.fullmatch(position) or name in positions:
-            raise _CursorError(_invalid_cursor(tool))
-        if name not in primaries:
-            raise _CursorError(
-                f"node {name} of the cursor is not a primary of this Redis Cluster (a failover or"
-                " resharding since the scan started?); start again with cursor 0"
-            )
-        positions[name] = (primaries[name], int(position))
-    return positions
-
-
-def _scan_cluster_step(
-    r: RedisCluster, pattern: str, count: int, cursor: Union[int, str]
-) -> Dict[str, Any]:
-    positions = _cluster_positions(r, cursor, "scan_keys")
-    keys: List[Any] = []
-    remaining: Dict[str, int] = {}
-    for name, (node, position) in positions.items():
-        cursors, batch = r.scan(
-            cursor=position, match=pattern, count=count, target_nodes=node
-        )
-        keys.extend(batch)
-        if cursors[name]:
-            remaining[name] = cursors[name]
-    return _scan_page(
-        ",".join(f"{name}={c}" for name, c in remaining.items()) or 0,
-        keys,
-        not remaining,
+    raise _CursorError(
+        f"invalid cursor: pass the cursor returned by the previous {tool} call unchanged, or 0 to start"
     )
+
+
+class _NodeError(ValueError):
+    pass
+
+
+def _scan_server(node: Optional[str]) -> Tuple[Redis, Optional[str]]:
+    """The one server a scan runs on, as a client that returns bytes: the server of a standalone or Sentinel
+    cluster or, on a Redis Cluster, the node ``node`` names (host:port), with that node's address. A scan of a
+    Redis Cluster never spreads over its nodes: the caller says which one."""
+    config = RedisConnectionManager.cluster_config()
+    r = RedisConnectionManager.get_connection(decode_responses=False)
+    named = (node or "").strip()
+    if not isinstance(r, RedisCluster):
+        if named:
+            raise _NodeError(
+                f"cluster {config.name} is not a Redis Cluster (mode {config.mode}): it has one server, so"
+                " leave node out"
+            )
+        return r, None
+    found = _cluster_node(r, named) if named else None
+    if found is None:
+        # the cluster's nodes may have changed since the client last read them
+        r.nodes_manager.initialize()
+        found = _cluster_node(r, named) if named else None
+    if found is None:
+        problem = (
+            f"node {named} is not a node of the Redis Cluster {config.name}"
+            if named
+            else f"cluster {config.name} is a Redis Cluster: node is required, the one node to scan"
+        )
+        raise _NodeError(
+            f"{problem}. Its nodes, as host:port: {_node_list(r)}. Ask the user which node to scan."
+        )
+    return r.get_redis_connection(found), found.name
+
+
+def _cluster_node(r: RedisCluster, named: str) -> Optional[ClusterNode]:
+    """The node of the Redis Cluster at ``named`` (host:port): by the address the cluster gives it, else by a
+    host name that resolves to that address (a cluster mostly names its nodes by IP address)."""
+    host, _, port = named.rpartition(":")
+    host = host.strip("[]").lower()
+    if not host or not port.isdigit():
+        return None
+    nodes = [n for n in r.get_nodes() if n.port == int(port)]
+    for candidate in nodes:
+        if candidate.host.lower() == host:
+            return candidate
+    if not nodes:
+        return None
+    try:
+        addresses = {
+            info[4][0]
+            for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        }
+    except OSError:
+        return None
+    matches = [n for n in nodes if n.host in addresses]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _node_list(r: RedisCluster) -> str:
+    """The nodes of the Redis Cluster: each primary with its replicas."""
+    replicas: Dict[str, List[str]] = {
+        n.name: [] for n in sorted(r.get_primaries(), key=lambda n: n.name)
+    }
+    seen = set()
+    # one list of nodes (the primary first) for all the slots of a range
+    for nodes in r.nodes_manager.slots_cache.values():
+        if id(nodes) not in seen:
+            seen.add(id(nodes))
+            followers = replicas.setdefault(nodes[0].name, [])
+            followers.extend(n.name for n in nodes[1:] if n.name not in followers)
+    return ", ".join(
+        f"{primary} (primary; replicas: {', '.join(sorted(names))})"
+        if names
+        else f"{primary} (primary)"
+        for primary, names in replicas.items()
+    )
+
+
+def _pipeline(server: Any, node: bool) -> Any:
+    """A pipeline whose commands run as they are sent. On a node of a Redis Cluster it starts with READONLY, so
+    that a replica answers commands on its keys instead of redirecting them to its primary."""
+    pipe = server.pipeline(transaction=False)
+    if node:
+        pipe.execute_command("READONLY")
+    return pipe
+
+
+def _replies(pipe: Any, node: bool) -> List[Any]:
+    """The replies of a _pipeline, a failed command's error in its place."""
+    replies = pipe.execute(raise_on_error=False)
+    if not node:
+        return replies
+    if isinstance(replies[0], Exception):
+        raise replies[0]
+    return replies[1:]
 
 
 @redis_tool("core")
@@ -371,24 +428,32 @@ async def memory_usage(key: str, samples: int = DEFAULT_SAMPLES) -> Dict[str, An
 
 
 def _sizes(
-    r: Union[Redis, RedisCluster], keys: List[Tuple[Any, str]], samples: int
+    r: Union[Redis, RedisCluster],
+    keys: List[Tuple[Any, str]],
+    samples: int,
+    node: bool = False,
 ) -> List[Optional[Dict[str, Any]]]:
     """For each (key, type): 'bytes' (MEMORY USAGE with ``samples``), 'estimated' if they are scaled from the
     samples, 'length' with 'lengthUnit' (left out for a type without a length command, such as a module's, and
-    for a key that holds another type by now) and 'encoding'. None for a key that is gone."""
+    for a key that holds another type by now) and 'encoding'. None for a key that is gone. ``node``: ``r`` is
+    a client of one node of a Redis Cluster (see _pipeline)."""
     sizes: List[Optional[Dict[str, Any]]] = []
     for start in range(0, len(keys), SIZES_PER_PIPELINE):
         batch = keys[start : start + SIZES_PER_PIPELINE]
-        pipe = r.pipeline(transaction=False)
+        pipe = _pipeline(r, node)
         for key, key_type in batch:
             pipe.memory_usage(key, samples=samples)
             pipe.object("ENCODING", key)
             if key_type in _LENGTHS:
                 getattr(pipe, _LENGTHS[key_type][0])(key)
-        replies = iter(pipe.execute(raise_on_error=False))
+        replies = iter(_replies(pipe, node))
         for key, key_type in batch:
             size, encoding = next(replies), next(replies)
             length = next(replies) if key_type in _LENGTHS else None
+            if any(isinstance(reply, AskError) for reply in (size, encoding, length)):
+                # a redirect: the key's slot has moved to another node
+                sizes.append(None)
+                continue
             for reply in (size, encoding):
                 if isinstance(reply, Exception):
                     raise reply
@@ -418,6 +483,7 @@ def _sizes(
 @redis_tool("core")
 async def big_keys(
     pattern: str,
+    node: Optional[str] = None,
     cursor: Union[int, str] = 0,
     top: int = 10,
     min_bytes: int = 0,
@@ -430,6 +496,9 @@ async def big_keys(
     ⚠️  A KEY PREFIX IS REQUIRED: pattern must start with one, e.g. "session:*". If the user has not named the
     prefix to measure, ask them for it before calling. Do not guess a prefix, and do not try a pattern that
     matches every key: a pattern that starts with *, ? or [ is rejected.
+
+    ⚠️  SCAN ONLY WHERE THE USER ASKED: the cluster they named and, on a Redis Cluster, the node they named.
+    If either is missing, ask the user; do not try the clusters or the nodes one after another.
 
     ⚠️  IMPORTANT: One call scans for about 5 s and returns PARTIAL results: the largest keys among those it
     scanned, and a cursor. Call it again with the returned cursor until cursor becomes 0 (scanComplete is true),
@@ -444,8 +513,12 @@ async def big_keys(
     Args:
         pattern: Pattern of the keys to measure. Required; it starts with the literal characters of a key
                  prefix and may go on with glob characters: "session:*", "user:42:*", "cache:*:html".
+        node: REQUIRED on a Redis Cluster: the one node to scan, as host:port. The keys of a Redis Cluster are
+              spread over its primaries, and a replica holds the keys of its primary, so scanning the replica
+              keeps the load off the primary. A call without it is rejected with the list of the cluster's
+              nodes. Leave it out on any other cluster.
         cursor: 0 to start from the beginning. To continue scanning, pass the cursor value returned from the
-                previous call unchanged (on a Redis Cluster it is text that holds the position on each primary).
+                previous call unchanged, with the same node.
         top: How many of the largest keys to return (default 10, at most 100).
         min_bytes: Leave out keys that take fewer bytes than this (default 0).
 
@@ -454,7 +527,8 @@ async def big_keys(
         - 'cursor': Next cursor position (0 means scan is complete)
         - 'scanComplete': Boolean indicating if scan is finished
         - 'keysScanned': Number of keys this call measured
-        - 'dbsize': Number of keys in the database, whatever the pattern
+        - 'dbsize': Number of keys on the scanned server, whatever the pattern
+        - 'node': The node that was scanned (on a Redis Cluster)
         - 'keys': The largest keys this call measured, largest first: 'key', 'type', 'bytes' (memory the key
           and its value take), 'estimated' (true when 'bytes' is an estimate: the key has more than 1000
           elements), 'length' with 'lengthUnit' (bytes of a string, fields of a hash, items of a list, members
@@ -476,41 +550,34 @@ async def big_keys(
     if min_bytes < 0:
         return "Error: min_bytes must not be negative"
     try:
-        r = RedisConnectionManager.get_connection(decode_responses=False)
-        # the server, or the primaries of a Redis Cluster, that have not finished, with their SCAN cursors
-        positions: Dict[str, Tuple[Optional[ClusterNode], int]]
-        if isinstance(r, RedisCluster):
-            positions = dict(_cluster_positions(r, cursor, "big_keys"))
-        else:
-            positions = {"": (None, _standalone_cursor(cursor, "big_keys"))}
+        server, scanned_node = _scan_server(node)
+        on_node = scanned_node is not None
+        position = _cursor_number(cursor, "big_keys")
         deadline = time.monotonic() + BIG_KEYS_SECONDS
         scanned = 0
         by_type: Dict[str, Dict[str, int]] = {}
         largest: Dict[Any, Tuple[int, str]] = {}
-        while positions:
-            # one SCAN step on each of them
-            for name, (node, position) in list(positions.items()):
-                position, keys = _scan_step(r, node, position, pattern)
-                for key, key_type, size in _measure(r, keys):
-                    scanned += 1
-                    totals = by_type.setdefault(key_type, {"keys": 0, "bytes": 0})
-                    totals["keys"] += 1
-                    totals["bytes"] += size
-                    if size >= min_bytes:
-                        largest[key] = (size, key_type)
-                largest = dict(
-                    heapq.nlargest(top, largest.items(), key=lambda item: item[1][0])
-                )
-                if position:
-                    positions[name] = (node, position)
-                else:
-                    del positions[name]
-            if time.monotonic() >= deadline:
+        while True:
+            position, keys = server.scan(
+                cursor=position, match=pattern, count=BIG_KEYS_SCAN_COUNT
+            )
+            for key, key_type, size in _measure(server, keys, on_node):
+                scanned += 1
+                totals = by_type.setdefault(key_type, {"keys": 0, "bytes": 0})
+                totals["keys"] += 1
+                totals["bytes"] += size
+                if size >= min_bytes:
+                    largest[key] = (size, key_type)
+            largest = dict(
+                heapq.nlargest(top, largest.items(), key=lambda item: item[1][0])
+            )
+            if not position or time.monotonic() >= deadline:
                 break
         # the quick estimate ranked them; now measure the few that are listed with more samples
         listed = [(key, key_type) for key, (_, key_type) in largest.items()]
+        sizes = _sizes(server, listed, DEFAULT_SAMPLES, on_node)
         entries = []
-        for (key, key_type), size in zip(listed, _sizes(r, listed, DEFAULT_SAMPLES)):
+        for (key, key_type), size in zip(listed, sizes):
             # None: gone since it was scanned
             if size is None or size["bytes"] < min_bytes:
                 continue
@@ -519,63 +586,46 @@ async def big_keys(
                 entry["nonUtf8Key"] = True
             entries.append(entry)
         entries.sort(key=lambda entry: entry["bytes"], reverse=True)
-        next_cursor: Union[int, str] = 0
-        if isinstance(r, RedisCluster):
-            next_cursor = (
-                ",".join(f"{name}={p}" for name, (_, p) in positions.items()) or 0
-            )
-        elif positions:
-            next_cursor = positions[""][1]
-        return {
-            "cursor": next_cursor,
-            "scanComplete": not positions,
+        result: Dict[str, Any] = {
+            "cursor": position,
+            "scanComplete": not position,
             "keysScanned": scanned,
-            "dbsize": r.dbsize(target_nodes=RedisCluster.PRIMARIES)
-            if isinstance(r, RedisCluster)
-            else r.dbsize(),
-            "keys": entries,
-            "byType": dict(
-                sorted(by_type.items(), key=lambda item: item[1]["bytes"], reverse=True)
-            ),
+            "dbsize": server.dbsize(),
         }
-    except _CursorError as e:
+        if on_node:
+            result["node"] = scanned_node
+        result["keys"] = entries
+        result["byType"] = dict(
+            sorted(by_type.items(), key=lambda item: item[1]["bytes"], reverse=True)
+        )
+        return result
+    except (_CursorError, _NodeError) as e:
         return f"Error: {e}"
     except RedisError as e:
         return f"Error measuring keys with pattern '{pattern}': {str(e)}"
 
 
-def _scan_step(
-    r: Union[Redis, RedisCluster],
-    node: Optional[ClusterNode],
-    position: int,
-    pattern: str,
-) -> Tuple[int, List[Any]]:
-    """One SCAN step on the server, or on ``node`` of a Redis Cluster: the next cursor and the keys."""
-    if node is None:
-        return r.scan(cursor=position, match=pattern, count=BIG_KEYS_SCAN_COUNT)
-    cursors, keys = r.scan(
-        cursor=position, match=pattern, count=BIG_KEYS_SCAN_COUNT, target_nodes=node
-    )
-    return cursors[node.name], keys
-
-
-def _measure(
-    r: Union[Redis, RedisCluster], keys: List[Any]
-) -> List[Tuple[Any, str, int]]:
-    """(key, type, bytes) of the keys that still exist."""
+def _measure(server: Redis, keys: List[Any], node: bool) -> List[Tuple[Any, str, int]]:
+    """(key, type, bytes) of the keys that are still on the server; ``node``: see _pipeline."""
     if not keys:
         return []
-    pipe = r.pipeline(transaction=False)
+    pipe = _pipeline(server, node)
     for key in keys:
         pipe.type(key)
         pipe.memory_usage(key, samples=SCAN_SAMPLES)
-    replies = pipe.execute()
-    return [
-        (key, text(key_type), size)
-        for key, key_type, size in zip(keys, replies[::2], replies[1::2])
+    replies = _replies(pipe, node)
+    measured = []
+    for key, key_type, size in zip(keys, replies[::2], replies[1::2]):
+        # a redirect: the key's slot has moved to another node since SCAN returned it
+        if isinstance(key_type, AskError) or isinstance(size, AskError):
+            continue
+        for reply in (key_type, size):
+            if isinstance(reply, Exception):
+                raise reply
         # None: expired or deleted since SCAN returned it
-        if size is not None
-    ]
+        if size is not None:
+            measured.append((key, text(key_type), size))
+    return measured
 
 
 @redis_tool("docs", cluster="none")

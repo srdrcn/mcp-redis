@@ -356,8 +356,11 @@ CLUSTER_KEYS = 90
 
 @pytest.fixture(scope="module")
 def redis_cluster(tmp_path_factory):
+    """Three primaries with a replica each."""
     redis_servers.skip_unless_installed(cluster=True)
-    with redis_servers.running_cluster(tmp_path_factory.mktemp("sizes-rc")) as nodes:
+    with redis_servers.running_cluster(
+        tmp_path_factory.mktemp("sizes-rc"), replicas=1
+    ) as nodes:
         client = nodes.client()
         try:
             for i in range(CLUSTER_KEYS - 2):
@@ -366,18 +369,39 @@ def redis_cluster(tmp_path_factory):
             client.hset("big:hash", mapping={f"f{i}": "v" * 20 for i in range(2000)})
         finally:
             client.close()
+        nodes.wait_for_replicas()
         yield nodes
 
 
 @pytest.fixture
 def cluster_mcp(redis_cluster):
+    # two of the six nodes as startup nodes: the client discovers the others
     return _server(
-        [{"name": "rc", "mode": "cluster", "hosts": redis_cluster.addresses}]
+        [{"name": "rc", "mode": "cluster", "hosts": redis_cluster.addresses[:2]}]
     )
 
 
+@pytest.fixture
+def primaries(redis_cluster):
+    return [node.address for node in redis_cluster.roles()["master"]]
+
+
+@pytest.fixture
+def replicas(redis_cluster):
+    return [node.address for node in redis_cluster.roles()["slave"]]
+
+
+def _keys_of(node_address):
+    """The keys a node holds, read from the node itself (a replica answers KEYS without READONLY)."""
+    client = redis_servers._client(int(node_address.rpartition(":")[2]), None)
+    try:
+        return sorted(client.keys("*"))
+    finally:
+        client.close()
+
+
 def test_memory_usage_on_a_redis_cluster(cluster_mcp, redis_cluster):
-    """Each key is measured on the node of its slot."""
+    """One key needs no node: it is measured on the node of its slot."""
     keys = ["big:string", "big:hash", *(f"small:{i}" for i in range(20))]
     assert len({redis_cluster.node_for_key(key).port for key in keys}) == 3
 
@@ -392,38 +416,179 @@ def test_memory_usage_on_a_redis_cluster(cluster_mcp, redis_cluster):
     }
 
 
-def test_big_keys_on_a_redis_cluster_measures_every_primary(cluster_mcp, redis_cluster):
-    small = [f"small:{i}" for i in range(CLUSTER_KEYS - 2)]
-    assert len({redis_cluster.node_for_key(key).port for key in small}) == 3
+@pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
+def test_a_scan_of_a_redis_cluster_needs_a_node(cluster_mcp, primaries, replicas, tool):
+    """Without a node nothing is scanned, and the error lists every node with its role."""
+    result = _call(cluster_mcp, tool, pattern="small:*")
 
-    result = _call(cluster_mcp, "big_keys", pattern="small:*", top=100)
-    big = _call(cluster_mcp, "big_keys", pattern="big:*")
+    assert result.startswith(
+        "Error: cluster rc is a Redis Cluster: node is required, the one node to scan. Its nodes, as"
+        " host:port: "
+    )
+    assert result.endswith(". Ask the user which node to scan.")
+    for primary in primaries:
+        assert f"{primary} (primary; replicas: " in result
+    assert all(replica in result for replica in replicas)
+    # node is optional in the schema: the other modes take none
+    (listed,) = [t for t in asyncio.run(cluster_mcp.list_tools()) if t.name == tool]
+    assert "node" not in listed.inputSchema.get("required", [])
 
-    assert (result["cursor"], result["scanComplete"]) == (0, True)
-    assert result["keysScanned"] == CLUSTER_KEYS - 2
-    assert result["dbsize"] == CLUSTER_KEYS
-    assert sorted(entry["key"] for entry in result["keys"]) == sorted(small)
-    assert result["byType"] == {
-        "string": {
-            "keys": CLUSTER_KEYS - 2,
-            "bytes": sum(entry["bytes"] for entry in result["keys"]),
-        }
-    }
-    assert [(e["key"], e["length"]) for e in big["keys"]] == [
-        ("big:string", 300_000),
+
+@pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
+def test_a_scan_rejects_a_node_the_redis_cluster_does_not_have(cluster_mcp, tool):
+    result = _call(cluster_mcp, tool, pattern="small:*", node="127.0.0.1:1")
+
+    assert result.startswith(
+        "Error: node 127.0.0.1:1 is not a node of the Redis Cluster rc. Its nodes, as host:port: "
+    )
+
+
+@pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
+def test_a_scan_rejects_a_node_on_a_standalone_cluster(mcp, server, tool):
+    result = _call(mcp, tool, pattern="small:*", node=server.address)
+
+    assert result == (
+        "Error: cluster local is not a Redis Cluster (mode standalone): it has one server, so leave node out"
+    )
+
+
+def test_big_keys_on_a_redis_cluster_measures_only_the_named_node(
+    cluster_mcp, primaries
+):
+    """Each primary holds its own share of the keys; together they hold all of them."""
+    measured = {}
+    for primary in primaries:
+        result = _call(
+            cluster_mcp, "big_keys", pattern="small:*", node=primary, top=100
+        )
+        own = [key for key in _keys_of(primary) if key.startswith("small:")]
+
+        assert (result["cursor"], result["scanComplete"]) == (0, True)
+        assert result["node"] == primary
+        assert sorted(entry["key"] for entry in result["keys"]) == own
+        assert result["keysScanned"] == len(own) > 0
+        assert result["dbsize"] == len(_keys_of(primary))
+        measured[primary] = set(own)
+
+    assert sum(len(keys) for keys in measured.values()) == CLUSTER_KEYS - 2
+    assert len(set.union(*measured.values())) == CLUSTER_KEYS - 2
+
+
+def test_big_keys_on_a_replica_measures_the_keys_of_its_primary(
+    cluster_mcp, primaries, replicas
+):
+    """The replica answers the commands on its keys (READONLY) instead of redirecting them to the primary."""
+    primary_of = {tuple(_keys_of(primary)): primary for primary in primaries}
+    for replica in replicas:
+        primary = primary_of[tuple(_keys_of(replica))]
+
+        on_replica = _call(
+            cluster_mcp, "big_keys", pattern="small:*", node=replica, top=100
+        )
+        on_primary = _call(
+            cluster_mcp, "big_keys", pattern="small:*", node=primary, top=100
+        )
+
+        assert on_replica["node"] == replica
+        assert on_replica["scanComplete"] is True
+        assert on_replica["keysScanned"] == on_primary["keysScanned"] > 0
+        assert sorted(e["key"] for e in on_replica["keys"]) == sorted(
+            e["key"] for e in on_primary["keys"]
+        )
+        assert on_replica["dbsize"] == on_primary["dbsize"]
+
+    big = [
+        entry
+        for replica in replicas
+        for entry in _call(cluster_mcp, "big_keys", pattern="big:*", node=replica)[
+            "keys"
+        ]
+    ]
+    assert sorted((e["key"], e["length"]) for e in big) == [
         ("big:hash", 2000),
+        ("big:string", 300_000),
     ]
 
 
-def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(cluster_mcp, short_calls):
-    pages = _all_pages(cluster_mcp, pattern="small:*", top=1)
+def test_the_readme_acl_user_can_scan_a_replica(redis_cluster, replicas, monkeypatch):
+    """mcp-reader may send READONLY (+@connection), so a replica answers its TYPE and MEMORY USAGE."""
+    if redis_servers.server_version() < (7, 0):
+        pytest.skip("the ACL rules of the README are checked on Redis 7.0 and later")
+    rule = [
+        ">pw" if part == ">REPLACE_ME" else part
+        for part in _readme_acl_rule("mcp-reader")
+    ]
+    # ACL users are per node
+    for node in redis_cluster.nodes:
+        client = node.client()
+        try:
+            client.execute_command(*rule)
+        finally:
+            client.close()
+    monkeypatch.setenv("rc-reader_pass", "pw")
+    mcp = _server(
+        [
+            {
+                "name": "rc-reader",
+                "mode": "cluster",
+                "hosts": redis_cluster.addresses,
+                "username": "mcp-reader",
+            }
+        ]
+    )
+
+    scan = _call(mcp, "big_keys", pattern="small:*", node=replicas[0], top=100)
+    page = _call(mcp, "scan_keys", pattern="small:*", node=replicas[0], count=1000)
+
+    own = [key for key in _keys_of(replicas[0]) if key.startswith("small:")]
+    assert scan["node"] == page["node"] == replicas[0]
+    assert sorted(entry["key"] for entry in scan["keys"]) == own
+    assert own and scan["keysScanned"] == len(own)
+
+
+def test_scans_accept_a_host_name_for_a_node(cluster_mcp, primaries):
+    """The cluster names its nodes by IP address (127.0.0.1); localhost resolves to it."""
+    port = primaries[0].rpartition(":")[2]
+
+    page = _call(cluster_mcp, "scan_keys", pattern="small:*", node=f"localhost:{port}")
+    sizes = _call(cluster_mcp, "big_keys", pattern="small:*", node=f"LOCALHOST:{port}")
+
+    assert page["node"] == sizes["node"] == primaries[0]
+
+
+def test_scan_keys_on_a_redis_cluster_pages_through_one_node(cluster_mcp, replicas):
+    replica = replicas[0]
+    seen, cursor = [], 0
+    for _ in range(500):
+        page = _call(
+            cluster_mcp, "scan_keys", pattern="*", count=5, cursor=cursor, node=replica
+        )
+        assert isinstance(page, dict), page
+        assert page["node"] == replica
+        seen.extend(page["keys"])
+        cursor = page["cursor"]
+        assert isinstance(cursor, int)
+        if page["scan_complete"]:
+            break
+    else:
+        raise AssertionError("scan_keys did not finish")
+
+    assert sorted(seen) == _keys_of(replica)
+    assert 0 < len(seen) < CLUSTER_KEYS
+
+
+def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(
+    cluster_mcp, primaries, short_calls
+):
+    primary = primaries[0]
+    own = [key for key in _keys_of(primary) if key.startswith("small:")]
+
+    pages = _all_pages(cluster_mcp, pattern="small:*", node=primary, top=1)
 
     assert len(pages) > 1
-    # text that holds the position of every primary that has not finished
-    assert all(
-        isinstance(page["cursor"], str) and "=" in page["cursor"] for page in pages[:-1]
-    )
+    assert all(isinstance(page["cursor"], int) for page in pages)
     assert pages[-1]["cursor"] == 0
-    assert sum(page["keysScanned"] for page in pages) == CLUSTER_KEYS - 2
+    assert all(page["node"] == primary for page in pages)
+    assert sum(page["keysScanned"] for page in pages) == len(own)
     listed = [entry["key"] for page in pages for entry in page["keys"]]
-    assert listed and all(key.startswith("small:") for key in listed)
+    assert listed and set(listed) <= set(own)

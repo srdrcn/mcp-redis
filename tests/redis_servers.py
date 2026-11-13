@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import pytest
 import redis
@@ -254,9 +254,11 @@ def running(directory: Path, password: Optional[str] = None) -> Iterator[RedisSe
 
 @dataclass
 class RedisClusterNodes:
-    """The primaries of a Redis Cluster (no replicas)."""
+    """The nodes of a Redis Cluster: its primaries and, when it was started with replicas, ``replicas`` replicas
+    of each."""
 
     nodes: List[RedisServer] = field(default_factory=list)
+    replicas: int = 0
 
     @property
     def addresses(self) -> List[str]:
@@ -292,6 +294,46 @@ class RedisClusterNodes:
             probe.close()
         raise LookupError(f"no node serves the slot of {key}")
 
+    def roles(self) -> Dict[str, List[RedisServer]]:
+        """The nodes by what INFO replication says they are now: "master" or "slave"."""
+        by_role: Dict[str, List[RedisServer]] = {"master": [], "slave": []}
+        for node in self.nodes:
+            probe = node.client()
+            try:
+                by_role[probe.info("replication")["role"]].append(node)
+            finally:
+                probe.close()
+        return by_role
+
+    def wait_for_replicas(self, timeout: float = 30) -> None:
+        """Waits until the replicas hold the keys of their primaries and CLUSTER SLOTS lists them. A replica
+        that has replicated nothing yet is left out of CLUSTER SLOTS, so call this after the first writes."""
+        deadline = time.monotonic() + timeout
+        while True:
+            probe = self.nodes[0].client()
+            try:
+                listed = all(
+                    len(entry) - 3 >= self.replicas
+                    for entry in probe.execute_command("CLUSTER SLOTS")
+                )
+            finally:
+                probe.close()
+            keys = {role: 0 for role in ("master", "slave")}
+            for role, nodes in self.roles().items():
+                for node in nodes:
+                    probe = node.client()
+                    try:
+                        keys[role] += probe.dbsize()
+                    finally:
+                        probe.close()
+            if listed and keys["slave"] == keys["master"] * self.replicas:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"the replicas did not catch up (listed: {listed}, keys: {keys})"
+                )
+            time.sleep(0.1)
+
     def stop(self) -> None:
         for node in self.nodes:
             node.stop()
@@ -315,18 +357,28 @@ def _cluster_is_ready(nodes: List[RedisServer]) -> bool:
     return True
 
 
-def start_cluster(directory: Path, size: int = 3) -> RedisClusterNodes:
-    """Starts ``size`` cluster-enabled servers, joins them into a cluster with ``redis-cli --cluster create``
-    and waits until every node reports cluster_state:ok. Stop it with ``.stop()`` (or use
-    :func:`running_cluster`)."""
+def start_cluster(
+    directory: Path, size: int = 3, replicas: int = 0
+) -> RedisClusterNodes:
+    """Starts cluster-enabled servers, joins them into a cluster of ``size`` primaries with ``replicas``
+    replicas each (``redis-cli --cluster create``) and waits until every node reports cluster_state:ok. Stop
+    it with ``.stop()`` (or use :func:`running_cluster`)."""
     if REDIS_CLI is None:
         raise RuntimeError("redis-cli binary not found")
-    cluster = RedisClusterNodes()
+    cluster = RedisClusterNodes(replicas=replicas)
     try:
-        for i in range(size):
+        for i in range(size * (1 + replicas)):
             cluster.nodes.append(start(directory / f"node{i}", cluster_enabled=True))
         created = subprocess.run(
-            [REDIS_CLI, "--cluster", "create", *cluster.addresses, "--cluster-yes"],
+            [
+                REDIS_CLI,
+                "--cluster",
+                "create",
+                *cluster.addresses,
+                "--cluster-replicas",
+                str(replicas),
+                "--cluster-yes",
+            ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -349,9 +401,11 @@ def start_cluster(directory: Path, size: int = 3) -> RedisClusterNodes:
 
 
 @contextmanager
-def running_cluster(directory: Path, size: int = 3) -> Iterator[RedisClusterNodes]:
-    """A Redis Cluster of ``size`` primaries for the duration of the block."""
-    cluster = start_cluster(directory, size)
+def running_cluster(
+    directory: Path, size: int = 3, replicas: int = 0
+) -> Iterator[RedisClusterNodes]:
+    """A Redis Cluster of ``size`` primaries, each with ``replicas`` replicas, for the duration of the block."""
+    cluster = start_cluster(directory, size, replicas)
     try:
         yield cluster
     finally:

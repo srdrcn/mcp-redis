@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 import pytest
 from redis import Redis
 from redis.cluster import RedisCluster
-from redis.exceptions import RedisError
+from redis.exceptions import MovedError, RedisError
 
 import src.tools.misc as misc
 
@@ -304,179 +304,228 @@ async def test_search_redis_documents_timeout(monkeypatch):
     )
 
 
-def _primaries(cluster, steps):
-    """Primaries n1:7000 and n2:7001 (listed out of order); ``steps`` maps a node name to the (cursor, keys) its
-    SCAN steps return, in order."""
-    nodes = {}
-    for name in ("n2:7001", "n1:7000"):
-        node = Mock()
-        node.name = name
-        nodes[name] = node
-    cluster.get_primaries.return_value = list(nodes.values())
-    remaining = {name: list(results) for name, results in steps.items()}
-
-    def scan(cursor, match, count, target_nodes):
-        next_cursor, keys = remaining[target_nodes.name].pop(0)
-        return {target_nodes.name: next_cursor}, keys
-
-    cluster.scan.side_effect = scan
-    return nodes
+def _cluster_node(name, role="primary"):
+    host, _, port = name.rpartition(":")
+    node = Mock()
+    node.name, node.host, node.port, node.server_type = name, host, int(port), role
+    return node
 
 
-def _scan_calls(cluster):
-    return [
-        (c.kwargs["target_nodes"].name, c.kwargs["cursor"], c.kwargs["count"])
-        for c in cluster.scan.call_args_list
-    ]
+P1, P2, R1 = "10.0.0.1:6500", "10.0.0.2:6500", "10.0.0.3:6501"
+NODE_LIST = (
+    "Its nodes, as host:port: 10.0.0.1:6500 (primary; replicas: 10.0.0.3:6501), 10.0.0.2:6500 (primary)."
+    " Ask the user which node to scan."
+)
+
+
+def _nodes(cluster):
+    """Makes the Redis Cluster mock one of two primaries, P1 and P2, and R1, a replica of P1. Returns the
+    client mock of each node by its address; ``get_connection`` hands out the cluster mock itself."""
+    nodes = {
+        P1: _cluster_node(P1),
+        P2: _cluster_node(P2),
+        R1: _cluster_node(R1, "replica"),
+    }
+    clients = {name: Mock(spec=Redis) for name in nodes}
+    first, second = [nodes[P1], nodes[R1]], [nodes[P2]]
+    cluster.get_nodes.return_value = list(nodes.values())
+    cluster.get_primaries.return_value = [nodes[P2], nodes[P1]]
+    # one list of nodes for all the slots of a range, as redis-py keeps them
+    cluster.nodes_manager = Mock(slots_cache={0: first, 1: first, 2: second})
+    cluster.get_redis_connection.side_effect = lambda node: clients[node.name]
+    return clients
 
 
 @pytest.mark.asyncio
-async def test_scan_keys_on_a_redis_cluster_reports_completion(mock_redis_cluster):
-    """One SCAN step on every primary; the scan is complete when every node is back at 0."""
-    _primaries(
-        mock_redis_cluster,
-        {"n1:7000": [(0, [b"user:1"])], "n2:7001": [(0, ["user:2"])]},
-    )
+@pytest.mark.parametrize("node", [None, "", "  "])
+async def test_scan_keys_on_a_redis_cluster_needs_a_node(mock_redis_cluster, node):
+    """A scan of a Redis Cluster runs on the one node the caller names, never on all of them."""
+    clients = _nodes(mock_redis_cluster)
 
-    result = await misc.scan_keys("user:*", count=50)
+    result = await misc.scan_keys("user:*", node=node)
+
+    assert result == (
+        "Error: cluster default is a Redis Cluster: node is required, the one node to scan. "
+        + NODE_LIST
+    )
+    for client in clients.values():
+        client.scan.assert_not_called()
+    mock_redis_cluster.scan.assert_not_called()
+    mock_redis_cluster.scan_iter.assert_not_called()
+    # the list is read again from the cluster, not taken from what the client knew
+    mock_redis_cluster.nodes_manager.initialize.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("node", [P1, R1, f" {P2} ", "10.0.0.2:6500"])
+async def test_scan_keys_on_a_redis_cluster_scans_the_named_node(
+    mock_redis_cluster, node
+):
+    """A primary or a replica: the SCAN goes to that node's own client, and to no other."""
+    clients = _nodes(mock_redis_cluster)
+    name = node.strip()
+    clients[name].scan.return_value = (12, [b"user:1", "user:2"])
+
+    result = await misc.scan_keys("user:*", count=50, node=node)
 
     assert result == {
-        "cursor": 0,
+        "cursor": 12,
         "keys": ["user:1", "user:2"],
         "total_scanned": 2,
-        "scan_complete": True,
+        "scan_complete": False,
+        "node": name,
     }
-    assert _scan_calls(mock_redis_cluster) == [("n1:7000", 0, 50), ("n2:7001", 0, 50)]
-    assert all(
-        c.kwargs["match"] == "user:*" for c in mock_redis_cluster.scan.call_args_list
-    )
+    clients[name].scan.assert_called_once_with(cursor=0, match="user:*", count=50)
+    for other, client in clients.items():
+        if other != name:
+            client.scan.assert_not_called()
+    mock_redis_cluster.scan.assert_not_called()
+    mock_redis_cluster.nodes_manager.initialize.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_scan_keys_on_a_redis_cluster_pages_with_the_cursor(mock_redis_cluster):
-    """The cursor holds the position of every primary that has not finished; passing it back continues
-    those primaries only."""
-    _primaries(
-        mock_redis_cluster,
-        {
-            "n1:7000": [(12, ["a:1"]), (40, ["a:2"]), (0, ["a:3"])],
-            "n2:7001": [(0, ["b:1"])],
-        },
-    )
+    """The cursor is the node's own SCAN cursor: a number, as on any other server."""
+    clients = _nodes(mock_redis_cluster)
+    clients[P1].scan.side_effect = [(12, ["a:1"]), (0, ["a:2"])]
 
-    first = await misc.scan_keys("*", count=10)
-    second = await misc.scan_keys("*", count=10, cursor=first["cursor"])
-    last = await misc.scan_keys("*", count=10, cursor=second["cursor"])
+    first = await misc.scan_keys("*", count=10, node=P1)
+    last = await misc.scan_keys("*", count=10, node=P1, cursor=str(first["cursor"]))
 
-    assert first == {
-        "cursor": "n1:7000=12",
-        "keys": ["a:1", "b:1"],
-        "total_scanned": 2,
-        "scan_complete": False,
-    }
-    assert second["cursor"] == "n1:7000=40"
-    assert second["keys"] == ["a:2"]
+    assert (first["cursor"], first["scan_complete"]) == (12, False)
     assert last == {
         "cursor": 0,
-        "keys": ["a:3"],
+        "keys": ["a:2"],
         "total_scanned": 1,
         "scan_complete": True,
+        "node": P1,
     }
-    assert _scan_calls(mock_redis_cluster) == [
-        ("n1:7000", 0, 10),
-        ("n2:7001", 0, 10),
-        ("n1:7000", 12, 10),
-        ("n1:7000", 40, 10),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_scan_keys_on_a_redis_cluster_continues_every_listed_node(
-    mock_redis_cluster,
-):
-    _primaries(
-        mock_redis_cluster,
-        {"n1:7000": [(0, ["a"])], "n2:7001": [(9, ["b"])]},
-    )
-
-    result = await misc.scan_keys("*", cursor=" n2:7001=5 , n1:7000=3 ")
-
-    assert result["cursor"] == "n2:7001=9"
-    assert result["keys"] == ["b", "a"]
-    assert _scan_calls(mock_redis_cluster) == [("n2:7001", 5, 100), ("n1:7000", 3, 100)]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cursor", [0, "0", " 0 "])
-async def test_scan_keys_on_a_redis_cluster_starts_at_zero(mock_redis_cluster, cursor):
-    _primaries(
-        mock_redis_cluster,
-        {"n1:7000": [(0, [])], "n2:7001": [(0, [])]},
-    )
-
-    result = await misc.scan_keys("*", cursor=cursor)
-
-    assert result["scan_complete"] is True
-    assert [name for name, _, _ in _scan_calls(mock_redis_cluster)] == [
-        "n1:7000",
-        "n2:7001",
-    ]
+    assert [c.kwargs["cursor"] for c in clients[P1].scan.call_args_list] == [0, 12]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "cursor",
-    [
-        12,
-        "12",
-        "",
-        "n1:7000",
-        "n1:7000=",
-        "=12",
-        "n1:7000=abc",
-        "n1:7000=-1",
-        "n1:7000=1,n1:7000=2",
-        "n1:7000=1,",
-        "n1:7000=" + "1" * 21,
-    ],
+    "node",
+    ["10.0.0.9:6500", "10.0.0.1:6501", "10.0.0.1", ":6500", "10.0.0.1:abc", "n1"],
 )
-async def test_scan_keys_on_a_redis_cluster_rejects_an_invalid_cursor(
-    mock_redis_cluster, cursor
+async def test_scan_keys_on_a_redis_cluster_rejects_a_node_it_does_not_have(
+    mock_redis_cluster, monkeypatch, node
 ):
-    _primaries(mock_redis_cluster, {})
+    clients = _nodes(mock_redis_cluster)
+    monkeypatch.setattr(
+        misc.socket, "getaddrinfo", Mock(side_effect=OSError("unknown"))
+    )
 
-    result = await misc.scan_keys("*", cursor=cursor)
+    result = await misc.scan_keys("*", node=node)
+
+    assert result == (
+        f"Error: node {node} is not a node of the Redis Cluster default. " + NODE_LIST
+    )
+    for client in clients.values():
+        client.scan.assert_not_called()
+    mock_redis_cluster.nodes_manager.initialize.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_finds_a_node_the_client_did_not_know(
+    mock_redis_cluster,
+):
+    """A node that joined, or a replica that had replicated nothing, since the client read the nodes."""
+    clients = _nodes(mock_redis_cluster)
+    known = mock_redis_cluster.get_nodes.return_value
+    mock_redis_cluster.get_nodes.side_effect = [
+        [n for n in known if n.name != R1],
+        known,
+    ]
+    clients[R1].scan.return_value = (0, [])
+
+    result = await misc.scan_keys("*", node=R1)
+
+    assert (result["node"], result["scan_complete"]) == (R1, True)
+    mock_redis_cluster.nodes_manager.initialize.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_accepts_a_host_name(
+    mock_redis_cluster, monkeypatch
+):
+    """The cluster names its nodes by IP address; a host name that resolves to one of them names that node."""
+    clients = _nodes(mock_redis_cluster)
+    resolve = Mock(return_value=[(2, 1, 6, "", ("10.0.0.3", 0))])
+    monkeypatch.setattr(misc.socket, "getaddrinfo", resolve)
+    clients[R1].scan.return_value = (0, ["k"])
+
+    result = await misc.scan_keys("*", node="CBPRDRDS03.example.com:6501")
+
+    assert result["node"] == R1
+    assert resolve.call_args.args[0] == "cbprdrds03.example.com"
+    clients[R1].scan.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_rejects_a_host_name_of_two_nodes(
+    mock_redis_cluster, monkeypatch
+):
+    """P1 and P2 share the port: a name that resolves to both addresses names neither."""
+    clients = _nodes(mock_redis_cluster)
+    monkeypatch.setattr(
+        misc.socket,
+        "getaddrinfo",
+        Mock(
+            return_value=[
+                (2, 1, 6, "", ("10.0.0.1", 0)),
+                (2, 1, 6, "", ("10.0.0.2", 0)),
+            ]
+        ),
+    )
+
+    result = await misc.scan_keys("*", node="redis.example.com:6500")
+
+    assert result.startswith(
+        "Error: node redis.example.com:6500 is not a node of the Redis Cluster default."
+    )
+    for client in clients.values():
+        client.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_error(mock_redis_cluster):
+    clients = _nodes(mock_redis_cluster)
+    clients[P1].scan.side_effect = RedisError("node down")
+
+    result = await misc.scan_keys("user:*", node=P1)
+
+    assert result == "Error scanning keys with pattern 'user:*': node down"
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_on_a_redis_cluster_rejects_an_invalid_cursor(
+    mock_redis_cluster,
+):
+    clients = _nodes(mock_redis_cluster)
+
+    result = await misc.scan_keys("*", node=P1, cursor="10.0.0.1:6500=12")
 
     assert result == (
         "Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to"
         " start"
     )
-    mock_redis_cluster.scan.assert_not_called()
+    clients[P1].scan.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_scan_keys_on_a_redis_cluster_rejects_a_node_that_is_not_a_primary(
-    mock_redis_cluster,
+@pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
+async def test_a_node_is_rejected_on_a_cluster_that_is_not_a_redis_cluster(
+    mock_redis_connection_manager, tool
 ):
-    _primaries(mock_redis_cluster, {})
-
-    result = await misc.scan_keys("*", cursor="n1:7000=3,n9:7009=4")
+    """A standalone or Sentinel cluster has one server; naming another must not scan this one instead."""
+    result = await getattr(misc, tool)("app:*", node="10.0.0.1:6500")
 
     assert result == (
-        "Error: node n9:7009 of the cursor is not a primary of this Redis Cluster (a failover or resharding"
-        " since the scan started?); start again with cursor 0"
+        "Error: cluster default is not a Redis Cluster (mode standalone): it has one server, so leave node"
+        " out"
     )
-    mock_redis_cluster.scan.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_scan_keys_on_a_redis_cluster_error(mock_redis_cluster):
-    _primaries(mock_redis_cluster, {})
-    mock_redis_cluster.scan.side_effect = RedisError("node down")
-
-    result = await misc.scan_keys("user:*")
-
-    assert result == "Error scanning keys with pattern 'user:*': node down"
+    mock_redis_connection_manager.scan.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -512,9 +561,10 @@ def test_scan_descriptions_name_no_other_tool():
 
 class _Pipeline:
     """A pipeline of a fake server that holds ``keys``: name -> (type, bytes, length, encoding). ``bytes`` is
-    a number, or {samples: number} for a key whose size depends on the samples; ``length`` may be an exception
-    its length command fails with; the encoding is "hashtable" when left out. Records each queued command in
-    ``commands`` and each executed pipeline's number of commands in ``batches``."""
+    a number, or {samples: number} for a key whose size depends on the samples; ``bytes`` and ``length`` may
+    be an exception the command fails with; the encoding is "hashtable" when left out. READONLY is answered
+    with True, or with ``keys["READONLY"]``. Records each queued command in ``commands`` and each executed
+    pipeline's number of commands in ``batches``."""
 
     def __init__(self, keys, commands, batches):
         self._keys = keys
@@ -543,6 +593,11 @@ class _Pipeline:
 
     def ttl(self, key):
         self._queue("ttl", key, -1 if key in self._keys else -2)
+
+    def execute_command(self, command):
+        assert command == "READONLY"
+        self._commands.append((command,))
+        self._replies.append(self._keys.get(command, True))
 
     def __getattr__(self, command):
         if command not in {"strlen", "hlen", "llen", "scard", "zcard", "xlen"}:
@@ -1220,94 +1275,165 @@ async def test_big_keys_reports_a_command_the_user_may_not_run(
 
 
 @pytest.mark.asyncio
-async def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(
-    mock_redis_cluster, monkeypatch
-):
-    """One SCAN step on every primary that has not finished per round; the cursor holds their positions."""
-    # one round per call
-    monkeypatch.setattr(misc, "BIG_KEYS_SECONDS", 0)
-    _primaries(
-        mock_redis_cluster,
-        {
-            "n1:7000": [(12, [b"cache:1"]), (0, [b"queue"])],
-            "n2:7001": [(0, [b"session:1", b"session:2"])],
-        },
-    )
-    _holding(mock_redis_cluster, KEYS)
-    mock_redis_cluster.dbsize.return_value = 4
-
-    first = await misc.big_keys("app:*")
-    last = await misc.big_keys("app:*", cursor=first["cursor"])
-
-    assert first["cursor"] == "n1:7000=12"
-    assert first["scanComplete"] is False
-    assert first["keysScanned"] == 3
-    assert first["keys"] == [SESSION_2, SESSION_1, CACHE_1]
-    assert (last["cursor"], last["scanComplete"]) == (0, True)
-    assert last["keys"] == [QUEUE]
-    assert _scan_calls(mock_redis_cluster) == [
-        ("n1:7000", 0, misc.BIG_KEYS_SCAN_COUNT),
-        ("n2:7001", 0, misc.BIG_KEYS_SCAN_COUNT),
-        ("n1:7000", 12, misc.BIG_KEYS_SCAN_COUNT),
-    ]
-    # the keys of every primary are counted
-    assert first["dbsize"] == 4
-    mock_redis_cluster.dbsize.assert_called_with(target_nodes=RedisCluster.PRIMARIES)
-
-
-@pytest.mark.asyncio
-async def test_big_keys_on_a_redis_cluster_scans_every_primary_until_done(
-    mock_redis_cluster,
-):
-    _primaries(
-        mock_redis_cluster,
-        {
-            "n1:7000": [(12, [b"cache:1"]), (40, []), (0, [b"queue"])],
-            "n2:7001": [(0, [b"session:1"])],
-        },
-    )
-    _holding(mock_redis_cluster, KEYS)
-    mock_redis_cluster.dbsize.return_value = 3
+async def test_big_keys_on_a_redis_cluster_needs_a_node(mock_redis_cluster):
+    clients = _nodes(mock_redis_cluster)
 
     result = await misc.big_keys("app:*")
 
-    assert (result["cursor"], result["scanComplete"], result["keysScanned"]) == (
-        0,
-        True,
-        3,
+    assert result == (
+        "Error: cluster default is a Redis Cluster: node is required, the one node to scan. "
+        + NODE_LIST
     )
-    assert [k["key"] for k in result["keys"]] == ["queue", "session:1", "cache:1"]
-    assert [name for name, _, _ in _scan_calls(mock_redis_cluster)] == [
-        "n1:7000",
-        "n2:7001",
-        "n1:7000",
-        "n1:7000",
-    ]
+    for client in clients.values():
+        client.scan.assert_not_called()
+        client.pipeline.assert_not_called()
+    mock_redis_cluster.pipeline.assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "cursor, error",
-    [
-        (
-            12,
-            "Error: invalid cursor: pass the cursor returned by the previous big_keys call unchanged, or 0 to"
-            " start",
-        ),
-        (
-            "n1:7000=3,n9:7009=4",
-            "Error: node n9:7009 of the cursor is not a primary of this Redis Cluster (a failover or resharding"
-            " since the scan started?); start again with cursor 0",
-        ),
-    ],
-)
-async def test_big_keys_on_a_redis_cluster_rejects_an_invalid_cursor(
-    mock_redis_cluster, cursor, error
+@pytest.mark.parametrize("node", [P1, R1])
+async def test_big_keys_on_a_redis_cluster_measures_the_named_node(
+    mock_redis_cluster, node
 ):
-    _primaries(mock_redis_cluster, {})
+    """Every command goes to the node's own client. Each pipeline starts with READONLY, without which a
+    replica would redirect the commands on its keys to its primary."""
+    clients = _nodes(mock_redis_cluster)
+    commands = _holding(clients[node], KEYS)
+    clients[node].scan.side_effect = [(17, [b"cache:1", b"session:1"]), (0, [b"queue"])]
+    clients[node].dbsize.return_value = 7
 
-    assert await misc.big_keys("app:*", cursor=cursor) == error
+    result = await misc.big_keys("app:*", node=node)
+
+    assert result == {
+        "cursor": 0,
+        "scanComplete": True,
+        "keysScanned": 3,
+        # the keys of that node
+        "dbsize": 7,
+        "node": node,
+        "keys": [QUEUE, SESSION_1, CACHE_1],
+        "byType": {
+            "list": {"keys": 1, "bytes": 90000},
+            "hash": {"keys": 1, "bytes": 5000},
+            "string": {"keys": 1, "bytes": 300},
+        },
+    }
+    assert [c.kwargs["cursor"] for c in clients[node].scan.call_args_list] == [0, 17]
+    # two scan steps and one pipeline for the three listed keys
+    assert commands.batches == [5, 3, 10]
+    assert commands[0] == commands[5] == commands[8] == ("READONLY",)
+    assert commands.count(("READONLY",)) == 3
+    for other, client in clients.items():
+        if other != node:
+            client.scan.assert_not_called()
+            client.pipeline.assert_not_called()
     mock_redis_cluster.scan.assert_not_called()
+    mock_redis_cluster.pipeline.assert_not_called()
+    mock_redis_cluster.dbsize.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(
+    mock_redis_cluster, monkeypatch
+):
+    # one SCAN step per call
+    monkeypatch.setattr(misc, "BIG_KEYS_SECONDS", 0)
+    clients = _nodes(mock_redis_cluster)
+    _holding(clients[P2], KEYS)
+    clients[P2].scan.side_effect = [(12, [b"cache:1"]), (0, [b"queue"])]
+    clients[P2].dbsize.return_value = 2
+
+    first = await misc.big_keys("app:*", node=P2)
+    last = await misc.big_keys("app:*", node=P2, cursor=first["cursor"])
+
+    assert (first["cursor"], first["scanComplete"], first["keys"]) == (
+        12,
+        False,
+        [CACHE_1],
+    )
+    assert (last["cursor"], last["scanComplete"], last["keys"]) == (0, True, [QUEUE])
+    assert [c.kwargs["cursor"] for c in clients[P2].scan.call_args_list] == [0, 12]
+
+
+@pytest.mark.asyncio
+async def test_big_keys_does_not_send_readonly_outside_a_redis_cluster(
+    mock_redis_connection_manager,
+):
+    mock_redis = mock_redis_connection_manager
+    commands = _holding(mock_redis, KEYS)
+    mock_redis.scan.return_value = (0, [b"cache:1"])
+    mock_redis.dbsize.return_value = 1
+
+    result = await misc.big_keys("app:*")
+
+    assert "node" not in result
+    assert ("READONLY",) not in commands
+
+
+@pytest.mark.asyncio
+async def test_big_keys_on_a_redis_cluster_skips_a_key_whose_slot_has_moved(
+    mock_redis_cluster,
+):
+    """The node redirects a key it no longer holds: the key is another node's now, not an error."""
+    clients = _nodes(mock_redis_cluster)
+    moved = MovedError("866 10.0.0.2:6500")
+    keys = {
+        b"moved": (b"hash", moved, 3, b"listpack"),
+        b"moves-later": (b"hash", {5: 9000, 1000: moved}, 3, b"listpack"),
+        b"stays": (b"string", 300, 250, b"raw"),
+    }
+    _holding(clients[P1], keys)
+    clients[P1].scan.return_value = (0, list(keys))
+    clients[P1].dbsize.return_value = 1
+
+    result = await misc.big_keys("app:*", node=P1)
+
+    assert [k["key"] for k in result["keys"]] == ["stays"]
+    # the key that moved before the scan measured it is not counted
+    assert result["keysScanned"] == 2
+
+
+@pytest.mark.asyncio
+async def test_big_keys_on_a_redis_cluster_reports_a_readonly_that_fails(
+    mock_redis_cluster,
+):
+    """Without READONLY a replica would redirect every key, and the scan would report an empty node."""
+    clients = _nodes(mock_redis_cluster)
+    denied = RedisError(
+        "NOPERM this user has no permissions to run the 'readonly' command"
+    )
+    _holding(clients[R1], {**KEYS, "READONLY": denied})
+    clients[R1].scan.return_value = (0, [b"cache:1"])
+
+    result = await misc.big_keys("app:*", node=R1)
+
+    assert result == f"Error measuring keys with pattern 'app:*': {denied}"
+
+
+@pytest.mark.asyncio
+async def test_big_keys_on_a_redis_cluster_rejects_a_node_it_does_not_have(
+    mock_redis_cluster,
+):
+    clients = _nodes(mock_redis_cluster)
+
+    result = await misc.big_keys("app:*", node="10.0.0.9:6500")
+
+    assert result == (
+        "Error: node 10.0.0.9:6500 is not a node of the Redis Cluster default. "
+        + NODE_LIST
+    )
+    for client in clients.values():
+        client.scan.assert_not_called()
+
+
+def test_scan_descriptions_require_the_node_and_the_users_choice():
+    for tool in (misc.scan_keys, misc.big_keys):
+        assert "SCAN ONLY WHERE THE USER ASKED" in tool.__doc__
+        assert "do not try the clusters or the nodes one after another" in tool.__doc__
+        assert (
+            "node: REQUIRED on a Redis Cluster: the one node to scan, as host:port"
+            in (tool.__doc__)
+        )
 
 
 def test_size_descriptions_name_no_other_tool():
