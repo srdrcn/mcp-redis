@@ -523,19 +523,43 @@ return a value whole, however large, so these two are the way to look first.
 - `big_keys` finds the largest keys: it walks the keyspace with `SCAN` (`MATCH <pattern>`, `COUNT 1000`) and
   sends `TYPE` and `MEMORY USAGE` for the keys of each step in one pipeline. It returns `keys`, the `top` largest
   keys it measured (default 10, at most 100, largest first, without those under `min_bytes`) with their `type`,
-  `bytes`, `length` and `lengthUnit`, and `byType`: for each type, the number of keys it measured and their bytes
-  in total, whatever `top` and `min_bytes`. `keysScanned` is the number of keys the call measured and `dbsize`
-  the number of keys in the database, whatever the pattern.
+  `bytes`, `length`, `lengthUnit` and `encoding`, and `byType`: for each type, the number of keys it measured and
+  their bytes in total, whatever `top` and `min_bytes`. `keysScanned` is the number of keys the call measured and
+  `dbsize` the number of keys in the database, whatever the pattern.
 
-**`bytes` of a collection is an estimate.** For a hash, list, set, sorted set or stream, `MEMORY USAGE` measures
-`samples` elements (the first it comes to, not a random choice) and scales the result to the number of elements;
-a key with no more elements than samples is measured exactly, and so is a string. `big_keys` uses 5 samples (the
-Redis default). `memory_usage` takes `samples` (default 5, at most 1000): raise it when the elements of a key
-differ much in size, because asking again with the same `samples` returns the same estimate. Measured on Redis
-7.0: a hash with 990 one-byte fields and 10 fields of 100 KB came out as 48 KB with 5 samples and with 100, and
-as 1.2 MB, its real size, with 1000 (with one of the large fields among the 5, the estimate would be about
-20 MB). `SAMPLES 0` (every element) is not offered, because it walks the whole key: on a hash of 500,000 fields
-it kept the server busy for 43 ms, against less than 0.1 ms with 5 or with 1000 samples.
+**`bytes` of a large collection is an estimate, marked `estimated: true`.** For a hash, list, set, sorted set or
+stream, `MEMORY USAGE` measures `samples` elements and scales their size to the number of elements. It takes the
+first elements it comes to, not a random choice, so asking again returns the same number. A string is always
+measured exactly, and so is a collection with no more elements than samples, or one that Redis stores as a single
+block (`listpack`, `intset`); those carry no `estimated`.
+
+- `memory_usage` measures 1000 elements (`samples`, at most 10000), so it is exact for a key of up to 1000
+  elements, and for one of up to 10000 when `samples` is at least its `length`.
+- `big_keys` measures every key it scans with 5 samples (the Redis default, and what `redis-cli --memkeys` uses)
+  and ranks them by that. The keys it lists are then measured again with 1000 samples, ten keys per pipeline;
+  `bytes`, the order of `keys` and `min_bytes` use that second size, while `byType` adds up the sizes of the scan.
+
+How far off an estimate is depends on how much the elements of the key differ in size. Measured on Redis 7.0 on
+keys of 20,000 elements, against `SAMPLES 0` (every element):
+
+| Key | 5 samples | 1000 samples |
+|---|---|---|
+| Hash, fields of the same size | exact | exact |
+| Hash, values of 10 to 2000 bytes | +18% | under 1% |
+| Sorted set, members of 10 to 2000 bytes | +15% | −2% |
+| Set, members of 10 to 2000 bytes | −9% | −1% |
+| List, items of 10 to 2000 bytes | −2% | under 1% |
+| Hash, one field in 1000 holds 100 KB, the others 20 bytes | −58% | −58% |
+
+The last row is what no sample count below the key's length can fix: when the size of a key lies in a few
+elements that are much larger than the rest, the samples usually hold none of them and the estimate is far too
+small, or they hold one and it is far too large. A hash of 1000 fields, 10 of them 100 KB, came out as 48 KB
+with 5 samples and as its real 1.2 MB with 1000. So `big_keys` can rank such a key too low and leave it out of
+`keys`, and an `estimated` size of such a key can be wrong by a multiple.
+
+More samples take server time: with 1000 samples `MEMORY USAGE` took at most 0.35 ms on keys of 400,000 elements
+(a hash, a set and a sorted set), with 10000 at most 0.7 ms. `SAMPLES 0` is not offered, because it walks the
+whole key: 39 ms on the hash of 400,000 fields.
 
 **One `big_keys` call scans for 5 s.** It then returns what it found and a `cursor`, and the next call continues
 from there; `cursor: 0` with `scanComplete: true` means the whole keyspace was scanned. The cursor is the one of

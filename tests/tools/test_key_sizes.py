@@ -79,16 +79,17 @@ def test_memory_usage_of_a_string(mcp):
 
 
 @pytest.mark.parametrize(
-    "key, key_type, length, unit",
+    "key, key_type, length, unit, estimated",
     [
-        ("big:hash", "hash", 2000, "fields"),
-        ("list", "list", 7, "items"),
-        ("set", "set", 40, "members"),
-        ("zset", "zset", 30, "members"),
-        ("stream", "stream", 2, "entries"),
+        # 2000 fields in a hash table: more than the 1000 that are measured
+        ("big:hash", "hash", 2000, "fields", True),
+        ("list", "list", 7, "items", False),
+        ("set", "set", 40, "members", False),
+        ("zset", "zset", 30, "members", False),
+        ("stream", "stream", 2, "entries", False),
     ],
 )
-def test_memory_usage_of_a_collection(mcp, key, key_type, length, unit):
+def test_memory_usage_of_a_collection(mcp, key, key_type, length, unit, estimated):
     result = _call(mcp, "memory_usage", key=key)
 
     assert (result["type"], result["length"], result["lengthUnit"]) == (
@@ -96,6 +97,7 @@ def test_memory_usage_of_a_collection(mcp, key, key_type, length, unit):
         length,
         unit,
     )
+    assert result.get("estimated", False) is estimated
     assert result["bytes"] > 0
     assert result["encoding"]
     assert result["ttl"] == -1
@@ -112,21 +114,35 @@ def test_memory_usage_of_a_missing_key(mcp):
     assert _call(mcp, "memory_usage", key="nope") == {"key": "nope", "type": "none"}
 
 
-def test_memory_usage_with_samples_for_every_element_is_exact(mcp):
-    """MEMORY USAGE scales the size of the first elements it comes to: with 5 samples the uneven hash is some
-    KB when none of its 10 large fields is among them, and about 20 MB when one is. With a sample for every
-    field it is the size of all of them."""
-    first = _call(mcp, "memory_usage", key="uneven", samples=1000)
-    second = _call(mcp, "memory_usage", key="uneven", samples=1000)
+def test_memory_usage_measures_up_to_1000_elements(mcp):
+    """Every field of the uneven hash is measured, so its size is that of all of them."""
+    first = _call(mcp, "memory_usage", key="uneven")
+    second = _call(mcp, "memory_usage", key="uneven")
 
     assert first == second
     assert 1_000_000 < first["bytes"] < 1_300_000
     assert first["length"] == 1000
+    assert "estimated" not in first
+
+
+def test_memory_usage_with_fewer_samples_than_elements_is_an_estimate(mcp):
+    """MEMORY USAGE scales the size of the first elements it comes to: with 5 samples the uneven hash is some
+    KB when none of its 10 large fields is among them, and 20 MB or more when one is."""
+    few = _call(mcp, "memory_usage", key="uneven", samples=5)
+    even = _call(mcp, "memory_usage", key="big:hash", samples=5)
+    whole = _call(mcp, "memory_usage", key="big:hash", samples=2000)
+
+    assert few["estimated"] is True
+    assert not 1_000_000 < few["bytes"] < 1_300_000
+    # fields of about the same size: the estimate is close
+    assert even["estimated"] is True
+    assert "estimated" not in whole
+    assert abs(even["bytes"] - whole["bytes"]) < whole["bytes"] * 0.1
 
 
 def test_memory_usage_rejects_samples_out_of_range(mcp):
     assert _call(mcp, "memory_usage", key="big:hash", samples=0) == {
-        "error": "samples must be between 1 and 1000"
+        "error": "samples must be between 1 and 10000"
     }
 
 
@@ -136,16 +152,31 @@ def test_big_keys_lists_the_largest_first(mcp):
     string, big_hash = result["keys"]
     assert (string["key"], string["type"]) == ("big:string", "string")
     assert (string["length"], string["lengthUnit"]) == (300_000, "bytes")
+    assert "estimated" not in string
     assert (big_hash["key"], big_hash["type"]) == ("big:hash", "hash")
     assert (big_hash["length"], big_hash["lengthUnit"]) == (2000, "fields")
+    assert (big_hash["encoding"], big_hash["estimated"]) == ("hashtable", True)
     assert string["bytes"] > big_hash["bytes"] > 2000 * 20
     assert (result["cursor"], result["scanComplete"]) == (0, True)
     assert result["keysScanned"] == 2
     assert result["dbsize"] == ALL_KEYS
-    assert result["byType"] == {
-        "string": {"keys": 1, "bytes": string["bytes"]},
-        "hash": {"keys": 1, "bytes": big_hash["bytes"]},
+    assert list(result["byType"]) == ["string", "hash"]
+    assert result["byType"]["string"] == {"keys": 1, "bytes": string["bytes"]}
+    assert result["byType"]["hash"]["keys"] == 1
+
+
+def test_big_keys_measures_a_listed_key_again(mcp):
+    """The scan measures 5 fields of the uneven hash, which makes it some KB or 20 MB and more (the total of
+    its type); the key that is listed has the size of its 1000 fields."""
+    result = _call(mcp, "big_keys", pattern="uneven")
+
+    (entry,) = result["keys"]
+    assert 1_000_000 < entry["bytes"] < 1_300_000
+    assert "estimated" not in entry
+    assert entry == {
+        k: v for k, v in _call(mcp, "memory_usage", key="uneven").items() if k != "ttl"
     }
+    assert not 1_000_000 < result["byType"]["hash"]["bytes"] < 1_300_000
 
 
 def test_big_keys_agrees_with_memory_usage(mcp):
@@ -170,7 +201,8 @@ def test_big_keys_measures_the_whole_database(mcp):
     }
     sizes = [entry["bytes"] for entry in result["keys"]]
     assert sizes == sorted(sizes, reverse=True)
-    assert sum(sizes) == sum(totals["bytes"] for totals in result["byType"].values())
+    # measured again, the uneven hash is the largest key; the scan seldom ranks it there
+    assert result["keys"][0]["key"] == "uneven"
     assert list(result["byType"].values()) == sorted(
         result["byType"].values(), key=lambda totals: totals["bytes"], reverse=True
     )
@@ -200,6 +232,7 @@ def test_big_keys_marks_a_key_name_that_is_not_utf8(mcp):
         "type": "string",
         "length": 50_000,
         "lengthUnit": "bytes",
+        "encoding": "raw",
         "nonUtf8Key": True,
     }
 

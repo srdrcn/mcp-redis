@@ -17,10 +17,15 @@ from src.version import __version__
 
 DOCS_SEARCH_TIMEOUT_SECONDS = 10
 
-# MEMORY USAGE measures this many elements of a collection and scales the result (the Redis default)
-DEFAULT_SAMPLES = 5
+# MEMORY USAGE measures this many elements of a collection and scales the result to its length, so the size of
+# a key with more elements is an estimate. For one key, and for the keys big_keys lists:
+DEFAULT_SAMPLES = 1000
 # it runs in O(samples): no more than this, and never 0, which measures every element
-MAX_SAMPLES = 1000
+MAX_SAMPLES = 10_000
+# for every key big_keys scans (the Redis default)
+SCAN_SAMPLES = 5
+# keys measured with DEFAULT_SAMPLES in one pipeline, which the server runs without serving other clients
+SIZES_PER_PIPELINE = 10
 # big_keys returns its cursor once it has scanned this long; a tool call has 15 s (see src.common.registry)
 BIG_KEYS_SECONDS = 5
 # keys of one SCAN step, measured with one pipeline
@@ -36,6 +41,8 @@ _LENGTHS = {
     "zset": ("zcard", "members"),
     "stream": ("xlen", "entries"),
 }
+# a collection stored as one block of memory, which MEMORY USAGE measures whole
+_COMPACT_ENCODINGS = {"listpack", "listpackex", "ziplist", "zipmap", "intset"}
 
 
 @redis_tool("core", ToolKind.DESTRUCTIVE)
@@ -332,13 +339,15 @@ async def memory_usage(key: str, samples: int = DEFAULT_SAMPLES) -> Dict[str, An
     Args:
         key: The key to measure.
         samples: How many elements of a hash, list, set, sorted set or stream are measured to work out
-                 'bytes' (default 5, at most 1000). A key with more elements than that gets an estimate:
-                 raise it when the elements differ much in size.
+                 'bytes' (default 1000, at most 10000). A key with more elements than that gets an estimate,
+                 marked 'estimated': the size of the measured elements, scaled to the length.
 
     Returns:
         A dictionary containing:
         - 'key' and 'type'; for a key that does not exist the type is 'none' and nothing else is set
         - 'bytes': Memory the key and its value take, overhead included
+        - 'estimated': true when 'bytes' is an estimate. It can be far off when a few elements are much
+          larger than the others; with samples equal to the length it is exact
         - 'length' and 'lengthUnit': bytes of a string, fields of a hash, items of a list, members of a set or
           sorted set, entries of a stream (left out for any other type)
         - 'encoding': How Redis stores the value (OBJECT ENCODING)
@@ -351,47 +360,59 @@ async def memory_usage(key: str, samples: int = DEFAULT_SAMPLES) -> Dict[str, An
         r = RedisConnectionManager.get_connection()
         pipe = r.pipeline(transaction=False)
         pipe.type(key)
-        pipe.memory_usage(key, samples=samples)
-        pipe.object("ENCODING", key)
         pipe.ttl(key)
-        key_type, size, encoding, ttl = pipe.execute()
+        key_type, ttl = pipe.execute()
+        size = _sizes(r, [(key, key_type)], samples)[0]
         if size is None:
             return {"key": key, "type": "none"}
-        return {
-            "key": key,
-            "type": key_type,
-            "bytes": size,
-            **_lengths(r, [(key, key_type)])[0],
-            "encoding": encoding,
-            "ttl": ttl,
-        }
+        return {"key": key, "type": key_type, **size, "ttl": ttl}
     except RedisError as e:
         return {"error": str(e)}
 
 
-def _lengths(
-    r: Union[Redis, RedisCluster], keys: List[Tuple[Any, str]]
-) -> List[Dict[str, Any]]:
-    """'length' and 'lengthUnit' of each (key, type). Empty for a type without a length command (a module's)
-    and for a key that holds another type by now."""
-    pipe = r.pipeline(transaction=False)
-    units: List[Optional[str]] = []
-    for key, key_type in keys:
-        command, unit = _LENGTHS.get(key_type, (None, None))
-        if command:
-            getattr(pipe, command)(key)
-        units.append(unit)
-    replies = iter(pipe.execute(raise_on_error=False) if any(units) else [])
-    lengths: List[Dict[str, Any]] = []
-    for unit in units:
-        reply = next(replies) if unit else None
-        if isinstance(reply, Exception) and not str(reply).startswith("WRONGTYPE"):
-            raise reply
-        if unit is None or isinstance(reply, Exception):
-            lengths.append({})
-        else:
-            lengths.append({"length": reply, "lengthUnit": unit})
-    return lengths
+def _sizes(
+    r: Union[Redis, RedisCluster], keys: List[Tuple[Any, str]], samples: int
+) -> List[Optional[Dict[str, Any]]]:
+    """For each (key, type): 'bytes' (MEMORY USAGE with ``samples``), 'estimated' if they are scaled from the
+    samples, 'length' with 'lengthUnit' (left out for a type without a length command, such as a module's, and
+    for a key that holds another type by now) and 'encoding'. None for a key that is gone."""
+    sizes: List[Optional[Dict[str, Any]]] = []
+    for start in range(0, len(keys), SIZES_PER_PIPELINE):
+        batch = keys[start : start + SIZES_PER_PIPELINE]
+        pipe = r.pipeline(transaction=False)
+        for key, key_type in batch:
+            pipe.memory_usage(key, samples=samples)
+            pipe.object("ENCODING", key)
+            if key_type in _LENGTHS:
+                getattr(pipe, _LENGTHS[key_type][0])(key)
+        replies = iter(pipe.execute(raise_on_error=False))
+        for key, key_type in batch:
+            size, encoding = next(replies), next(replies)
+            length = next(replies) if key_type in _LENGTHS else None
+            for reply in (size, encoding):
+                if isinstance(reply, Exception):
+                    raise reply
+            if isinstance(length, Exception):
+                if not str(length).startswith("WRONGTYPE"):
+                    raise length
+                length = None
+            if size is None:
+                sizes.append(None)
+                continue
+            encoding = text(encoding) if encoding is not None else None
+            described: Dict[str, Any] = {"bytes": size}
+            if length is not None:
+                if (
+                    key_type != "string"
+                    and length > samples
+                    and encoding not in _COMPACT_ENCODINGS
+                ):
+                    described["estimated"] = True
+                described["length"] = length
+                described["lengthUnit"] = _LENGTHS[key_type][1]
+            described["encoding"] = encoding
+            sizes.append(described)
+    return sizes
 
 
 @redis_tool("core")
@@ -410,6 +431,10 @@ async def big_keys(
     and keep the largest keys of every call. On a database with millions of keys a complete scan takes many
     calls: narrow the pattern, or stop after a few calls and treat the result as a sample.
 
+    The keys are ranked by a quick estimate (5 elements of a hash, list, set, sorted set or stream, scaled to
+    its length), so a key whose size lies in a few very large elements among many small ones can be ranked too
+    low and missed. The keys that are listed are measured again with 1000 elements.
+
     Args:
         pattern: Pattern of the keys to measure (default is "*" for all keys), e.g. "session:*".
         cursor: 0 to start from the beginning. To continue scanning, pass the cursor value returned from the
@@ -424,10 +449,11 @@ async def big_keys(
         - 'keysScanned': Number of keys this call measured
         - 'dbsize': Number of keys in the database, whatever the pattern
         - 'keys': The largest keys this call measured, largest first: 'key', 'type', 'bytes' (memory the key
-          and its value take; for a collection an estimate from 5 of its elements), and 'length' with
-          'lengthUnit' (bytes of a string, fields of a hash, items of a list, members of a set or sorted set,
-          entries of a stream)
-        - 'byType': For each type, the number of keys this call measured and their bytes in total
+          and its value take), 'estimated' (true when 'bytes' is an estimate: the key has more than 1000
+          elements), 'length' with 'lengthUnit' (bytes of a string, fields of a hash, items of a list, members
+          of a set or sorted set, entries of a stream) and 'encoding'
+        - 'byType': For each type, the number of keys this call measured and their bytes in total, from the
+          quick estimates
         Or an error message if something goes wrong.
 
     A key name that is not UTF-8 is shown with \\xNN for those bytes and marked 'nonUtf8Key'; the other tools
@@ -469,15 +495,18 @@ async def big_keys(
                     del positions[name]
             if time.monotonic() >= deadline:
                 break
-        lengths = _lengths(
-            r, [(key, key_type) for key, (_, key_type) in largest.items()]
-        )
+        # the quick estimate ranked them; now measure the few that are listed with more samples
+        listed = [(key, key_type) for key, (_, key_type) in largest.items()]
         entries = []
-        for (key, (size, key_type)), length in zip(largest.items(), lengths):
-            entry = {"key": text(key), "type": key_type, "bytes": size, **length}
+        for (key, key_type), size in zip(listed, _sizes(r, listed, DEFAULT_SAMPLES)):
+            # None: gone since it was scanned
+            if size is None or size["bytes"] < min_bytes:
+                continue
+            entry = {"key": text(key), "type": key_type, **size}
             if not _is_utf8(key):
                 entry["nonUtf8Key"] = True
             entries.append(entry)
+        entries.sort(key=lambda entry: entry["bytes"], reverse=True)
         next_cursor: Union[int, str] = 0
         if isinstance(r, RedisCluster):
             next_cursor = (
@@ -527,7 +556,7 @@ def _measure(
     pipe = r.pipeline(transaction=False)
     for key in keys:
         pipe.type(key)
-        pipe.memory_usage(key, samples=DEFAULT_SAMPLES)
+        pipe.memory_usage(key, samples=SCAN_SAMPLES)
     replies = pipe.execute()
     return [
         (key, text(key_type), size)
