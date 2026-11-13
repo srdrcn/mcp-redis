@@ -751,6 +751,40 @@ class TestRedisCluster:
         # more than one page, continued with the text cursor of the unfinished primaries
         assert cursors and all(isinstance(c, str) and "=" in c for c in cursors)
 
+    def test_big_keys_measures_the_keys_of_every_node(
+        self, cluster_stdio, empty_cluster
+    ):
+        """big_keys scans every primary; each key is measured on the node that serves its slot."""
+        keys = list(_keys_on_every_node(empty_cluster, "mcp:it:size"))
+        client = empty_cluster.client()
+        try:
+            for thousands, key in enumerate(keys, start=1):
+                client.set(key, "x" * (thousands * 1000))
+            client.set("mcp:it:other", "1")
+        finally:
+            client.close()
+
+        result = cluster_stdio.call(
+            "big_keys", cluster=REDIS_CLUSTER, pattern="mcp:it:size:*"
+        )
+        single = cluster_stdio.call("memory_usage", cluster=REDIS_CLUSTER, key=keys[0])
+
+        assert not result.get("isError"), _text(result)
+        page = result["structuredContent"]["result"]
+        assert (page["cursor"], page["scanComplete"]) == (0, True)
+        assert page["keysScanned"] == len(keys) == 3
+        # the keys of every primary, whatever the pattern
+        assert page["dbsize"] == 4
+        assert [(entry["key"], entry["length"]) for entry in page["keys"]] == [
+            (keys[2], 3000),
+            (keys[1], 2000),
+            (keys[0], 1000),
+        ]
+        assert not single.get("isError"), _text(single)
+        measured = single["structuredContent"]["result"]
+        assert (measured["type"], measured["length"]) == ("string", 1000)
+        assert measured["bytes"] == page["keys"][2]["bytes"]
+
     def test_scan_all_keys_on_an_empty_cluster(self, cluster_stdio, empty_cluster):
         result = cluster_stdio.call("scan_all_keys", cluster=REDIS_CLUSTER)
 

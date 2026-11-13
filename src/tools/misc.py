@@ -1,8 +1,11 @@
 import asyncio
+import heapq
 import re
-from typing import Any, Dict, Union, List, Tuple
+import time
+from typing import Any, Dict, Optional, Union, List, Tuple
 import aiohttp
 
+from redis import Redis
 from redis.cluster import ClusterNode, RedisCluster
 from redis.exceptions import RedisError
 
@@ -13,6 +16,26 @@ from src.common.config import MCP_DOCS_SEARCH_URL
 from src.version import __version__
 
 DOCS_SEARCH_TIMEOUT_SECONDS = 10
+
+# MEMORY USAGE measures this many elements of a collection and scales the result (the Redis default)
+DEFAULT_SAMPLES = 5
+# it runs in O(samples): no more than this, and never 0, which measures every element
+MAX_SAMPLES = 1000
+# big_keys returns its cursor once it has scanned this long; a tool call has 15 s (see src.common.registry)
+BIG_KEYS_SECONDS = 5
+# keys of one SCAN step, measured with one pipeline
+BIG_KEYS_SCAN_COUNT = 1000
+MAX_BIG_KEYS = 100
+
+# the command that counts what a type holds, and what it counts
+_LENGTHS = {
+    "string": ("strlen", "bytes"),
+    "hash": ("hlen", "fields"),
+    "list": ("llen", "items"),
+    "set": ("scard", "members"),
+    "zset": ("zcard", "members"),
+    "stream": ("xlen", "entries"),
+}
 
 
 @redis_tool("core", ToolKind.DESTRUCTIVE)
@@ -154,7 +177,7 @@ async def scan_keys(
         if isinstance(r, RedisCluster):
             return _scan_cluster_step(r, pattern, count, cursor)
         cursor, keys = r.scan(
-            cursor=_standalone_cursor(cursor), match=pattern, count=count
+            cursor=_standalone_cursor(cursor, "scan_keys"), match=pattern, count=count
         )
         return _scan_page(cursor, keys, cursor == 0)
     except _CursorError as e:
@@ -195,35 +218,39 @@ class _CursorError(ValueError):
 
 # a SCAN cursor is an unsigned 64-bit number
 _CURSOR_NUMBER = re.compile(r"[0-9]{1,20}")
-_INVALID_CURSOR = "invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start"
 
 
-def _standalone_cursor(cursor: Union[int, str]) -> int:
+def _invalid_cursor(tool: str) -> str:
+    return f"invalid cursor: pass the cursor returned by the previous {tool} call unchanged, or 0 to start"
+
+
+def _standalone_cursor(cursor: Union[int, str], tool: str) -> int:
     if isinstance(cursor, int):
         return cursor
     if _CURSOR_NUMBER.fullmatch(cursor.strip()):
         return int(cursor)
-    raise _CursorError(_INVALID_CURSOR)
+    raise _CursorError(_invalid_cursor(tool))
 
 
 def _cluster_positions(
-    r: RedisCluster, cursor: Union[int, str]
+    r: RedisCluster, cursor: Union[int, str], tool: str
 ) -> Dict[str, Tuple[ClusterNode, int]]:
     """The primaries still to be scanned with their SCAN cursors, by node name. The cursor of a Redis Cluster
-    scan is ``name=position`` for each of them, comma-separated; a primary that finished is left out."""
+    scan is ``name=position`` for each of them, comma-separated; a primary that finished is left out. ``tool``
+    is the scanning tool, named in the error of an invalid cursor."""
     primaries = {
         node.name: node for node in sorted(r.get_primaries(), key=lambda n: n.name)
     }
     if isinstance(cursor, int) or _CURSOR_NUMBER.fullmatch(cursor.strip()):
         # a number other than 0 is the cursor of a standalone server, not of a Redis Cluster
         if int(cursor) != 0:
-            raise _CursorError(_INVALID_CURSOR)
+            raise _CursorError(_invalid_cursor(tool))
         return {name: (node, 0) for name, node in primaries.items()}
     positions: Dict[str, Tuple[ClusterNode, int]] = {}
     for part in cursor.split(","):
         name, _, position = part.strip().rpartition("=")
         if not name or not _CURSOR_NUMBER.fullmatch(position) or name in positions:
-            raise _CursorError(_INVALID_CURSOR)
+            raise _CursorError(_invalid_cursor(tool))
         if name not in primaries:
             raise _CursorError(
                 f"node {name} of the cursor is not a primary of this Redis Cluster (a failover or"
@@ -236,7 +263,7 @@ def _cluster_positions(
 def _scan_cluster_step(
     r: RedisCluster, pattern: str, count: int, cursor: Union[int, str]
 ) -> Dict[str, Any]:
-    positions = _cluster_positions(r, cursor)
+    positions = _cluster_positions(r, cursor, "scan_keys")
     keys: List[Any] = []
     remaining: Dict[str, int] = {}
     for name, (node, position) in positions.items():
@@ -295,6 +322,219 @@ async def scan_all_keys(
         return all_keys
     except RedisError as e:
         return f"Error scanning all keys with pattern '{pattern}': {str(e)}"
+
+
+@redis_tool("core")
+async def memory_usage(key: str, samples: int = DEFAULT_SAMPLES) -> Dict[str, Any]:
+    """How large a key is, without reading its value: the bytes it takes in memory (MEMORY USAGE), its type,
+    length, encoding and TTL. Use it before reading a value that may be large.
+
+    Args:
+        key: The key to measure.
+        samples: How many elements of a hash, list, set, sorted set or stream are measured to work out
+                 'bytes' (default 5, at most 1000). A key with more elements than that gets an estimate:
+                 raise it when the elements differ much in size.
+
+    Returns:
+        A dictionary containing:
+        - 'key' and 'type'; for a key that does not exist the type is 'none' and nothing else is set
+        - 'bytes': Memory the key and its value take, overhead included
+        - 'length' and 'lengthUnit': bytes of a string, fields of a hash, items of a list, members of a set or
+          sorted set, entries of a stream (left out for any other type)
+        - 'encoding': How Redis stores the value (OBJECT ENCODING)
+        - 'ttl': Seconds until the key expires, -1 for never
+        Or {"error": ...} if something goes wrong.
+    """
+    if not 1 <= samples <= MAX_SAMPLES:
+        return {"error": f"samples must be between 1 and {MAX_SAMPLES}"}
+    try:
+        r = RedisConnectionManager.get_connection()
+        pipe = r.pipeline(transaction=False)
+        pipe.type(key)
+        pipe.memory_usage(key, samples=samples)
+        pipe.object("ENCODING", key)
+        pipe.ttl(key)
+        key_type, size, encoding, ttl = pipe.execute()
+        if size is None:
+            return {"key": key, "type": "none"}
+        return {
+            "key": key,
+            "type": key_type,
+            "bytes": size,
+            **_lengths(r, [(key, key_type)])[0],
+            "encoding": encoding,
+            "ttl": ttl,
+        }
+    except RedisError as e:
+        return {"error": str(e)}
+
+
+def _lengths(
+    r: Union[Redis, RedisCluster], keys: List[Tuple[Any, str]]
+) -> List[Dict[str, Any]]:
+    """'length' and 'lengthUnit' of each (key, type). Empty for a type without a length command (a module's)
+    and for a key that holds another type by now."""
+    pipe = r.pipeline(transaction=False)
+    units: List[Optional[str]] = []
+    for key, key_type in keys:
+        command, unit = _LENGTHS.get(key_type, (None, None))
+        if command:
+            getattr(pipe, command)(key)
+        units.append(unit)
+    replies = iter(pipe.execute(raise_on_error=False) if any(units) else [])
+    lengths: List[Dict[str, Any]] = []
+    for unit in units:
+        reply = next(replies) if unit else None
+        if isinstance(reply, Exception) and not str(reply).startswith("WRONGTYPE"):
+            raise reply
+        if unit is None or isinstance(reply, Exception):
+            lengths.append({})
+        else:
+            lengths.append({"length": reply, "lengthUnit": unit})
+    return lengths
+
+
+@redis_tool("core")
+async def big_keys(
+    pattern: str = "*",
+    cursor: Union[int, str] = 0,
+    top: int = 10,
+    min_bytes: int = 0,
+) -> Union[str, Dict[str, Any]]:
+    """
+    Find the keys that take the most memory: SCAN the keyspace and measure every key with MEMORY USAGE, without
+    reading values (non-blocking, as redis-cli --memkeys does).
+
+    ⚠️  IMPORTANT: One call scans for about 5 s and returns PARTIAL results: the largest keys among those it
+    scanned, and a cursor. Call it again with the returned cursor until cursor becomes 0 (scanComplete is true),
+    and keep the largest keys of every call. On a database with millions of keys a complete scan takes many
+    calls: narrow the pattern, or stop after a few calls and treat the result as a sample.
+
+    Args:
+        pattern: Pattern of the keys to measure (default is "*" for all keys), e.g. "session:*".
+        cursor: 0 to start from the beginning. To continue scanning, pass the cursor value returned from the
+                previous call unchanged (on a Redis Cluster it is text that holds the position on each primary).
+        top: How many of the largest keys to return (default 10, at most 100).
+        min_bytes: Leave out keys that take fewer bytes than this (default 0).
+
+    Returns:
+        A dictionary containing:
+        - 'cursor': Next cursor position (0 means scan is complete)
+        - 'scanComplete': Boolean indicating if scan is finished
+        - 'keysScanned': Number of keys this call measured
+        - 'dbsize': Number of keys in the database, whatever the pattern
+        - 'keys': The largest keys this call measured, largest first: 'key', 'type', 'bytes' (memory the key
+          and its value take; for a collection an estimate from 5 of its elements), and 'length' with
+          'lengthUnit' (bytes of a string, fields of a hash, items of a list, members of a set or sorted set,
+          entries of a stream)
+        - 'byType': For each type, the number of keys this call measured and their bytes in total
+        Or an error message if something goes wrong.
+
+    A key name that is not UTF-8 is shown with \\xNN for those bytes and marked 'nonUtf8Key'; the other tools
+    cannot read such a key by name.
+    """
+    if not 1 <= top <= MAX_BIG_KEYS:
+        return f"Error: top must be between 1 and {MAX_BIG_KEYS}"
+    if min_bytes < 0:
+        return "Error: min_bytes must not be negative"
+    try:
+        r = RedisConnectionManager.get_connection(decode_responses=False)
+        # the server, or the primaries of a Redis Cluster, that have not finished, with their SCAN cursors
+        positions: Dict[str, Tuple[Optional[ClusterNode], int]]
+        if isinstance(r, RedisCluster):
+            positions = dict(_cluster_positions(r, cursor, "big_keys"))
+        else:
+            positions = {"": (None, _standalone_cursor(cursor, "big_keys"))}
+        deadline = time.monotonic() + BIG_KEYS_SECONDS
+        scanned = 0
+        by_type: Dict[str, Dict[str, int]] = {}
+        largest: Dict[Any, Tuple[int, str]] = {}
+        while positions:
+            # one SCAN step on each of them
+            for name, (node, position) in list(positions.items()):
+                position, keys = _scan_step(r, node, position, pattern)
+                for key, key_type, size in _measure(r, keys):
+                    scanned += 1
+                    totals = by_type.setdefault(key_type, {"keys": 0, "bytes": 0})
+                    totals["keys"] += 1
+                    totals["bytes"] += size
+                    if size >= min_bytes:
+                        largest[key] = (size, key_type)
+                largest = dict(
+                    heapq.nlargest(top, largest.items(), key=lambda item: item[1][0])
+                )
+                if position:
+                    positions[name] = (node, position)
+                else:
+                    del positions[name]
+            if time.monotonic() >= deadline:
+                break
+        lengths = _lengths(
+            r, [(key, key_type) for key, (_, key_type) in largest.items()]
+        )
+        entries = []
+        for (key, (size, key_type)), length in zip(largest.items(), lengths):
+            entry = {"key": text(key), "type": key_type, "bytes": size, **length}
+            if not _is_utf8(key):
+                entry["nonUtf8Key"] = True
+            entries.append(entry)
+        next_cursor: Union[int, str] = 0
+        if isinstance(r, RedisCluster):
+            next_cursor = (
+                ",".join(f"{name}={p}" for name, (_, p) in positions.items()) or 0
+            )
+        elif positions:
+            next_cursor = positions[""][1]
+        return {
+            "cursor": next_cursor,
+            "scanComplete": not positions,
+            "keysScanned": scanned,
+            "dbsize": r.dbsize(target_nodes=RedisCluster.PRIMARIES)
+            if isinstance(r, RedisCluster)
+            else r.dbsize(),
+            "keys": entries,
+            "byType": dict(
+                sorted(by_type.items(), key=lambda item: item[1]["bytes"], reverse=True)
+            ),
+        }
+    except _CursorError as e:
+        return f"Error: {e}"
+    except RedisError as e:
+        return f"Error measuring keys with pattern '{pattern}': {str(e)}"
+
+
+def _scan_step(
+    r: Union[Redis, RedisCluster],
+    node: Optional[ClusterNode],
+    position: int,
+    pattern: str,
+) -> Tuple[int, List[Any]]:
+    """One SCAN step on the server, or on ``node`` of a Redis Cluster: the next cursor and the keys."""
+    if node is None:
+        return r.scan(cursor=position, match=pattern, count=BIG_KEYS_SCAN_COUNT)
+    cursors, keys = r.scan(
+        cursor=position, match=pattern, count=BIG_KEYS_SCAN_COUNT, target_nodes=node
+    )
+    return cursors[node.name], keys
+
+
+def _measure(
+    r: Union[Redis, RedisCluster], keys: List[Any]
+) -> List[Tuple[Any, str, int]]:
+    """(key, type, bytes) of the keys that still exist."""
+    if not keys:
+        return []
+    pipe = r.pipeline(transaction=False)
+    for key in keys:
+        pipe.type(key)
+        pipe.memory_usage(key, samples=DEFAULT_SAMPLES)
+    replies = pipe.execute()
+    return [
+        (key, text(key_type), size)
+        for key, key_type, size in zip(keys, replies[::2], replies[1::2])
+        # None: expired or deleted since SCAN returned it
+        if size is not None
+    ]
 
 
 @redis_tool("docs", cluster="none")
