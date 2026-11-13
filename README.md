@@ -13,7 +13,7 @@ Built with Python 3.10+ (the image uses Python 3.14), FastMCP from the MCP Pytho
 - **Many clusters, one server**: standalone servers, Redis Cluster and Sentinel-managed primaries side by side.
   Every tool that works on Redis takes a `cluster` parameter whose enum lists exactly the clusters the tool may run
   on. When only one cluster is configured, the parameter is optional.
-- **58 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
+- **60 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
 - **Read-only in the example config**: `readOnly: true` hides every write tool (one sandbox cluster opts back in),
   and `disableDestructive: true` hides the delete/pop/remove tools.
 - **Passwords stay out of the config**: each cluster's password comes from a mounted Secret file
@@ -256,7 +256,7 @@ clusters:
 | `readOnly` | boolean | `false` | `true` hides every write tool on clusters that do not override it with their own `readOnly`. |
 | `disableDestructive` | boolean | `false` | `true` hides the destructive tools (`delete`, `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy`, `json_del`) on every cluster. It is global only and does not affect the other write tools. |
 | `toolsets` | list of strings | `[core]` | Toolsets to enable, which also sets the order of `tools/list`. An unknown name stops the server at startup; an empty or duplicate entry is an invalid config. |
-| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 58 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
+| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 60 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
 | `passwordsDir` | path | `/etc/redis-mcp/passwords` | Directory of the `<name>_pass` password files (see [Passwords](#passwords)). |
 | `clusters` | list | (required) | The Redis deployments. At least one is required, and names must be unique. |
 
@@ -459,9 +459,14 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
   command the connection fails with `Cluster mode is not enabled on this node`. `+cluster|nodes +cluster|info` let
   `cluster_nodes` read the node list and the cluster state. They do no harm elsewhere.
 - Checked on Redis 7.0 with the server's tools and `ACL DRYRUN`: `mcp-reader` can run `get`, `hgetall`, `scan_keys`,
-  `scan_all_keys`, `type`, `dbsize`, `info`, `client_list` and `clusters_list`, and `set`/`delete` fail with
-  `this user has no permissions to run the 'set' command`; `mcp-writer` can also run `set`, `delete`, `expire`,
-  `rename` and the stream group commands, but not `FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG` or `SHUTDOWN`.
+  `scan_all_keys`, `memory_usage`, `big_keys`, `type`, `dbsize`, `info`, `client_list` and `clusters_list`, and
+  `set`/`delete` fail with `this user has no permissions to run the 'set' command`; `mcp-writer` can also run
+  `set`, `delete`, `expire`, `rename` and the stream group commands, but not `FLUSHALL`, `FLUSHDB`, `KEYS`,
+  `CONFIG` or `SHUTDOWN`.
+- `memory_usage` and `big_keys` need `MEMORY USAGE`, `OBJECT ENCODING`, `TYPE`, `TTL`, `SCAN`, `DBSIZE` and the
+  length commands (`STRLEN`, `HLEN`, `LLEN`, `SCARD`, `ZCARD`, `XLEN`). All of them are in `@read` and none is in
+  `@dangerous` (`MEMORY USAGE` is the only `MEMORY` subcommand in `@read`). A user that lacks one of them gets
+  that command's `no permissions` error, not an empty result.
 - The `pubsub` toolset needs `+subscribe +psubscribe +unsubscribe +punsubscribe` (and `+publish` for the write
   tool `publish`): pub/sub commands are not in `@read` or `@write`.
 - The `json` and `search` tools use module commands (`JSON.GET`, `JSON.SET`, `JSON.DEL`, `FT._LIST`, `FT.INFO`,
@@ -477,7 +482,7 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
 
 | Toolset | Tools | What it covers | Available on |
 |---|---:|---|---|
-| `core` (enabled by default) | 14 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`), key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`) and what the Sentinels see (`sentinel_status`, `sentinel_replicas`, `sentinel_masters`) | Every cluster; the three Sentinel tools only on clusters with `mode: sentinel`. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
+| `core` (enabled by default) | 16 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`), key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`), key sizes (`memory_usage`, `big_keys`) and what the Sentinels see (`sentinel_status`, `sentinel_replicas`, `sentinel_masters`) | Every cluster; the three Sentinel tools only on clusters with `mode: sentinel`. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
 | `data` | 29 | Strings, hashes (including vectors stored as binary fields), lists, sets, sorted sets, and streams with consumer groups | Every cluster |
 | `json` | 3 | RedisJSON documents: get, set and delete at a path | Clusters with `modules: [json]` |
 | `search` | 6 | Redis Query Engine: indexes, index information, indexed key count, vector index creation on hashes, vector (KNN) and hybrid search | Clusters with `modules: [search]` |
@@ -504,6 +509,50 @@ Cluster ...`); start again with cursor 0. As with any `SCAN` on a Redis Cluster,
 primaries while the scan pages can be missed or returned twice. On standalone and Sentinel clusters the cursor is the
 number Redis returns. The example config lists no `scan_all_keys` (`excludeTools`), so keys are listed page by page
 with `scan_keys`.
+
+### Key sizes
+
+`memory_usage` and `big_keys` tell how large keys are without reading a value. `get`, `hgetall` and `smembers`
+return a value whole, however large, so these two are the way to look first.
+
+- `memory_usage` measures one key: `bytes` (`MEMORY USAGE`: the memory the key and its value take, overhead
+  included), `type`, `length` with `lengthUnit` (`bytes` of a string, `fields` of a hash, `items` of a list,
+  `members` of a set or sorted set, `entries` of a stream; left out for any other type, such as a module's),
+  `encoding` (`OBJECT ENCODING`) and `ttl`. A key that does not exist comes back as
+  `{"key": "<key>", "type": "none"}`.
+- `big_keys` finds the largest keys: it walks the keyspace with `SCAN` (`MATCH <pattern>`, `COUNT 1000`) and
+  sends `TYPE` and `MEMORY USAGE` for the keys of each step in one pipeline. It returns `keys`, the `top` largest
+  keys it measured (default 10, at most 100, largest first, without those under `min_bytes`) with their `type`,
+  `bytes`, `length` and `lengthUnit`, and `byType`: for each type, the number of keys it measured and their bytes
+  in total, whatever `top` and `min_bytes`. `keysScanned` is the number of keys the call measured and `dbsize`
+  the number of keys in the database, whatever the pattern.
+
+**`bytes` of a collection is an estimate.** For a hash, list, set, sorted set or stream, `MEMORY USAGE` measures
+`samples` elements (the first it comes to, not a random choice) and scales the result to the number of elements;
+a key with no more elements than samples is measured exactly, and so is a string. `big_keys` uses 5 samples (the
+Redis default). `memory_usage` takes `samples` (default 5, at most 1000): raise it when the elements of a key
+differ much in size, because asking again with the same `samples` returns the same estimate. Measured on Redis
+7.0: a hash with 990 one-byte fields and 10 fields of 100 KB came out as 48 KB with 5 samples and with 100, and
+as 1.2 MB, its real size, with 1000 (with one of the large fields among the 5, the estimate would be about
+20 MB). `SAMPLES 0` (every element) is not offered, because it walks the whole key: on a hash of 500,000 fields
+it kept the server busy for 43 ms, against less than 0.1 ms with 5 or with 1000 samples.
+
+**One `big_keys` call scans for 5 s.** It then returns what it found and a `cursor`, and the next call continues
+from there; `cursor: 0` with `scanComplete: true` means the whole keyspace was scanned. The cursor is the one of
+`scan_keys`: a number on standalone and Sentinel clusters, and on a Redis Cluster text with the position of
+every primary that has not finished, with the same errors for a malformed cursor or a node that is no longer a
+primary (see above). A call runs one `SCAN` step on each unfinished primary in turn until its 5 s are over. Each
+call reports the largest keys of that call only, so the caller keeps the largest across the calls and adds up
+`byType`. A key can be counted twice when `SCAN` returns it twice (it may, while the keyspace grows or shrinks),
+and a key that expired between `SCAN` and `MEMORY USAGE` is left out.
+
+Measured on a local Redis 7.0 with 1,000,000 keys (strings, three-field hashes and short lists): the scan took
+two calls, about 105,000 keys per second. A `SCAN` step took 0.7 ms and the 2 × 1000 commands of its pipeline
+about 1.1 ms, so the server spent about a fifth of its time on the scan while a call ran, and no command reached
+the slow log (10 ms). A second client that read a key every millisecond saw its p99 go from 0.3 ms to 1.0 ms and
+its slowest reply from 2.3 ms to 4.1 ms. Over a network a call measures fewer keys. A database with tens of
+millions of keys needs dozens of calls: narrow the `pattern` (`session:*`), take a few calls as a sample, or run
+`redis-cli --memkeys` against a replica instead.
 
 ### Sentinel tools
 
@@ -555,9 +604,9 @@ when the content is recognised, `format`:
   `format: gzip` with a `note` and its bytes in `text` instead.
 - `java-serialization`: Java's `ObjectOutputStream` format; class and field names show in `text`.
 
-`scan_keys` and `scan_all_keys` read key names as bytes too: a name that is not UTF-8 is shown with `\xNN` for
-those bytes (as redis-cli shows it) and, in `scan_keys`, also listed in `nonUtf8Keys`. The other tools cannot
-read such a key by name.
+`scan_keys`, `scan_all_keys` and `big_keys` read key names as bytes too: a name that is not UTF-8 is shown with
+`\xNN` for those bytes (as redis-cli shows it) and, in `scan_keys`, also listed in `nonUtf8Keys`; `big_keys` marks
+its entry with `nonUtf8Key: true`. The other tools cannot read such a key by name.
 
 ### Which tools are listed
 
@@ -578,7 +627,7 @@ cluster is rejected by schema validation (`Input should be 'cbsbxrds'`). With tw
 one cluster (a one-cluster config file or the [single-cluster mode](#single-cluster-mode)), `cluster` is optional
 and comes last, described as `Cluster name (default: the only configured cluster)`: a call without it runs on that
 cluster. `clusters_list` always takes an optional `cluster` (all clusters when omitted), and `read_messages`,
-`unsubscribe` and `search_redis_documents` take none. With the example config, 30 of the 58 tools are listed.
+`unsubscribe` and `search_redis_documents` take none. With the example config, 32 of the 60 tools are listed.
 For example:
 
 | Tool | `cluster` enum |
@@ -602,15 +651,15 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 
 | Toolset | Tools | Read | Write | Destructive |
 |---|---:|---:|---:|---:|
-| [core](#core-14-tools) | 14 | 11 | 2 | 1 |
+| [core](#core-16-tools) | 16 | 13 | 2 | 1 |
 | [data](#data-29-tools) | 29 | 10 | 11 | 8 |
 | [json](#json-3-tools) | 3 | 1 | 1 | 1 |
 | [search](#search-6-tools) | 6 | 5 | 1 | 0 |
 | [pubsub](#pubsub-5-tools) | 5 | 4 | 1 | 0 |
 | [docs](#docs-1-tool) | 1 | 1 | 0 | 0 |
-| **Total** | **58** | **32** | **16** | **10** |
+| **Total** | **60** | **34** | **16** | **10** |
 
-### core (14 tools)
+### core (16 tools)
 
 | Tool | Kind | Needs | Description |
 |---|---|---|---|
@@ -622,6 +671,8 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 | `rename` | write | — | Renames a Redis key from old_key to new_key |
 | `scan_keys` | read | — | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
 | `scan_all_keys` | read | — | Scan and return ALL keys matching a pattern using multiple SCAN iterations |
+| `memory_usage` | read | — | How large a key is, without reading its value: the bytes it takes in memory (MEMORY USAGE), its type, length, encoding and TTL. Use it before reading a value that may be large |
+| `big_keys` | read | — | Find the keys that take the most memory: SCAN the keyspace and measure every key with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
 | `dbsize` | read | — | Get the number of keys stored in the Redis database |
 | `info` | read | — | Get Redis server information and statistics |
 | `client_list` | read | — | Get a list of connected clients to the Redis server |
@@ -1176,8 +1227,9 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `No master found for '<masterName>'` | Without anything after it: the Sentinels answered, but none of them knows a healthy primary named `masterName`; check `masterName`. With ` : <host>:<port> - <error type>: <message>, ...` after it: those Sentinels could not be asked. `ConnectionError` or `TimeoutError`: check the Sentinel addresses (usually port 26379) and the network path (each Sentinel gets at most 2 s). `AuthenticationError: Authentication required.` or `invalid username-password pair ...`: set or fix `<name>_sentinel_pass`. |
 | `Timeout connecting to server` after about 10 s on a cluster with `tls`, or TLS errors such as `CERTIFICATE_VERIFY_FAILED` | `tls` set on a port without TLS: the TLS handshake gets no answer. For certificate errors, set `caFile` to the CA that signed the server certificate (mounted at `/etc/redis-mcp/tls`), and use the host name the certificate is issued for in `hosts`. |
 | `Tool did not finish within 15 s (timeout). The cluster may be slow or unreachable (check clusters_list), or the request too large (narrow the pattern or count).` | Run `clusters_list`. If the cluster shows `status: timeout` or an error, the cluster or the path to it is the cause: Redis Cluster startup nodes that do not answer cost one timeout each and can add up to more than 15 s, and so can more than 8 simultaneous calls to a cluster that hangs, or a slow DNS lookup (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)); fix `hosts`, the network or DNS, or lower the timeouts in `options`. If the cluster is fine, the request is too large: `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large databases use `scan_keys` and page through the keys with the `cursor` it returns (on a Redis Cluster too, see [Toolsets](#toolsets)), or use a more specific tool. Without `clusters_list` listed, the message has no `(check clusters_list)`. |
-| `Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start` | Pass the `cursor` of the previous `scan_keys` call as it is: a number on standalone and Sentinel clusters, text such as `10.0.0.1:6379=1536,10.0.0.2:6379=96` on a Redis Cluster. |
-| `Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...` | A failover or resharding changed the primaries while `scan_keys` was paging. Start again with cursor 0. |
+| `Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start` (or `... previous big_keys call ...`) | Pass the `cursor` of the previous `scan_keys` or `big_keys` call as it is: a number on standalone and Sentinel clusters, text such as `10.0.0.1:6379=1536,10.0.0.2:6379=96` on a Redis Cluster. |
+| `Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...` | A failover or resharding changed the primaries while `scan_keys` or `big_keys` was paging. Start again with cursor 0. |
+| `big_keys` never reaches `scanComplete: true`, or needs very many calls | A call scans for 5 s and the database is large (compare `keysScanned` with `dbsize`). Narrow the `pattern`, take the calls so far as a sample, or run `redis-cli --memkeys` against a replica (see [Key sizes](#key-sizes)). |
 | `status: timeout` in `clusters_list` | The cluster's check did not finish within 13 s, for example two or more Redis Cluster startup nodes that accept connections but do not answer, or a slow DNS lookup. See the `Tool did not finish within 15 s` row. |
 | `Redis Cluster cannot be connected ...` again at once, right after the cluster was fixed | A failed Redis Cluster connection is remembered for 5 s (see [Redis clients](#redis-clients)). The first call after that tries again. |
 | A call fails once with `Error while reading from <host>:<port> : (104, 'Connection reset by peer')`, `Connection closed by server.` or `Timeout reading from socket`, and the next call works | The connection broke while the command was in flight, typically during a restart or a failover. The server sends no command twice, so a write in such a call may or may not have been applied: check before you repeat it. |

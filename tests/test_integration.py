@@ -253,6 +253,8 @@ class TestMCPServerIntegration:
             "rename",
             "scan_keys",
             "scan_all_keys",
+            "memory_usage",
+            "big_keys",
             "search_redis_documents",
             "publish",
             "psubscribe",
@@ -313,13 +315,14 @@ class TestMCPServerIntegration:
         tool_names = [tool["name"] for tool in tools]
 
         # Expected tool count (the @redis_tool declarations in src/tools; legacy mode lists every toolset)
-        expected_tool_count = 55
+        expected_tool_count = 57
         assert len(tools) == expected_tool_count, (
             f"Expected {expected_tool_count} tools, but got {len(tools)}"
         )
 
         # Expected tool names (alphabetically sorted for easier verification)
         expected_tools = [
+            "big_keys",
             "client_list",
             "cluster_nodes",
             "clusters_list",
@@ -347,6 +350,7 @@ class TestMCPServerIntegration:
             "lpop",
             "lpush",
             "lrange",
+            "memory_usage",
             "publish",
             "psubscribe",
             "read_messages",
@@ -417,6 +421,8 @@ class TestMCPServerIntegration:
                 "type",
                 "scan_keys",
                 "scan_all_keys",
+                "memory_usage",
+                "big_keys",
             ],
             "vector_search": [
                 "create_vector_index_hash",

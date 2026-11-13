@@ -45,7 +45,7 @@ MAX_CONCURRENT_CALLS_PER_CLUSTER = 8
 STATUS_TOOL = "clusters_list"
 
 TOOLSETS: Dict[str, str] = {
-    "core": "Clusters, server info and generic key operations (type, scan, expire, rename, delete)",
+    "core": "Clusters, server info and generic key operations (type, scan, sizes, expire, rename, delete)",
     "data": "Strings, hashes (including vectors), lists, sets, sorted sets and streams",
     "json": "RedisJSON documents (clusters with modules: [json])",
     "search": "Redis Query Engine: indexes, vector and hybrid search (clusters with modules: [search])",
