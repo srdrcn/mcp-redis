@@ -651,6 +651,7 @@ def test_key_prefixes_can_be_scanned(mcp):
 
 def test_key_prefixes_takes_one_sample_of_a_large_database(tmp_path):
     """Far more keys than one step holds: one SCAN and about 1000 names, whatever the size."""
+    redis_servers.skip_unless_installed()
     with redis_servers.running(tmp_path) as large:
         client = large.client()
         try:
