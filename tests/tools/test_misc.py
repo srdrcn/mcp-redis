@@ -511,12 +511,15 @@ def test_scan_descriptions_name_no_other_tool():
 
 
 class _Pipeline:
-    """A pipeline of a fake server that holds ``keys``: name -> (type, bytes, length), or an exception as the
-    length for a key whose length command fails. Records each queued command in ``commands``."""
+    """A pipeline of a fake server that holds ``keys``: name -> (type, bytes, length, encoding). ``bytes`` is
+    a number, or {samples: number} for a key whose size depends on the samples; ``length`` may be an exception
+    its length command fails with; the encoding is "hashtable" when left out. Records each queued command in
+    ``commands`` and each executed pipeline's number of commands in ``batches``."""
 
-    def __init__(self, keys, commands):
+    def __init__(self, keys, commands, batches):
         self._keys = keys
         self._commands = commands
+        self._batches = batches
         self._replies = []
 
     def _queue(self, command, key, reply, **options):
@@ -527,17 +530,16 @@ class _Pipeline:
         self._queue("type", key, self._keys[key][0] if key in self._keys else "none")
 
     def memory_usage(self, key, samples=None):
-        self._queue(
-            "memory_usage",
-            key,
-            self._keys[key][1] if key in self._keys else None,
-            samples=samples,
-        )
+        size = self._keys[key][1] if key in self._keys else None
+        if isinstance(size, dict):
+            size = size[samples]
+        self._queue("memory_usage", key, size, samples=samples)
 
     def object(self, infotype, key):
-        self._queue(
-            f"object {infotype}", key, "listpack" if key in self._keys else None
-        )
+        encoding = None
+        if key in self._keys:
+            encoding = (*self._keys[key], "hashtable")[3]
+        self._queue(f"object {infotype}", key, encoding)
 
     def ttl(self, key):
         self._queue("ttl", key, -1 if key in self._keys else -2)
@@ -545,9 +547,12 @@ class _Pipeline:
     def __getattr__(self, command):
         if command not in {"strlen", "hlen", "llen", "scard", "zcard", "xlen"}:
             raise AttributeError(command)
-        return lambda key: self._queue(command, key, self._keys[key][2])
+        return lambda key: self._queue(
+            command, key, self._keys[key][2] if key in self._keys else 0
+        )
 
     def execute(self, raise_on_error=True):
+        self._batches.append(len(self._replies))
         for reply in self._replies:
             if raise_on_error and isinstance(reply, Exception):
                 raise reply
@@ -555,12 +560,18 @@ class _Pipeline:
 
 
 def _holding(client, keys):
-    """Makes the client mock hold ``keys`` (see _Pipeline); returns the list its pipelines' commands go to."""
-    commands = []
+    """Makes the client mock hold ``keys`` (see _Pipeline); returns the list its pipelines' commands go to,
+    with the sizes of the executed pipelines in its ``batches``."""
+
+    class Commands(list):
+        batches = []
+
+    commands = Commands()
+    commands.batches = []
 
     def pipeline(transaction=True):
         assert transaction is False
-        return _Pipeline(keys, commands)
+        return _Pipeline(keys, commands, commands.batches)
 
     client.pipeline.side_effect = pipeline
     return commands
@@ -574,7 +585,9 @@ def _clock(monkeypatch, *times):
 
 @pytest.mark.asyncio
 async def test_memory_usage_of_a_hash(mock_redis_connection_manager):
-    commands = _holding(mock_redis_connection_manager, {"h": ("hash", 4096, 3)})
+    commands = _holding(
+        mock_redis_connection_manager, {"h": ("hash", 4096, 3, "listpack")}
+    )
 
     result = await misc.memory_usage("h")
 
@@ -590,9 +603,9 @@ async def test_memory_usage_of_a_hash(mock_redis_connection_manager):
     # the value is never read
     assert commands == [
         ("type", "h"),
-        ("memory_usage", "h", {"samples": 5}),
-        ("object ENCODING", "h"),
         ("ttl", "h"),
+        ("memory_usage", "h", {"samples": 1000}),
+        ("object ENCODING", "h"),
         ("hlen", "h"),
     ]
 
@@ -625,11 +638,48 @@ async def test_memory_usage_counts_each_type_with_its_own_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key_type, length, encoding, samples, estimated",
+    [
+        # more elements than samples: their size is scaled to the length
+        ("hash", 1001, "hashtable", 1000, True),
+        ("zset", 5000, "skiplist", 1000, True),
+        ("list", 5000, "quicklist", 1000, True),
+        ("set", 50, "hashtable", 49, True),
+        ("stream", 2000, "stream", 1000, True),
+        # every element is measured
+        ("hash", 1000, "hashtable", 1000, False),
+        ("set", 50, "hashtable", 50, False),
+        ("hash", 5000, "hashtable", 5000, False),
+        # one block of memory, measured whole whatever the samples
+        ("hash", 400, "listpack", 5, False),
+        ("set", 400, "intset", 5, False),
+        ("zset", 100, "ziplist", 5, False),
+        # a string is not sampled
+        ("string", 5_000_000, "raw", 5, False),
+    ],
+)
+async def test_memory_usage_marks_an_estimate(
+    mock_redis_connection_manager, key_type, length, encoding, samples, estimated
+):
+    _holding(mock_redis_connection_manager, {"k": (key_type, 900, length, encoding)})
+
+    result = await misc.memory_usage("k", samples=samples)
+
+    assert result.get("estimated", False) is estimated
+    assert list(result)[:4] == (
+        ["key", "type", "bytes", "estimated"]
+        if estimated
+        else ["key", "type", "bytes", "length"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_memory_usage_of_a_module_type_has_no_length(
     mock_redis_connection_manager,
 ):
     commands = _holding(
-        mock_redis_connection_manager, {"doc": ("ReJSON-RL", 900, None)}
+        mock_redis_connection_manager, {"doc": ("ReJSON-RL", 900, None, "raw")}
     )
 
     result = await misc.memory_usage("doc")
@@ -638,7 +688,7 @@ async def test_memory_usage_of_a_module_type_has_no_length(
         "key": "doc",
         "type": "ReJSON-RL",
         "bytes": 900,
-        "encoding": "listpack",
+        "encoding": "raw",
         "ttl": -1,
     }
     assert len(commands) == 4
@@ -658,7 +708,7 @@ async def test_memory_usage_passes_the_samples(mock_redis_connection_manager):
 
     await misc.memory_usage("l", samples=misc.MAX_SAMPLES)
 
-    assert ("memory_usage", "l", {"samples": 1000}) in commands
+    assert ("memory_usage", "l", {"samples": 10000}) in commands
 
 
 @pytest.mark.asyncio
@@ -669,7 +719,7 @@ async def test_memory_usage_rejects_samples_out_of_range(
     """0 would make MEMORY USAGE walk every element of the key."""
     result = await misc.memory_usage("k", samples=samples)
 
-    assert result == {"error": "samples must be between 1 and 1000"}
+    assert result == {"error": "samples must be between 1 and 10000"}
     mock_redis_connection_manager.pipeline.assert_not_called()
 
 
@@ -685,7 +735,7 @@ async def test_memory_usage_on_a_key_that_changed_type_has_no_length(
     result = await misc.memory_usage("k")
 
     assert result["bytes"] == 100
-    assert "length" not in result and "lengthUnit" not in result
+    assert not {"length", "lengthUnit", "estimated"} & set(result)
 
 
 @pytest.mark.asyncio
@@ -694,6 +744,18 @@ async def test_memory_usage_reports_a_length_command_that_fails(
 ):
     denied = RedisError("NOPERM this user has no permissions to run the 'hlen' command")
     _holding(mock_redis_connection_manager, {"k": ("hash", 100, denied)})
+
+    assert await misc.memory_usage("k") == {"error": str(denied)}
+
+
+@pytest.mark.asyncio
+async def test_memory_usage_reports_a_memory_usage_that_fails(
+    mock_redis_connection_manager,
+):
+    denied = RedisError(
+        "NOPERM this user has no permissions to run the 'memory|usage' command"
+    )
+    _holding(mock_redis_connection_manager, {"k": ("hash", denied, 3)})
 
     assert await misc.memory_usage("k") == {"error": str(denied)}
 
@@ -720,10 +782,36 @@ async def test_memory_usage_on_a_redis_cluster(mock_redis_cluster):
 
 
 KEYS = {
-    b"cache:1": (b"string", 300, 250),
-    b"session:1": (b"hash", 5000, 3),
-    b"queue": (b"list", 90000, 1200),
-    b"session:2": (b"hash", 7000, 4),
+    b"cache:1": (b"string", 300, 250, b"raw"),
+    b"session:1": (b"hash", 5000, 3, b"listpack"),
+    b"queue": (b"list", 90000, 1200, b"quicklist"),
+    b"session:2": (b"hash", 7000, 4, b"listpack"),
+}
+QUEUE = {
+    "key": "queue",
+    "type": "list",
+    "bytes": 90000,
+    "estimated": True,
+    "length": 1200,
+    "lengthUnit": "items",
+    "encoding": "quicklist",
+}
+SESSION_1 = {
+    "key": "session:1",
+    "type": "hash",
+    "bytes": 5000,
+    "length": 3,
+    "lengthUnit": "fields",
+    "encoding": "listpack",
+}
+SESSION_2 = {**SESSION_1, "key": "session:2", "bytes": 7000, "length": 4}
+CACHE_1 = {
+    "key": "cache:1",
+    "type": "string",
+    "bytes": 300,
+    "length": 250,
+    "lengthUnit": "bytes",
+    "encoding": "raw",
 }
 
 
@@ -744,36 +832,7 @@ async def test_big_keys_scans_until_the_scan_is_complete(mock_redis_connection_m
         "scanComplete": True,
         "keysScanned": 4,
         "dbsize": 40,
-        "keys": [
-            {
-                "key": "queue",
-                "type": "list",
-                "bytes": 90000,
-                "length": 1200,
-                "lengthUnit": "items",
-            },
-            {
-                "key": "session:2",
-                "type": "hash",
-                "bytes": 7000,
-                "length": 4,
-                "lengthUnit": "fields",
-            },
-            {
-                "key": "session:1",
-                "type": "hash",
-                "bytes": 5000,
-                "length": 3,
-                "lengthUnit": "fields",
-            },
-            {
-                "key": "cache:1",
-                "type": "string",
-                "bytes": 300,
-                "length": 250,
-                "lengthUnit": "bytes",
-            },
-        ],
+        "keys": [QUEUE, SESSION_2, SESSION_1, CACHE_1],
         "byType": {
             "list": {"keys": 1, "bytes": 90000},
             "hash": {"keys": 2, "bytes": 12000},
@@ -785,20 +844,82 @@ async def test_big_keys_scans_until_the_scan_is_complete(mock_redis_connection_m
         {"cursor": 0, "match": "*", "count": misc.BIG_KEYS_SCAN_COUNT},
         {"cursor": 17, "match": "*", "count": misc.BIG_KEYS_SCAN_COUNT},
     ]
-    # every key is measured with the default number of samples, and no value is read
-    assert commands[:4] == [
+    # every key is measured with the 5 samples of the scan
+    assert commands[:8] == [
         ("type", b"cache:1"),
         ("memory_usage", b"cache:1", {"samples": 5}),
         ("type", b"session:1"),
         ("memory_usage", b"session:1", {"samples": 5}),
+        ("type", b"queue"),
+        ("memory_usage", b"queue", {"samples": 5}),
+        ("type", b"session:2"),
+        ("memory_usage", b"session:2", {"samples": 5}),
+    ]
+    # the listed keys again, with more; no value is read
+    assert commands[8:11] == [
+        ("memory_usage", b"queue", {"samples": 1000}),
+        ("object ENCODING", b"queue"),
+        ("llen", b"queue"),
     ]
     assert {c[0] for c in commands} == {
         "type",
         "memory_usage",
+        "object ENCODING",
         "strlen",
         "hlen",
         "llen",
     }
+
+
+@pytest.mark.asyncio
+async def test_big_keys_measures_the_listed_keys_again(mock_redis_connection_manager):
+    """The 5 samples of the scan rank the keys; the listed ones come back with the size 1000 samples give."""
+    mock_redis = mock_redis_connection_manager
+    keys = {
+        # the scan caught one of its few large fields: far too large
+        b"lucky": (b"hash", {5: 20_000_000, 1000: 1_200_000}, 1000, b"hashtable"),
+        # and none of this one's
+        b"unlucky": (b"hash", {5: 400_000, 1000: 3_000_000}, 800, b"hashtable"),
+        b"steady": (b"hash", {5: 2_000_000, 1000: 2_100_000}, 4000, b"hashtable"),
+        b"small": (b"string", 100, 50, b"raw"),
+    }
+    commands = _holding(mock_redis, keys)
+    mock_redis.scan.return_value = (0, list(keys))
+    mock_redis.dbsize.return_value = 4
+
+    result = await misc.big_keys("*", top=3)
+
+    assert [(k["key"], k["bytes"]) for k in result["keys"]] == [
+        ("unlucky", 3_000_000),
+        ("steady", 2_100_000),
+        ("lucky", 1_200_000),
+    ]
+    # only the key with more elements than samples is still an estimate
+    assert [k.get("estimated", False) for k in result["keys"]] == [False, True, False]
+    # the totals are those of the scan
+    assert result["byType"] == {
+        "hash": {"keys": 3, "bytes": 22_400_000},
+        "string": {"keys": 1, "bytes": 100},
+    }
+    assert ("memory_usage", b"small", {"samples": 1000}) not in commands
+
+
+@pytest.mark.asyncio
+async def test_big_keys_measures_the_listed_keys_ten_at_a_time(
+    mock_redis_connection_manager,
+):
+    """A pipeline runs without the server serving other clients, so the larger measurements are split."""
+    mock_redis = mock_redis_connection_manager
+    keys = {b"k%d" % i: (b"hash", 1000 + i, 2000, b"hashtable") for i in range(25)}
+    commands = _holding(mock_redis, keys)
+    mock_redis.scan.return_value = (0, list(keys))
+    mock_redis.dbsize.return_value = 25
+
+    result = await misc.big_keys("*", top=25)
+
+    assert len(result["keys"]) == 25
+    # the scan step (TYPE and MEMORY USAGE of 25 keys), then 10, 10 and 5 keys with three commands each
+    assert commands.batches == [50, 30, 30, 15]
 
 
 @pytest.mark.asyncio
@@ -852,6 +973,24 @@ async def test_big_keys_top_and_min_bytes(mock_redis_connection_manager):
 
 
 @pytest.mark.asyncio
+async def test_big_keys_min_bytes_applies_to_the_size_it_lists(
+    mock_redis_connection_manager,
+):
+    mock_redis = mock_redis_connection_manager
+    keys = {
+        b"shrinks": (b"hash", {5: 9000, 1000: 4000}, 900, b"hashtable"),
+        b"stays": (b"hash", {5: 9000, 1000: 8000}, 900, b"hashtable"),
+    }
+    _holding(mock_redis, keys)
+    mock_redis.scan.return_value = (0, list(keys))
+    mock_redis.dbsize.return_value = 2
+
+    result = await misc.big_keys("*", min_bytes=5000)
+
+    assert [(k["key"], k["bytes"]) for k in result["keys"]] == [("stays", 8000)]
+
+
+@pytest.mark.asyncio
 async def test_big_keys_passes_the_pattern(mock_redis_connection_manager):
     mock_redis = mock_redis_connection_manager
     _holding(mock_redis, KEYS)
@@ -876,8 +1015,28 @@ async def test_big_keys_skips_a_key_that_is_gone(mock_redis_connection_manager):
     result = await misc.big_keys("*")
 
     assert result["keysScanned"] == 1
-    assert [k["key"] for k in result["keys"]] == ["cache:1"]
+    assert result["keys"] == [CACHE_1]
     assert result["byType"] == {"string": {"keys": 1, "bytes": 300}}
+
+
+@pytest.mark.asyncio
+async def test_big_keys_leaves_out_a_key_that_is_gone_when_measured_again(
+    mock_redis_connection_manager,
+):
+    mock_redis = mock_redis_connection_manager
+    keys = {
+        b"stays": (b"string", 300, 250, b"raw"),
+        b"expires": (b"hash", {5: 9000, 1000: None}, 0, None),
+    }
+    _holding(mock_redis, keys)
+    mock_redis.scan.return_value = (0, list(keys))
+    mock_redis.dbsize.return_value = 1
+
+    result = await misc.big_keys("*")
+
+    assert [k["key"] for k in result["keys"]] == ["stays"]
+    # it was there when the scan measured it
+    assert result["keysScanned"] == 2
 
 
 @pytest.mark.asyncio
@@ -909,6 +1068,7 @@ async def test_big_keys_on_an_empty_database(mock_redis_connection_manager):
         "byType": {},
     }
     assert commands == []
+    assert commands.batches == []
 
 
 @pytest.mark.asyncio
@@ -917,29 +1077,28 @@ async def test_big_keys_marks_a_key_name_that_is_not_utf8(
 ):
     mock_redis = mock_redis_connection_manager
     _holding(
-        mock_redis, {b"odd:\x8e": (b"string", 80, 1), b"plain": (b"string", 70, 1)}
+        mock_redis,
+        {
+            b"odd:\x8e": (b"string", 80, 1, b"embstr"),
+            b"plain": (b"string", 70, 1, b"embstr"),
+        },
     )
     mock_redis.scan.return_value = (0, [b"odd:\x8e", b"plain"])
     mock_redis.dbsize.return_value = 2
 
     result = await misc.big_keys("*")
 
+    plain = {
+        "key": "plain",
+        "type": "string",
+        "bytes": 70,
+        "length": 1,
+        "lengthUnit": "bytes",
+        "encoding": "embstr",
+    }
     assert result["keys"] == [
-        {
-            "key": "odd:\\x8e",
-            "type": "string",
-            "bytes": 80,
-            "length": 1,
-            "lengthUnit": "bytes",
-            "nonUtf8Key": True,
-        },
-        {
-            "key": "plain",
-            "type": "string",
-            "bytes": 70,
-            "length": 1,
-            "lengthUnit": "bytes",
-        },
+        {**plain, "key": "odd:\\x8e", "bytes": 80, "nonUtf8Key": True},
+        plain,
     ]
 
 
@@ -1035,9 +1194,9 @@ async def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(
     assert first["cursor"] == "n1:7000=12"
     assert first["scanComplete"] is False
     assert first["keysScanned"] == 3
-    assert [k["key"] for k in first["keys"]] == ["session:2", "session:1", "cache:1"]
+    assert first["keys"] == [SESSION_2, SESSION_1, CACHE_1]
     assert (last["cursor"], last["scanComplete"]) == (0, True)
-    assert [k["key"] for k in last["keys"]] == ["queue"]
+    assert last["keys"] == [QUEUE]
     assert _scan_calls(mock_redis_cluster) == [
         ("n1:7000", 0, misc.BIG_KEYS_SCAN_COUNT),
         ("n2:7001", 0, misc.BIG_KEYS_SCAN_COUNT),
@@ -1125,6 +1284,8 @@ def test_size_descriptions_state_the_limits():
     )
     assert f"scans for about {misc.BIG_KEYS_SECONDS} s" in misc.big_keys.__doc__
     assert f"default 10, at most {misc.MAX_BIG_KEYS}" in misc.big_keys.__doc__
-    assert f"an estimate from {misc.DEFAULT_SAMPLES} of its elements" in (
+    assert f"a quick estimate ({misc.SCAN_SAMPLES} elements" in misc.big_keys.__doc__
+    assert f"measured again with {misc.DEFAULT_SAMPLES} elements" in (
         misc.big_keys.__doc__
     )
+    assert f"more than {misc.DEFAULT_SAMPLES}\n" in misc.big_keys.__doc__
