@@ -188,38 +188,29 @@ def test_big_keys_agrees_with_memory_usage(mcp):
 
 
 def test_big_keys_measures_every_key_with_the_prefix(mcp):
-    """s*: the small:* strings, the set and the stream."""
-    result = _call(mcp, "big_keys", pattern="s*", top=100)
+    result = _call(mcp, "big_keys", pattern="small:*", top=100)
 
     assert result["scanComplete"] is True
-    assert result["keysScanned"] == SMALL_KEYS + 2 == len(result["keys"])
+    assert result["keysScanned"] == SMALL_KEYS == len(result["keys"])
     assert result["dbsize"] == ALL_KEYS
-    assert {t: totals["keys"] for t, totals in result["byType"].items()} == {
-        "string": SMALL_KEYS,
-        "set": 1,
-        "stream": 1,
-    }
     sizes = [entry["bytes"] for entry in result["keys"]]
     assert sizes == sorted(sizes, reverse=True)
-    # nothing here is an estimate, so the sizes of the scan add up to those of the list
-    assert sum(sizes) == sum(totals["bytes"] for totals in result["byType"].values())
-    assert list(result["byType"].values()) == sorted(
-        result["byType"].values(), key=lambda totals: totals["bytes"], reverse=True
-    )
+    # strings are measured exactly, so the sizes of the scan add up to those of the list
+    assert result["byType"] == {"string": {"keys": SMALL_KEYS, "bytes": sum(sizes)}}
 
 
-def test_big_keys_requires_a_prefix(mcp):
-    """pattern has no default, and a pattern that could match every key is turned down."""
+def test_big_keys_requires_a_whole_prefix(mcp):
+    """pattern has no default, and a pattern that could match most keys is turned down."""
     (tool,) = [t for t in asyncio.run(mcp.list_tools()) if t.name == "big_keys"]
     assert tool.inputSchema["required"] == ["pattern"]
     assert "default" not in tool.inputSchema["properties"]["pattern"]
 
     with pytest.raises(ToolError, match="pattern"):
         asyncio.run(mcp.call_tool("big_keys", {}))
-    for pattern in ("*", "*:string", "?ig:*", "[b]ig:*", ""):
+    for pattern in ("*", "s*", "big*", "*:string", "?ig:*", "[b]ig:*", ""):
         assert _call(mcp, "big_keys", pattern=pattern) == (
-            f"Error: pattern must start with a key prefix, for example session:* (it is {pattern!r})."
-            " Ask the user which prefix to measure."
+            "Error: pattern must start with a whole key prefix, up to a separator, for example session:*"
+            f" (it is {pattern!r}). Ask the user which prefix to measure."
         )
 
 
@@ -561,7 +552,12 @@ def test_scan_keys_on_a_redis_cluster_pages_through_one_node(cluster_mcp, replic
     seen, cursor = [], 0
     for _ in range(500):
         page = _call(
-            cluster_mcp, "scan_keys", pattern="*", count=5, cursor=cursor, node=replica
+            cluster_mcp,
+            "scan_keys",
+            pattern="small:*",
+            count=5,
+            cursor=cursor,
+            node=replica,
         )
         assert isinstance(page, dict), page
         assert page["node"] == replica
@@ -573,8 +569,137 @@ def test_scan_keys_on_a_redis_cluster_pages_through_one_node(cluster_mcp, replic
     else:
         raise AssertionError("scan_keys did not finish")
 
-    assert sorted(seen) == _keys_of(replica)
+    assert sorted(seen) == [k for k in _keys_of(replica) if k.startswith("small:")]
     assert 0 < len(seen) < CLUSTER_KEYS
+
+
+def test_scan_keys_without_a_whole_prefix_is_one_sample_page(mcp):
+    """Key names to look at, and no way to walk the keyspace with them."""
+    sample = _call(mcp, "scan_keys", pattern="*", count=10)
+    again = _call(mcp, "scan_keys", pattern="s*", count=10)
+
+    assert sample["sample"] is True and again["sample"] is True
+    assert "cursor" not in sample
+    assert sample["scan_complete"] is False
+    assert 0 < len(sample["keys"]) < ALL_KEYS
+    for cursor in (1, 8, "24"):
+        assert _call(mcp, "scan_keys", pattern="*", count=10, cursor=cursor) == (
+            "Error: pattern '*' does not start with a whole key prefix, so it returns one sample page and"
+            " cannot be continued. To page, use a pattern that starts with a key prefix up to a separator,"
+            " for example session:*. Ask the user which prefix to scan."
+        )
+    assert _call(mcp, "scan_keys", pattern="small:*", count=1001) == (
+        "Error: count must be between 1 and 1000"
+    )
+
+
+def test_scan_keys_with_a_whole_prefix_pages_to_the_end(mcp):
+    seen, cursor = [], 0
+    for _ in range(500):
+        page = _call(mcp, "scan_keys", pattern="small:*", count=10, cursor=cursor)
+        assert "sample" not in page
+        seen.extend(page["keys"])
+        cursor = page["cursor"]
+        if page["scan_complete"]:
+            break
+    else:
+        raise AssertionError("scan_keys did not finish")
+
+    assert sorted(seen) == sorted(f"small:{i}" for i in range(SMALL_KEYS))
+
+
+def test_key_prefixes_of_a_server(mcp):
+    """Fewer keys than one step holds: the sample is every key, and no key name comes back."""
+    result = _call(mcp, "key_prefixes")
+
+    assert result == {
+        "sampledKeys": ALL_KEYS,
+        "dbsize": ALL_KEYS,
+        "scanComplete": True,
+        "prefixes": [
+            {"pattern": "small:*", "keys": SMALL_KEYS},
+            {"pattern": "big:hash", "keys": 1},
+            {"pattern": "big:string", "keys": 1},
+            {"pattern": "expiring", "keys": 1},
+            {"pattern": "list", "keys": 1},
+            # the key whose name is not UTF-8
+            {"pattern": "odd:*", "keys": 1},
+            {"pattern": "set", "keys": 1},
+            {"pattern": "stream", "keys": 1},
+            {"pattern": "uneven", "keys": 1},
+            {"pattern": "zset", "keys": 1},
+        ],
+    }
+    top = _call(mcp, "key_prefixes", top=1)
+    assert top["prefixes"] == [{"pattern": "small:*", "keys": SMALL_KEYS}]
+    assert top["otherPrefixes"] == {"patterns": 9, "keys": 9}
+
+
+def test_key_prefixes_can_be_scanned(mcp):
+    """A pattern it returns is a pattern the scans page with."""
+    (pattern,) = [
+        entry["pattern"]
+        for entry in _call(mcp, "key_prefixes")["prefixes"]
+        if entry["keys"] == SMALL_KEYS
+    ]
+
+    page = _call(mcp, "scan_keys", pattern=pattern, count=1000)
+    sizes = _call(mcp, "big_keys", pattern=pattern, top=100)
+
+    assert len(page["keys"]) == sizes["keysScanned"] == SMALL_KEYS
+
+
+def test_key_prefixes_takes_one_sample_of_a_large_database(tmp_path):
+    """Far more keys than one step holds: one SCAN and about 1000 names, whatever the size."""
+    with redis_servers.running(tmp_path) as large:
+        client = large.client()
+        try:
+            pipe = client.pipeline(transaction=False)
+            for i in range(30_000):
+                pipe.set(f"session:{i}", "1")
+                if i % 3 == 0:
+                    pipe.set(f"user:{i}:profile", "1")
+            pipe.execute()
+            client.config_resetstat()
+            mcp = _server([{"name": "large", "hosts": large.address}])
+
+            result = _call(mcp, "key_prefixes")
+            again = _call(mcp, "key_prefixes")
+
+            scans = client.info("commandstats")["cmdstat_scan"]["calls"]
+        finally:
+            client.close()
+
+    assert result == again
+    assert scans == 2
+    assert result["dbsize"] == 40_000
+    assert result["scanComplete"] is False
+    assert 800 < result["sampledKeys"] < 1300
+    found = {entry["pattern"]: entry["keys"] for entry in result["prefixes"]}
+    assert set(found) == {"session:*", "user:*:profile"}
+    assert sum(found.values()) == result["sampledKeys"]
+    # three keys in four are sessions
+    assert 0.65 < found["session:*"] / result["sampledKeys"] < 0.85
+
+
+def test_key_prefixes_on_a_redis_cluster_samples_the_named_node(
+    cluster_mcp, primaries, replicas
+):
+    without_node = _call(cluster_mcp, "key_prefixes")
+    assert without_node.startswith(
+        "Error: cluster rc is a Redis Cluster: node is required, the one node to scan."
+    )
+
+    for node in (primaries[0], replicas[0]):
+        result = _call(cluster_mcp, "key_prefixes", node=node)
+        own = _keys_of(node)
+
+        assert result["node"] == node
+        assert result["sampledKeys"] == result["dbsize"] == len(own)
+        assert result["scanComplete"] is True
+        found = {entry["pattern"]: entry["keys"] for entry in result["prefixes"]}
+        assert found["small:*"] == len([k for k in own if k.startswith("small:")])
+        assert sum(found.values()) == len(own)
 
 
 def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(
