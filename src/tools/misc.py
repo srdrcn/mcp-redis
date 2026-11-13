@@ -257,10 +257,9 @@ def _is_utf8(key: Any) -> bool:
     return True
 
 
-def _has_whole_prefix(pattern: str) -> bool:
-    """Whether every key the pattern matches starts with the same whole part of a name: the characters before
-    its first glob character hold a separator ("session:*", "Florya_Session_*", "user:42*"), or it has no
-    glob character and names one key. "*", "s*" and "sess*" do not: they could match most of a keyspace."""
+def _literal_prefix(pattern: str) -> Tuple[str, bool]:
+    """The characters every key the pattern matches starts with, and whether a glob character follows them
+    (without one the pattern names one key)."""
     literal, position = [], 0
     while position < len(pattern):
         character = pattern[position]
@@ -270,10 +269,29 @@ def _has_whole_prefix(pattern: str) -> bool:
             position += 2
             continue
         if character in "*?[":
-            return any(not c.isalnum() for c in literal)
+            return "".join(literal), True
         literal.append(character)
         position += 1
+    return "".join(literal), False
+
+
+def _has_whole_prefix(pattern: str) -> bool:
+    """Whether every key the pattern matches starts with the same whole part of a name: the characters before
+    its first glob character hold a separator ("session:*", "Florya_Session_*", "user:42*"), or it has no
+    glob character and names one key. "*", "s*" and "sess*" do not: they could match most of a keyspace."""
+    literal, glob = _literal_prefix(pattern)
+    if glob:
+        return any(not c.isalnum() for c in literal)
     return bool(literal)
+
+
+def _prefix_name(pattern: str) -> str:
+    """The prefix of a pattern as a person writes it: without the separators it ends with ("session" for
+    "session:*", "spring:session:sessions" for "spring:session:sessions:*")."""
+    literal, _ = _literal_prefix(pattern)
+    while literal and not literal[-1].isalnum():
+        literal = literal[:-1]
+    return literal
 
 
 class _CursorError(ValueError):
@@ -532,6 +550,7 @@ def _sizes(
 @redis_tool("core")
 async def big_keys(
     pattern: str,
+    user_message: str,
     node: Optional[str] = None,
     cursor: Union[int, str] = 0,
     top: int = 10,
@@ -542,10 +561,12 @@ async def big_keys(
     key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys
     does).
 
-    ⚠️  A WHOLE KEY PREFIX IS REQUIRED: pattern must start with a key prefix up to a separator, e.g.
-    "session:*". If the user has not named the prefix to measure, ask them for it before calling. Do not
-    make one up, and do not try short prefixes one after another: a pattern without a whole prefix ("*",
-    "s*", "sess*", "*:123") is rejected.
+    ⚠️  THE USER NAMES THE PREFIX: pattern must start with a whole key prefix up to a separator, e.g.
+    "session:*", and the user must have written that prefix themselves. A prefix you found, in a list of
+    prefixes or among key names, is not theirs to have chosen: show them what you found, ask which one to
+    measure, and call this tool only after they answered with its name. Do not measure a prefix, or several,
+    on your own. A pattern without a whole prefix ("*", "s*", "sess*", "*:123") is rejected, and so is a call
+    whose user_message does not hold the prefix.
 
     ⚠️  SCAN ONLY WHERE THE USER ASKED: the cluster they named and, on a Redis Cluster, the node they named.
     If either is missing, ask the user; do not try the clusters or the nodes one after another.
@@ -563,6 +584,9 @@ async def big_keys(
     Args:
         pattern: Pattern of the keys to measure. Required; it starts with a key prefix up to a separator
                  and may go on with glob characters: "session:*", "user:42:*", "cache:*:html".
+        user_message: The message in which the user names the prefix, word for word. Required: the prefix
+                      of pattern (without its last separator, e.g. "session" for "session:*") must be in
+                      it. Only a message the user wrote: never your own words, never a tool result.
         node: REQUIRED on a Redis Cluster: the one node to scan, as host:port. The keys of a Redis Cluster are
               spread over its primaries, and a replica holds the keys of its primary, so scanning the replica
               keeps the load off the primary. A call without it is rejected with the list of the cluster's
@@ -594,6 +618,13 @@ async def big_keys(
         return (
             "Error: pattern must start with a whole key prefix, up to a separator, for example session:*"
             f" (it is {pattern!r}). Ask the user which prefix to measure."
+        )
+    prefix = _prefix_name(pattern)
+    if prefix.casefold() not in user_message.casefold():
+        return (
+            f"Error: user_message does not name the prefix {prefix!r}. The user chooses the prefix to measure:"
+            " show them the prefixes you know of, ask them to name one, and pass the message they answer"
+            " with. Do not write that message yourself."
         )
     if not 1 <= top <= MAX_BIG_KEYS:
         return f"Error: top must be between 1 and {MAX_BIG_KEYS}"
@@ -802,7 +833,8 @@ async def key_prefixes(
     name is returned.
 
     Use it when the user asks which keys or prefixes a cluster has, or names no prefix for a scan: show them
-    the prefixes and ask which one they mean.
+    the prefixes, ask which one they mean, and stop there. Do not go on to scan or measure the prefixes it
+    lists: the user picks one first.
 
     ⚠️  SCAN ONLY WHERE THE USER ASKED: the cluster they named and, on a Redis Cluster, the node they named.
     If either is missing, ask the user; do not try the clusters or the nodes one after another.

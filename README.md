@@ -547,6 +547,17 @@ give: the descriptions tell the model to ask for it and not to make one up.
 - **`big_keys`** has no default `pattern` and rejects one without a whole prefix: `Error: pattern must start with
   a whole key prefix, up to a separator, for example session:* (it is 's*'). Ask the user which prefix to
   measure.`
+- **`big_keys` also takes the user's own words.** `user_message` is required: the message in which the user
+  names the prefix, word for word. The prefix of the pattern, without the separators it ends with (`session`
+  for `session:*`, `spring:session:sessions` for `spring:session:sessions:*`), must be in it, in any case;
+  otherwise nothing is scanned: `Error: user_message does not name the prefix 'session'. The user chooses the
+  prefix to measure: show them the prefixes you know of, ask them to name one, and pass the message they
+  answer with. Do not write that message yourself.` This is there because a model asked for the largest keys
+  took a prefix it had found itself (from `key_prefixes`, or from key names) and measured it without asking,
+  although the description told it to ask. The server compares text and cannot tell who wrote a message: the
+  parameter makes the model state where the prefix comes from, and a model that fills it with a message the
+  user never wrote goes against its instructions in plain sight. To make sure of the user's consent whatever
+  the model does, have the MCP client ask for approval before it calls `big_keys`.
 - **`scan_keys`** pages only with a whole prefix. Any other pattern, the default `*` included, returns **one
   sample page**: the keys of one `SCAN` step, `sample: true` in place of the `cursor`, and nothing to continue
   with. A call that passes a cursor with such a pattern is rejected (`Error: pattern '*' does not start with a
@@ -775,7 +786,7 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 | `scan_keys` | read | `node` on a Redis Cluster; a whole key prefix in `pattern` to page | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
 | `scan_all_keys` | read | — | Scan and return ALL keys matching a pattern using multiple SCAN iterations |
 | `memory_usage` | read | — | How large a key is, without reading its value: the bytes it takes in memory (MEMORY USAGE), its type, length, encoding and TTL. Use it before reading a value that may be large |
-| `big_keys` | read | a whole key prefix in `pattern`; `node` on a Redis Cluster | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
+| `big_keys` | read | a whole key prefix in `pattern`, named by the user in `user_message`; `node` on a Redis Cluster | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
 | `key_prefixes` | read | `node` on a Redis Cluster | List the key prefixes found in a sample of about 1000 keys of a server, such as "session:*" 490: one SCAN step, whose key names are grouped by their fixed parts inside this server. No value is read and no key name is returned |
 | `dbsize` | read | — | Get the number of keys stored in the Redis database |
 | `info` | read | — | Get Redis server information and statistics |
@@ -1336,6 +1347,7 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `Error: node <host:port> is not a node of the Redis Cluster <name>. Its nodes, as host:port: ...` | The address is not one the cluster gives its nodes, and its host name does not resolve to exactly one of them. Use an address from the list; a node that has just joined, or a replica that has replicated nothing yet, is not listed by `CLUSTER SLOTS`. |
 | `Error: cluster <name> is not a Redis Cluster (mode <mode>): it has one server, so leave node out` | `node` belongs to `mode: cluster`. A standalone or Sentinel cluster is scanned on its one server. |
 | `Error: pattern must start with a whole key prefix, up to a separator, for example session:* (it is 's*'). Ask the user which prefix to measure.` | `big_keys` measures the keys with one prefix: pass a pattern whose start is a key prefix up to a separator (`session:*`), not `*`, `s*` or `sess*` (see [Scans need a whole key prefix](#scans-need-a-whole-key-prefix)). `key_prefixes` shows which prefixes a server has. |
+| `Error: user_message does not name the prefix '<prefix>'. The user chooses the prefix to measure: ...` | `big_keys` was called with a prefix that is not in the user's message passed as `user_message`, usually one the model picked itself. The user has to name the prefix (they can copy it from the list of `key_prefixes`); a reply such as "the first one" does not hold it. |
 | `Error: pattern '*' does not start with a whole key prefix, so it returns one sample page and cannot be continued. ...` | `scan_keys` was given a cursor with a pattern that has no whole prefix. Such a pattern returns one sample page (`sample: true`, no `cursor`); to page, pass a pattern such as `session:*`. |
 | `Error: count must be between 1 and 1000` | `count` of `scan_keys` is limited, because one `SCAN` command with a large count keeps the server from answering other clients until it is done. |
 | `big_keys` never reaches `scanComplete: true`, or needs very many calls | A call scans for 5 s and the database is large: `SCAN` walks every key, and every key with the prefix is measured. Use a longer prefix, take the calls so far as a sample, or run `redis-cli --memkeys` against a replica (see [Key sizes](#key-sizes)). |

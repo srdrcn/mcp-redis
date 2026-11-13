@@ -793,16 +793,31 @@ class TestRedisCluster:
         finally:
             client.close()
 
+        asked = "mcp:it:size ile başlayanların en büyükleri"
         without_node = cluster_stdio.call(
-            "big_keys", cluster=REDIS_CLUSTER, pattern="mcp:it:size:*"
+            "big_keys",
+            cluster=REDIS_CLUSTER,
+            pattern="mcp:it:size:*",
+            user_message=asked,
         )
         assert "node is required" in without_node["structuredContent"]["result"]
+        not_named = cluster_stdio.call(
+            "big_keys",
+            cluster=REDIS_CLUSTER,
+            pattern="mcp:it:size:*",
+            user_message="en büyük key'leri göster",
+            node=next(iter(keys.values())).address,
+        )
+        assert not_named["structuredContent"]["result"].startswith(
+            "Error: user_message does not name the prefix 'mcp:it:size'."
+        )
 
         for thousands, (key, node) in enumerate(keys.items(), start=1):
             result = cluster_stdio.call(
                 "big_keys",
                 cluster=REDIS_CLUSTER,
                 pattern="mcp:it:size:*",
+                user_message=asked,
                 node=node.address,
             )
 

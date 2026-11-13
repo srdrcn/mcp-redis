@@ -64,6 +64,17 @@ def _call(mcp, tool, /, **arguments):
     return structured["result"]
 
 
+def _named(tool):
+    """What big_keys needs on top of a scan's arguments: the user's message that names the prefix small."""
+    return {"user_message": "measure small"} if tool == "big_keys" else {}
+
+
+def _big_keys(mcp, /, **arguments):
+    """big_keys as when the user's message names the prefix of the pattern."""
+    arguments.setdefault("user_message", f"measure {arguments.get('pattern', '')}")
+    return _call(mcp, "big_keys", **arguments)
+
+
 def test_memory_usage_of_a_string(mcp):
     result = _call(mcp, "memory_usage", key="big:string")
 
@@ -148,7 +159,7 @@ def test_memory_usage_rejects_samples_out_of_range(mcp):
 
 
 def test_big_keys_lists_the_largest_first(mcp):
-    result = _call(mcp, "big_keys", pattern="big:*")
+    result = _big_keys(mcp, pattern="big:*")
 
     string, big_hash = result["keys"]
     assert (string["key"], string["type"]) == ("big:string", "string")
@@ -169,7 +180,7 @@ def test_big_keys_lists_the_largest_first(mcp):
 def test_big_keys_measures_a_listed_key_again(mcp):
     """The scan measures 5 fields of the uneven hash, which makes it some KB or 20 MB and more (the total of
     its type); the key that is listed has the size of its 1000 fields."""
-    result = _call(mcp, "big_keys", pattern="uneven")
+    result = _big_keys(mcp, pattern="uneven")
 
     (entry,) = result["keys"]
     assert 1_000_000 < entry["bytes"] < 1_300_000
@@ -181,14 +192,14 @@ def test_big_keys_measures_a_listed_key_again(mcp):
 
 
 def test_big_keys_agrees_with_memory_usage(mcp):
-    (entry,) = _call(mcp, "big_keys", pattern="big:string")["keys"]
+    (entry,) = _big_keys(mcp, pattern="big:string")["keys"]
     single = _call(mcp, "memory_usage", key="big:string")
 
     assert entry == {k: single[k] for k in entry}
 
 
 def test_big_keys_measures_every_key_with_the_prefix(mcp):
-    result = _call(mcp, "big_keys", pattern="small:*", top=100)
+    result = _big_keys(mcp, pattern="small:*", top=100)
 
     assert result["scanComplete"] is True
     assert result["keysScanned"] == SMALL_KEYS == len(result["keys"])
@@ -202,22 +213,39 @@ def test_big_keys_measures_every_key_with_the_prefix(mcp):
 def test_big_keys_requires_a_whole_prefix(mcp):
     """pattern has no default, and a pattern that could match most keys is turned down."""
     (tool,) = [t for t in asyncio.run(mcp.list_tools()) if t.name == "big_keys"]
-    assert tool.inputSchema["required"] == ["pattern"]
+    assert tool.inputSchema["required"] == ["pattern", "user_message"]
     assert "default" not in tool.inputSchema["properties"]["pattern"]
 
     with pytest.raises(ToolError, match="pattern"):
         asyncio.run(mcp.call_tool("big_keys", {}))
     for pattern in ("*", "s*", "big*", "*:string", "?ig:*", "[b]ig:*", ""):
-        assert _call(mcp, "big_keys", pattern=pattern) == (
+        assert _big_keys(mcp, pattern=pattern) == (
             "Error: pattern must start with a whole key prefix, up to a separator, for example session:*"
             f" (it is {pattern!r}). Ask the user which prefix to measure."
         )
 
 
+def test_big_keys_needs_the_users_message_that_names_the_prefix(mcp):
+    """Nothing is scanned for a prefix the user did not write: the call is turned down before any command."""
+    with pytest.raises(ToolError, match="user_message"):
+        asyncio.run(mcp.call_tool("big_keys", {"pattern": "small:*"}))
+    for user_message in ("", "show me the biggest keys", "the first one", "big"):
+        assert _call(mcp, "big_keys", pattern="small:*", user_message=user_message) == (
+            "Error: user_message does not name the prefix 'small'. The user chooses the prefix to measure: show"
+            " them the prefixes you know of, ask them to name one, and pass the message they answer with. Do"
+            " not write that message yourself."
+        )
+
+    named = _call(
+        mcp, "big_keys", pattern="small:*", user_message="SMALL: olanlara bak"
+    )
+    assert named["keysScanned"] == SMALL_KEYS
+
+
 def test_big_keys_top_and_min_bytes(mcp):
-    top = _call(mcp, "big_keys", pattern="big:*", top=1)
-    large = _call(mcp, "big_keys", pattern="big:*", min_bytes=200_000)
-    small = _call(mcp, "big_keys", pattern="small:*", top=3)
+    top = _big_keys(mcp, pattern="big:*", top=1)
+    large = _big_keys(mcp, pattern="big:*", min_bytes=200_000)
+    small = _big_keys(mcp, pattern="small:*", top=3)
 
     assert [entry["key"] for entry in top["keys"]] == ["big:string"]
     # also matches big:hash, which is smaller
@@ -229,7 +257,7 @@ def test_big_keys_top_and_min_bytes(mcp):
 
 
 def test_big_keys_marks_a_key_name_that_is_not_utf8(mcp):
-    (entry,) = _call(mcp, "big_keys", pattern="odd:*")["keys"]
+    (entry,) = _big_keys(mcp, pattern="odd:*")["keys"]
 
     assert entry["bytes"] >= 50_000
     del entry["bytes"]
@@ -244,7 +272,7 @@ def test_big_keys_marks_a_key_name_that_is_not_utf8(mcp):
 
 
 def test_big_keys_rejects_an_invalid_cursor(mcp):
-    assert _call(mcp, "big_keys", pattern="big:*", cursor="abc") == (
+    assert _big_keys(mcp, pattern="big:*", cursor="abc") == (
         "Error: invalid cursor: pass the cursor returned by the previous big_keys call unchanged, or 0 to"
         " start"
     )
@@ -254,7 +282,7 @@ def _all_pages(mcp, **arguments):
     """Calls big_keys with the cursor it returns until the scan is complete; the pages."""
     pages, cursor = [], 0
     for _ in range(500):
-        page = _call(mcp, "big_keys", cursor=cursor, **arguments)
+        page = _big_keys(mcp, cursor=cursor, **arguments)
         assert isinstance(page, dict), page
         pages.append(page)
         cursor = page["cursor"]
@@ -324,7 +352,7 @@ def acl_users(server, monkeypatch):
 
 def test_the_readme_acl_user_can_run_both_tools(acl_users):
     single = _call(acl_users, "memory_usage", cluster="reader", key="big:hash")
-    scan = _call(acl_users, "big_keys", cluster="reader", pattern="big:*")
+    scan = _big_keys(acl_users, cluster="reader", pattern="big:*")
 
     assert (single["length"], single["encoding"]) == (2000, "hashtable")
     assert [entry["key"] for entry in scan["keys"]] == ["big:string", "big:hash"]
@@ -334,7 +362,7 @@ def test_the_readme_acl_user_can_run_both_tools(acl_users):
 def test_a_user_without_memory_usage_gets_the_error(acl_users):
     """Not an empty result: the call names the command the user may not run."""
     single = _call(acl_users, "memory_usage", cluster="limited", key="big:hash")
-    scan = _call(acl_users, "big_keys", cluster="limited", pattern="big:*")
+    scan = _big_keys(acl_users, cluster="limited", pattern="big:*")
 
     assert list(single) == ["error"]
     assert "memory|usage" in single["error"]
@@ -410,7 +438,7 @@ def test_memory_usage_on_a_redis_cluster(cluster_mcp, redis_cluster):
 @pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
 def test_a_scan_of_a_redis_cluster_needs_a_node(cluster_mcp, primaries, replicas, tool):
     """Without a node nothing is scanned, and the error lists every node with its role."""
-    result = _call(cluster_mcp, tool, pattern="small:*")
+    result = _call(cluster_mcp, tool, pattern="small:*", **_named(tool))
 
     assert result.startswith(
         "Error: cluster rc is a Redis Cluster: node is required, the one node to scan. Its nodes, as"
@@ -427,7 +455,9 @@ def test_a_scan_of_a_redis_cluster_needs_a_node(cluster_mcp, primaries, replicas
 
 @pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
 def test_a_scan_rejects_a_node_the_redis_cluster_does_not_have(cluster_mcp, tool):
-    result = _call(cluster_mcp, tool, pattern="small:*", node="127.0.0.1:1")
+    result = _call(
+        cluster_mcp, tool, pattern="small:*", node="127.0.0.1:1", **_named(tool)
+    )
 
     assert result.startswith(
         "Error: node 127.0.0.1:1 is not a node of the Redis Cluster rc. Its nodes, as host:port: "
@@ -436,7 +466,7 @@ def test_a_scan_rejects_a_node_the_redis_cluster_does_not_have(cluster_mcp, tool
 
 @pytest.mark.parametrize("tool", ["scan_keys", "big_keys"])
 def test_a_scan_rejects_a_node_on_a_standalone_cluster(mcp, server, tool):
-    result = _call(mcp, tool, pattern="small:*", node=server.address)
+    result = _call(mcp, tool, pattern="small:*", node=server.address, **_named(tool))
 
     assert result == (
         "Error: cluster local is not a Redis Cluster (mode standalone): it has one server, so leave node out"
@@ -449,9 +479,7 @@ def test_big_keys_on_a_redis_cluster_measures_only_the_named_node(
     """Each primary holds its own share of the keys; together they hold all of them."""
     measured = {}
     for primary in primaries:
-        result = _call(
-            cluster_mcp, "big_keys", pattern="small:*", node=primary, top=100
-        )
+        result = _big_keys(cluster_mcp, pattern="small:*", node=primary, top=100)
         own = [key for key in _keys_of(primary) if key.startswith("small:")]
 
         assert (result["cursor"], result["scanComplete"]) == (0, True)
@@ -473,12 +501,8 @@ def test_big_keys_on_a_replica_measures_the_keys_of_its_primary(
     for replica in replicas:
         primary = primary_of[tuple(_keys_of(replica))]
 
-        on_replica = _call(
-            cluster_mcp, "big_keys", pattern="small:*", node=replica, top=100
-        )
-        on_primary = _call(
-            cluster_mcp, "big_keys", pattern="small:*", node=primary, top=100
-        )
+        on_replica = _big_keys(cluster_mcp, pattern="small:*", node=replica, top=100)
+        on_primary = _big_keys(cluster_mcp, pattern="small:*", node=primary, top=100)
 
         assert on_replica["node"] == replica
         assert on_replica["scanComplete"] is True
@@ -491,9 +515,7 @@ def test_big_keys_on_a_replica_measures_the_keys_of_its_primary(
     big = [
         entry
         for replica in replicas
-        for entry in _call(cluster_mcp, "big_keys", pattern="big:*", node=replica)[
-            "keys"
-        ]
+        for entry in _big_keys(cluster_mcp, pattern="big:*", node=replica)["keys"]
     ]
     assert sorted((e["key"], e["length"]) for e in big) == [
         ("big:hash", 2000),
@@ -528,7 +550,7 @@ def test_the_readme_acl_user_can_scan_a_replica(redis_cluster, replicas, monkeyp
         ]
     )
 
-    scan = _call(mcp, "big_keys", pattern="small:*", node=replicas[0], top=100)
+    scan = _big_keys(mcp, pattern="small:*", node=replicas[0], top=100)
     page = _call(mcp, "scan_keys", pattern="small:*", node=replicas[0], count=1000)
 
     own = [key for key in _keys_of(replicas[0]) if key.startswith("small:")]
@@ -542,7 +564,7 @@ def test_scans_accept_a_host_name_for_a_node(cluster_mcp, primaries):
     port = primaries[0].rpartition(":")[2]
 
     page = _call(cluster_mcp, "scan_keys", pattern="small:*", node=f"localhost:{port}")
-    sizes = _call(cluster_mcp, "big_keys", pattern="small:*", node=f"LOCALHOST:{port}")
+    sizes = _big_keys(cluster_mcp, pattern="small:*", node=f"LOCALHOST:{port}")
 
     assert page["node"] == sizes["node"] == primaries[0]
 
@@ -644,7 +666,7 @@ def test_key_prefixes_can_be_scanned(mcp):
     ]
 
     page = _call(mcp, "scan_keys", pattern=pattern, count=1000)
-    sizes = _call(mcp, "big_keys", pattern=pattern, top=100)
+    sizes = _big_keys(mcp, pattern=pattern, top=100)
 
     assert len(page["keys"]) == sizes["keysScanned"] == SMALL_KEYS
 
