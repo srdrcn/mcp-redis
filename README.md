@@ -466,7 +466,8 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
 - `memory_usage` and `big_keys` need `MEMORY USAGE`, `OBJECT ENCODING`, `TYPE`, `TTL`, `SCAN`, `DBSIZE` and the
   length commands (`STRLEN`, `HLEN`, `LLEN`, `SCARD`, `ZCARD`, `XLEN`). All of them are in `@read` and none is in
   `@dangerous` (`MEMORY USAGE` is the only `MEMORY` subcommand in `@read`). A user that lacks one of them gets
-  that command's `no permissions` error, not an empty result.
+  that command's `no permissions` error, not an empty result. On a node of a Redis Cluster `big_keys` also sends
+  `READONLY`, which is in `@connection`.
 - The `pubsub` toolset needs `+subscribe +psubscribe +unsubscribe +punsubscribe` (and `+publish` for the write
   tool `publish`): pub/sub commands are not in `@read` or `@write`.
 - The `json` and `search` tools use module commands (`JSON.GET`, `JSON.SET`, `JSON.DEL`, `FT._LIST`, `FT.INFO`,
@@ -498,17 +499,40 @@ time is up; a call right after `subscribe` waits like any other. Subscriptions a
 `read_messages` then answers `Subscription '<id>' was not found`; this is why the Deployment runs a single replica.
 
 On a Redis Cluster, `dbsize` adds up the keys of every primary, and `scan_all_keys` scans every primary until each
-one is done. `scan_keys` runs one `SCAN` step on every primary that has not finished (`count` applies to each of
-them) and returns what they found together. Its `cursor` is then text that holds the position of every unfinished
-primary (`10.0.0.1:6379=1536,10.0.0.2:6379=96`): passing it back continues those primaries, and `cursor: 0` with
-`scan_complete: true` means every primary is done. The cursor must be passed back unchanged: the server checks only
-its form and its nodes, so a cursor with an entry left out ends the scan of that primary early without an error. A
-malformed cursor is rejected (`Error: invalid cursor: ...`), and so is one that names a node that is no longer a
-primary after a failover or resharding (`Error: node <host:port> of the cursor is not a primary of this Redis
-Cluster ...`); start again with cursor 0. As with any `SCAN` on a Redis Cluster, keys whose slots move between
-primaries while the scan pages can be missed or returned twice. On standalone and Sentinel clusters the cursor is the
-number Redis returns. The example config lists no `scan_all_keys` (`excludeTools`), so keys are listed page by page
-with `scan_keys`.
+one is done. The example config lists no `scan_all_keys` (`excludeTools`), so keys are listed page by page with
+`scan_keys`.
+
+### Scans name their node
+
+`scan_keys` and `big_keys` scan one server per call. On a standalone or Sentinel cluster that is the cluster's
+server. A Redis Cluster has several, so there the call must say which one: `node`, the `host:port` of a primary
+or of a replica. A scan never spreads over the nodes of a Redis Cluster on its own, and with several clusters
+configured `cluster` is required as well, so a call scans exactly the cluster and the node it names. The
+descriptions of both tools tell the model to ask the user when either is missing, and not to try the clusters
+or the nodes one after another.
+
+- The keys of a Redis Cluster are spread over its primaries, so one node shows only its share of the keys with a
+  prefix. To see all of them, scan every primary, or one replica of every primary: a replica holds the keys of
+  its primary, and scanning it keeps the load off the primary.
+- A call without `node` scans nothing and lists the nodes, each primary with its replicas:
+  `Error: cluster cbprdrds is a Redis Cluster: node is required, the one node to scan. Its nodes, as host:port:
+  10.0.0.1:6500 (primary; replicas: 10.0.0.2:6501), 10.0.0.2:6500 (primary; replicas: 10.0.0.3:6501), ... Ask the
+  user which node to scan.` A node the cluster does not have is rejected with the same list (`Error: node
+  10.0.0.9:6500 is not a node of the Redis Cluster cbprdrds. ...`). Before either error the server reads the
+  cluster's nodes again, so the list is the current one.
+- A node is named by the address the cluster gives it (`CLUSTER SLOTS`, the addresses `cluster_nodes` shows),
+  mostly an IP address. A host name with the node's port is accepted when it resolves to the address of
+  exactly one node with that port, so `cbprdrds01.example.com:6500` works where the pod can resolve the name.
+- On a cluster that is not a Redis Cluster, `node` must be left out: `Error: cluster cbdevrds is not a Redis
+  Cluster (mode standalone): it has one server, so leave node out`. The call fails instead of scanning that
+  server under another node's name.
+- The result names the scanned node in `node`. The `cursor` is the number `SCAN` returns, in every mode; pass it
+  back unchanged with the same `node`. A malformed cursor is rejected (`Error: invalid cursor: ...`). As with any
+  `SCAN`, a key can be missed or returned twice while the keyspace changes; a key whose slot moves to another
+  node during a `big_keys` scan is left out.
+- The commands go to the node over a connection of its own. On a node of a Redis Cluster, `big_keys` starts each
+  pipeline with `READONLY`, without which a replica redirects the commands on its keys to its primary; on a
+  primary it changes nothing.
 
 ### Key sizes
 
@@ -525,8 +549,8 @@ return a value whole, however large, so these two are the way to look first.
   pipeline. It returns `keys`, the `top` largest keys it measured (default 10, at most 100, largest first,
   without those under `min_bytes`) with their `type`, `bytes`, `length`, `lengthUnit` and `encoding`, and
   `byType`: for each type, the number of keys it measured and their bytes in total, whatever `top` and
-  `min_bytes`. `keysScanned` is the number of keys the call measured and `dbsize` the number of keys in the
-  database, whatever the pattern.
+  `min_bytes`. `keysScanned` is the number of keys the call measured and `dbsize` the number of keys on the
+  scanned server, whatever the pattern.
 
 **`big_keys` takes a key prefix.** `pattern` has no default, so a call cannot leave it out, and it must start
 with the literal characters of a prefix (`session:*`, `user:42:*`, `cache:*:html`). A pattern that starts with
@@ -571,13 +595,11 @@ More samples take server time: with 1000 samples `MEMORY USAGE` took at most 0.3
 whole key: 39 ms on the hash of 400,000 fields.
 
 **One `big_keys` call scans for 5 s.** It then returns what it found and a `cursor`, and the next call continues
-from there; `cursor: 0` with `scanComplete: true` means the whole keyspace was scanned. The cursor is the one of
-`scan_keys`: a number on standalone and Sentinel clusters, and on a Redis Cluster text with the position of
-every primary that has not finished, with the same errors for a malformed cursor or a node that is no longer a
-primary (see above). A call runs one `SCAN` step on each unfinished primary in turn until its 5 s are over. Each
-call reports the largest keys of that call only, so the caller keeps the largest across the calls and adds up
-`byType`. A key can be counted twice when `SCAN` returns it twice (it may, while the keyspace grows or shrinks),
-and a key that expired between `SCAN` and `MEMORY USAGE` is left out.
+from there; `cursor: 0` with `scanComplete: true` means the server was scanned to the end. On a Redis Cluster
+that server is the node the call names (see [Scans name their node](#scans-name-their-node)). Each call reports
+the largest keys of that call only, so the caller keeps the largest across the calls and adds up `byType`. A key
+can be counted twice when `SCAN` returns it twice (it may, while the keyspace grows or shrinks), and a key that
+expired between `SCAN` and `MEMORY USAGE` is left out.
 
 Measured on a local Redis 7.0 with 1,000,000 keys (strings, three-field hashes and short lists), a whole scan
 by the share of the keys that have the prefix:
@@ -713,10 +735,10 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 | `type` | read | — | Returns the string representation of the type of the value stored at key |
 | `expire` | write | — | Set an expiration time for a Redis key |
 | `rename` | write | — | Renames a Redis key from old_key to new_key |
-| `scan_keys` | read | — | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
+| `scan_keys` | read | `node` on a Redis Cluster | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
 | `scan_all_keys` | read | — | Scan and return ALL keys matching a pattern using multiple SCAN iterations |
 | `memory_usage` | read | — | How large a key is, without reading its value: the bytes it takes in memory (MEMORY USAGE), its type, length, encoding and TTL. Use it before reading a value that may be large |
-| `big_keys` | read | a key prefix in `pattern` | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
+| `big_keys` | read | a key prefix in `pattern`; `node` on a Redis Cluster | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
 | `dbsize` | read | — | Get the number of keys stored in the Redis database |
 | `info` | read | — | Get Redis server information and statistics |
 | `client_list` | read | — | Get a list of connected clients to the Redis server |
@@ -1270,9 +1292,11 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `Error -2 connecting to <host>:<port>. Name or service not known.` (or `Error -3 ... Temporary failure in name resolution`) | The host name does not resolve from the pod. Check the name in `hosts` and the pod's DNS (see [DNS lookups](#dns-lookups)). |
 | `No master found for '<masterName>'` | Without anything after it: the Sentinels answered, but none of them knows a healthy primary named `masterName`; check `masterName`. With ` : <host>:<port> - <error type>: <message>, ...` after it: those Sentinels could not be asked. `ConnectionError` or `TimeoutError`: check the Sentinel addresses (usually port 26379) and the network path (each Sentinel gets at most 2 s). `AuthenticationError: Authentication required.` or `invalid username-password pair ...`: set or fix `<name>_sentinel_pass`. |
 | `Timeout connecting to server` after about 10 s on a cluster with `tls`, or TLS errors such as `CERTIFICATE_VERIFY_FAILED` | `tls` set on a port without TLS: the TLS handshake gets no answer. For certificate errors, set `caFile` to the CA that signed the server certificate (mounted at `/etc/redis-mcp/tls`), and use the host name the certificate is issued for in `hosts`. |
-| `Tool did not finish within 15 s (timeout). The cluster may be slow or unreachable (check clusters_list), or the request too large (narrow the pattern or count).` | Run `clusters_list`. If the cluster shows `status: timeout` or an error, the cluster or the path to it is the cause: Redis Cluster startup nodes that do not answer cost one timeout each and can add up to more than 15 s, and so can more than 8 simultaneous calls to a cluster that hangs, or a slow DNS lookup (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)); fix `hosts`, the network or DNS, or lower the timeouts in `options`. If the cluster is fine, the request is too large: `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large databases use `scan_keys` and page through the keys with the `cursor` it returns (on a Redis Cluster too, see [Toolsets](#toolsets)), or use a more specific tool. Without `clusters_list` listed, the message has no `(check clusters_list)`. |
-| `Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start` (or `... previous big_keys call ...`) | Pass the `cursor` of the previous `scan_keys` or `big_keys` call as it is: a number on standalone and Sentinel clusters, text such as `10.0.0.1:6379=1536,10.0.0.2:6379=96` on a Redis Cluster. |
-| `Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...` | A failover or resharding changed the primaries while `scan_keys` or `big_keys` was paging. Start again with cursor 0. |
+| `Tool did not finish within 15 s (timeout). The cluster may be slow or unreachable (check clusters_list), or the request too large (narrow the pattern or count).` | Run `clusters_list`. If the cluster shows `status: timeout` or an error, the cluster or the path to it is the cause: Redis Cluster startup nodes that do not answer cost one timeout each and can add up to more than 15 s, and so can more than 8 simultaneous calls to a cluster that hangs, or a slow DNS lookup (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)); fix `hosts`, the network or DNS, or lower the timeouts in `options`. If the cluster is fine, the request is too large: `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large databases use `scan_keys` and page through the keys with the `cursor` it returns (on a Redis Cluster node by node, see [Scans name their node](#scans-name-their-node)), or use a more specific tool. Without `clusters_list` listed, the message has no `(check clusters_list)`. |
+| `Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start` (or `... previous big_keys call ...`) | Pass the `cursor` of the previous `scan_keys` or `big_keys` call as it is, a number, with the same `node`. |
+| `Error: cluster <name> is a Redis Cluster: node is required, the one node to scan. Its nodes, as host:port: ...` | `scan_keys` and `big_keys` scan one node of a Redis Cluster per call. Pass `node`, one of the listed addresses: a primary, or one of its replicas to keep the load off the primary (see [Scans name their node](#scans-name-their-node)). |
+| `Error: node <host:port> is not a node of the Redis Cluster <name>. Its nodes, as host:port: ...` | The address is not one the cluster gives its nodes, and its host name does not resolve to exactly one of them. Use an address from the list; a node that has just joined, or a replica that has replicated nothing yet, is not listed by `CLUSTER SLOTS`. |
+| `Error: cluster <name> is not a Redis Cluster (mode <mode>): it has one server, so leave node out` | `node` belongs to `mode: cluster`. A standalone or Sentinel cluster is scanned on its one server. |
 | `Error: pattern must start with a key prefix, for example session:* (it is '*'). Ask the user which prefix to measure.` | `big_keys` measures the keys with one prefix: pass a pattern that starts with it (`session:*`), not one that starts with `*`, `?` or `[` (see [Key sizes](#key-sizes)). |
 | `big_keys` never reaches `scanComplete: true`, or needs very many calls | A call scans for 5 s and the database is large: `SCAN` walks every key, and every key with the prefix is measured. Use a longer prefix, take the calls so far as a sample, or run `redis-cli --memkeys` against a replica (see [Key sizes](#key-sizes)). |
 | `status: timeout` in `clusters_list` | The cluster's check did not finish within 13 s, for example two or more Redis Cluster startup nodes that accept connections but do not answer, or a slow DNS lookup. See the `Tool did not finish within 15 s` row. |
