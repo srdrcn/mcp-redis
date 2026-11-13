@@ -255,6 +255,7 @@ class TestMCPServerIntegration:
             "scan_all_keys",
             "memory_usage",
             "big_keys",
+            "key_prefixes",
             "search_redis_documents",
             "publish",
             "psubscribe",
@@ -315,7 +316,7 @@ class TestMCPServerIntegration:
         tool_names = [tool["name"] for tool in tools]
 
         # Expected tool count (the @redis_tool declarations in src/tools; legacy mode lists every toolset)
-        expected_tool_count = 57
+        expected_tool_count = 58
         assert len(tools) == expected_tool_count, (
             f"Expected {expected_tool_count} tools, but got {len(tools)}"
         )
@@ -345,6 +346,7 @@ class TestMCPServerIntegration:
             "json_del",
             "json_get",
             "json_set",
+            "key_prefixes",
             "llen",
             "lrem",
             "lpop",
@@ -423,6 +425,7 @@ class TestMCPServerIntegration:
                 "scan_all_keys",
                 "memory_usage",
                 "big_keys",
+                "key_prefixes",
             ],
             "vector_search": [
                 "create_vector_index_hash",

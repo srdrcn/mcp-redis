@@ -1,3 +1,4 @@
+import random
 from unittest.mock import Mock, patch
 
 import pytest
@@ -389,8 +390,8 @@ async def test_scan_keys_on_a_redis_cluster_pages_with_the_cursor(mock_redis_clu
     clients = _nodes(mock_redis_cluster)
     clients[P1].scan.side_effect = [(12, ["a:1"]), (0, ["a:2"])]
 
-    first = await misc.scan_keys("*", count=10, node=P1)
-    last = await misc.scan_keys("*", count=10, node=P1, cursor=str(first["cursor"]))
+    first = await misc.scan_keys("a:*", count=10, node=P1)
+    last = await misc.scan_keys("a:*", count=10, node=P1, cursor=str(first["cursor"]))
 
     assert (first["cursor"], first["scan_complete"]) == (12, False)
     assert last == {
@@ -532,11 +533,11 @@ async def test_a_node_is_rejected_on_a_cluster_that_is_not_a_redis_cluster(
 async def test_scan_keys_accepts_a_cursor_given_as_text(mock_redis_connection_manager):
     mock_redis_connection_manager.scan.return_value = (0, [])
 
-    result = await misc.scan_keys("*", cursor="1234")
+    result = await misc.scan_keys("user:*", cursor="1234")
 
     assert result["scan_complete"] is True
     mock_redis_connection_manager.scan.assert_called_once_with(
-        cursor=1234, match="*", count=100
+        cursor=1234, match="user:*", count=100
     )
 
 
@@ -1173,30 +1174,63 @@ async def test_big_keys_rejects_values_out_of_range(
     mock_redis_connection_manager.scan.assert_not_called()
 
 
+NO_WHOLE_PREFIX = [
+    "*",
+    "",
+    "s*",
+    "sess*",
+    "session*",
+    "*session",
+    "*:123",
+    "?ession:*",
+    "[st]ession:*",
+]
+WHOLE_PREFIX = [
+    "session:*",
+    "s:*",
+    "user:42*",
+    "user:42:*",
+    "cache:*:html",
+    "Florya_Session_*",
+    "rate-limit*",
+    "one-key",
+    "onekey",
+    "\\*starred*",
+    "a\\:b*",
+]
+
+
+@pytest.mark.parametrize("pattern", NO_WHOLE_PREFIX)
+def test_a_pattern_without_a_whole_prefix(pattern):
+    """Nothing before the first glob character, or only the start of a name: it could match most keys."""
+    assert misc._has_whole_prefix(pattern) is False
+
+
+@pytest.mark.parametrize("pattern", WHOLE_PREFIX)
+def test_a_pattern_with_a_whole_prefix(pattern):
+    """A part of the name up to a separator comes before the first glob character, or the pattern names
+    one key."""
+    assert misc._has_whole_prefix(pattern) is True
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "pattern", ["*", "", "*session", "*:session:*", "?ession:*", "[st]ession:*"]
-)
-async def test_big_keys_rejects_a_pattern_without_a_prefix(
+@pytest.mark.parametrize("pattern", NO_WHOLE_PREFIX)
+async def test_big_keys_rejects_a_pattern_without_a_whole_prefix(
     mock_redis_connection_manager, pattern
 ):
-    """A pattern that starts with a glob character has no prefix: it could match every key."""
     result = await misc.big_keys(pattern)
 
     assert result == (
-        f"Error: pattern must start with a key prefix, for example session:* (it is {pattern!r})."
-        " Ask the user which prefix to measure."
+        "Error: pattern must start with a whole key prefix, up to a separator, for example session:*"
+        f" (it is {pattern!r}). Ask the user which prefix to measure."
     )
     mock_redis_connection_manager.scan.assert_not_called()
     mock_redis_connection_manager.pipeline.assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "pattern",
-    ["session:*", "s*", "user:42:*", "cache:*:html", "one-key", "\\*starred*"],
-)
-async def test_big_keys_accepts_a_pattern_that_starts_with_a_prefix(
+@pytest.mark.parametrize("pattern", WHOLE_PREFIX)
+async def test_big_keys_accepts_a_pattern_with_a_whole_prefix(
     mock_redis_connection_manager, pattern
 ):
     mock_redis = mock_redis_connection_manager
@@ -1217,7 +1251,7 @@ def test_big_keys_has_no_default_pattern():
     parameters = inspect.signature(misc.big_keys).parameters
 
     assert parameters["pattern"].default is inspect.Parameter.empty
-    assert "A KEY PREFIX IS REQUIRED" in misc.big_keys.__doc__
+    assert "A WHOLE KEY PREFIX IS REQUIRED" in misc.big_keys.__doc__
     assert "ask them for it before calling" in misc.big_keys.__doc__
 
 
@@ -1427,7 +1461,7 @@ async def test_big_keys_on_a_redis_cluster_rejects_a_node_it_does_not_have(
 
 
 def test_scan_descriptions_require_the_node_and_the_users_choice():
-    for tool in (misc.scan_keys, misc.big_keys):
+    for tool in (misc.scan_keys, misc.big_keys, misc.key_prefixes):
         assert "SCAN ONLY WHERE THE USER ASKED" in tool.__doc__
         assert "do not try the clusters or the nodes one after another" in tool.__doc__
         assert (
@@ -1463,3 +1497,371 @@ def test_size_descriptions_state_the_limits():
         misc.big_keys.__doc__
     )
     assert f"more than {misc.DEFAULT_SAMPLES}\n" in misc.big_keys.__doc__
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern", ["*", "s*", "sess*", "*:123"])
+async def test_scan_keys_without_a_whole_prefix_returns_a_sample(
+    mock_redis_connection_manager, pattern
+):
+    """One page of names, and no cursor to walk the keyspace with."""
+    mock_redis_connection_manager.scan.return_value = (17, [b"session:1", b"user:2"])
+
+    result = await misc.scan_keys(pattern, count=1000)
+
+    assert result == {
+        "keys": ["session:1", "user:2"],
+        "total_scanned": 2,
+        "scan_complete": False,
+        "sample": True,
+    }
+    mock_redis_connection_manager.scan.assert_called_once_with(
+        cursor=0, match=pattern, count=1000
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_default_pattern_is_a_sample(mock_redis_connection_manager):
+    mock_redis_connection_manager.scan.return_value = (5, [b"k"])
+
+    result = await misc.scan_keys()
+
+    assert result["sample"] is True and "cursor" not in result
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_sample_of_a_small_database_is_the_whole_scan(
+    mock_redis_connection_manager,
+):
+    """SCAN came back to 0 in one step: every key was seen, so there is nothing to continue."""
+    mock_redis_connection_manager.scan.return_value = (0, [b"a", b"b"])
+
+    result = await misc.scan_keys("*")
+
+    assert result == {
+        "cursor": 0,
+        "keys": ["a", "b"],
+        "total_scanned": 2,
+        "scan_complete": True,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern", ["*", "s*", "*:123"])
+@pytest.mark.parametrize("cursor", [17, "17"])
+async def test_scan_keys_without_a_whole_prefix_cannot_be_continued(
+    mock_redis_connection_manager, pattern, cursor
+):
+    result = await misc.scan_keys(pattern, cursor=cursor)
+
+    assert result == (
+        f"Error: pattern {pattern!r} does not start with a whole key prefix, so it returns one sample page"
+        " and cannot be continued. To page, use a pattern that starts with a key prefix up to a separator,"
+        " for example session:*. Ask the user which prefix to scan."
+    )
+    mock_redis_connection_manager.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_with_a_whole_prefix_pages(mock_redis_connection_manager):
+    mock_redis = mock_redis_connection_manager
+    mock_redis.scan.side_effect = [(17, [b"session:1"]), (0, [b"session:2"])]
+
+    first = await misc.scan_keys("session:*")
+    last = await misc.scan_keys("session:*", cursor=first["cursor"])
+
+    assert (first["cursor"], first["scan_complete"]) == (17, False)
+    assert "sample" not in first
+    assert (last["cursor"], last["scan_complete"]) == (0, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, -5, misc.MAX_SCAN_COUNT + 1, 100_000])
+async def test_scan_keys_rejects_a_count_out_of_range(
+    mock_redis_connection_manager, count
+):
+    """One SCAN command with a large COUNT keeps the server from answering anyone else until it is done."""
+    result = await misc.scan_keys("session:*", count=count)
+
+    assert result == "Error: count must be between 1 and 1000"
+    mock_redis_connection_manager.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_sample_on_a_redis_cluster_names_the_node(mock_redis_cluster):
+    clients = _nodes(mock_redis_cluster)
+    clients[R1].scan.return_value = (9, [b"session:1"])
+
+    result = await misc.scan_keys("*", node=R1)
+
+    assert result == {
+        "keys": ["session:1"],
+        "total_scanned": 1,
+        "scan_complete": False,
+        "sample": True,
+        "node": R1,
+    }
+
+
+def _patterns(*keys):
+    names = misc._KeyNames()
+    for key in keys:
+        names.add(key)
+    return names.patterns()
+
+
+def test_key_names_with_an_id_become_one_pattern():
+    """A part with a digit is variable: UUIDs, numbers, dates."""
+    assert _patterns(
+        b"spring:session:sessions:f43a430b-4af3-43cb-a545-b19327d0f414",
+        b"spring:session:sessions:ce7eb517-8711-4d18-a5ff-8fa085bf0c94",
+        b"spring:session:sessions:expires:ce7eb517-8711-4d18-a5ff-8fa085bf0c94",
+        b"customerSolutionsWithEligibility::30962005140",
+        b"customerSolutionsWithEligibility::0680684141",
+        b"customerSolutionsWithEligibility::55846550592",
+        b"Florya_Session_3f2a9c",
+        b"report:2026-11-13",
+    ) == [
+        ("customerSolutionsWithEligibility::*", 3),
+        ("spring:session:sessions:*", 2),
+        ("Florya_Session_*", 1),
+        ("report:*", 1),
+        ("spring:session:sessions:expires:*", 1),
+    ]
+
+
+def test_key_names_keep_the_fixed_parts_after_an_id():
+    assert _patterns(
+        "user:1:profile", "user:2:profile", "user:2:settings", "user:17"
+    ) == [("user:*:profile", 2), ("user:*", 1), ("user:*:settings", 1)]
+
+
+def test_key_names_without_a_variable_part_stay_as_they_are():
+    assert _patterns(b"config", b"maintenance_mode", b"feature:flags") == [
+        ("config", 1),
+        ("feature:flags", 1),
+        ("maintenance_mode", 1),
+    ]
+
+
+def test_key_names_are_split_at_every_separator():
+    assert _patterns(b"a.b/c|d_e:1", b"a.b/c|d_e:2", b"{user1000}.following") == [
+        ("a.b/c|d_e:*", 2),
+        ("*.following", 1),
+    ]
+
+
+def test_key_names_escape_their_glob_characters():
+    """The pattern of a name with a glob character matches that name, not what the character would."""
+    patterns = dict(_patterns(b"we*ird[x]:a", b"what?:1", b"back\\slash"))
+
+    assert patterns == {"we\\*ird\\[x\\]:a": 1, "what\\?:*": 1, "back\\\\slash": 1}
+    assert all(misc._has_whole_prefix(pattern) for pattern in patterns)
+
+
+def test_key_names_that_are_not_utf8():
+    assert _patterns(b"odd:\x8e", b"odd:\xff\xfe") == [("odd:*", 2)]
+
+
+def test_key_names_with_very_many_parts_end_in_one_variable_part():
+    deep = ":".join("abcdefghijklmnopqrst")
+
+    assert _patterns(deep, deep + ":more") == [("a:b:c:d:e:f:g:h:i:j:k:l:*", 2)]
+
+
+def test_many_different_names_at_one_place_are_a_variable_part():
+    """Ids without a digit (user names, e-mail addresses): past 200 of them the place is variable."""
+    words = [f"{a}{b}{c}" for a in "abcdefgh" for b in "abcdefgh" for c in "abcdefgh"]
+    assert len(words) == 512
+
+    patterns = _patterns(*(f"otp:{word}@example.com" for word in words))
+
+    assert patterns == [("otp:*.com", 512)]
+
+
+def test_a_name_with_many_keys_among_many_rare_ones_stays():
+    """spring:session:sessions:<id> and spring:session:sessions:expires:<id>, with ids without a digit: half
+    of the keys under sessions: are under expires:, which stays a name while the ids merge."""
+    ids = [f"{a}{b}{c}" for a in "abcdefgh" for b in "abcdefgh" for c in "abcdefgh"]
+    keys = []
+    for value in ids:
+        keys.append(f"sessions:{value}")
+        keys.append(f"sessions:expires:{value}")
+
+    assert _patterns(*keys) == [("sessions:*", 512), ("sessions:expires:*", 512)]
+
+
+def test_few_different_names_at_one_place_stay_names():
+    kinds = ["gold", "silver", "youth"]
+
+    patterns = _patterns(*(f"campaign:{kinds[i % 3]}:{i}" for i in range(300)))
+
+    assert patterns == [
+        ("campaign:gold:*", 100),
+        ("campaign:silver:*", 100),
+        ("campaign:youth:*", 100),
+    ]
+
+
+def test_every_key_is_counted_once_whatever_is_merged():
+    words = [f"{a}{b}{c}" for a in "abcdefgh" for b in "abcdefgh" for c in "abcdefgh"]
+    keys = [f"{word}:x" for word in words] + [f"{word}" for word in words]
+    keys += [f"user:{word}:profile" for word in words] + ["config"] * 3
+    # as SCAN returns them: in no order of their names
+    random.Random(1).shuffle(keys)
+
+    patterns = _patterns(*keys)
+
+    assert sum(count for _, count in patterns) == len(keys)
+    assert dict(patterns)["user:*:profile"] == 512
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_groups_one_sample(mock_redis_connection_manager):
+    mock_redis = mock_redis_connection_manager
+    mock_redis.scan.return_value = (
+        17,
+        [b"session:1", b"session:2", b"user:1:profile", b"session:3", b"config"],
+    )
+    mock_redis.dbsize.return_value = 820_000
+
+    result = await misc.key_prefixes()
+
+    assert result == {
+        "sampledKeys": 5,
+        "dbsize": 820_000,
+        "scanComplete": False,
+        "prefixes": [
+            {"pattern": "session:*", "keys": 3},
+            {"pattern": "config", "keys": 1},
+            {"pattern": "user:*:profile", "keys": 1},
+        ],
+    }
+    # one SCAN step and nothing else: no pattern, no command on a key, no value, no second step
+    mock_redis.scan.assert_called_once_with(cursor=0, count=1000)
+    mock_redis.pipeline.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_of_a_small_database_are_exact(
+    mock_redis_connection_manager,
+):
+    """The one step came back to 0: the sample is every key."""
+    mock_redis = mock_redis_connection_manager
+    mock_redis.scan.return_value = (0, [b"session:1", b"session:2"])
+    mock_redis.dbsize.return_value = 2
+
+    result = await misc.key_prefixes()
+
+    assert (result["sampledKeys"], result["dbsize"], result["scanComplete"]) == (
+        2,
+        2,
+        True,
+    )
+
+
+def test_key_prefixes_takes_no_cursor():
+    """Nothing to continue with: a call cannot walk the keyspace."""
+    import inspect
+
+    assert list(inspect.signature(misc.key_prefixes).parameters) == ["node", "top"]
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_sums_the_patterns_top_leaves_out(
+    mock_redis_connection_manager,
+):
+    mock_redis = mock_redis_connection_manager
+    keys = [b"a:1", b"a:2", b"a:3", b"b:1", b"b:2", b"c:1", b"d:1"]
+    mock_redis.scan.return_value = (0, keys)
+    mock_redis.dbsize.return_value = len(keys)
+
+    result = await misc.key_prefixes(top=2)
+
+    assert result["prefixes"] == [
+        {"pattern": "a:*", "keys": 3},
+        {"pattern": "b:*", "keys": 2},
+    ]
+    assert result["otherPrefixes"] == {"patterns": 2, "keys": 2}
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_on_an_empty_database(mock_redis_connection_manager):
+    mock_redis_connection_manager.scan.return_value = (0, [])
+    mock_redis_connection_manager.dbsize.return_value = 0
+
+    assert await misc.key_prefixes() == {
+        "sampledKeys": 0,
+        "dbsize": 0,
+        "scanComplete": True,
+        "prefixes": [],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("top", [0, misc.MAX_KEY_PREFIXES + 1])
+async def test_key_prefixes_rejects_a_top_out_of_range(
+    mock_redis_connection_manager, top
+):
+    assert await misc.key_prefixes(top=top) == "Error: top must be between 1 and 200"
+    mock_redis_connection_manager.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_error(mock_redis_connection_manager):
+    mock_redis_connection_manager.scan.side_effect = RedisError("Connection failed")
+
+    assert await misc.key_prefixes() == (
+        "Error listing the key prefixes: Connection failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_on_a_redis_cluster_needs_a_node(mock_redis_cluster):
+    clients = _nodes(mock_redis_cluster)
+
+    result = await misc.key_prefixes()
+
+    assert result == (
+        "Error: cluster default is a Redis Cluster: node is required, the one node to scan. "
+        + NODE_LIST
+    )
+    for client in clients.values():
+        client.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_key_prefixes_on_a_redis_cluster_scans_the_named_node(mock_redis_cluster):
+    clients = _nodes(mock_redis_cluster)
+    clients[R1].scan.return_value = (40, [b"session:1", b"session:2"])
+    clients[R1].dbsize.return_value = 270_000
+
+    result = await misc.key_prefixes(node=R1)
+
+    assert result == {
+        "sampledKeys": 2,
+        "dbsize": 270_000,
+        "scanComplete": False,
+        "node": R1,
+        "prefixes": [{"pattern": "session:*", "keys": 2}],
+    }
+    clients[R1].scan.assert_called_once_with(cursor=0, count=1000)
+    for other, client in clients.items():
+        if other != R1:
+            client.scan.assert_not_called()
+    mock_redis_cluster.scan.assert_not_called()
+
+
+def test_key_prefixes_description_states_its_limits():
+    doc = misc.key_prefixes.__doc__
+    assert f"a sample of about {misc.MAX_SCAN_COUNT} keys" in doc
+    assert "IT IS A SAMPLE, NOT A COUNT" in doc
+    assert f"default 50, at most {misc.MAX_KEY_PREFIXES}" in doc
+    assert f"more than {misc.MAX_NAMES_OF_A_PART} different parts" in doc
+    assert "(: _ / . |)" in doc and set(misc.NAME_SEPARATORS) == set(":_/.|")
+    assert f"at most {misc.MAX_SCAN_COUNT}" in misc.scan_keys.__doc__
+    # any of the scan tools may be excluded, so it names none of the others
+    for other in ("scan_keys", "scan_all_keys", "big_keys", "memory_usage"):
+        assert other not in doc
+    for tool in (misc.scan_keys, misc.big_keys, misc.memory_usage, misc.scan_all_keys):
+        assert "key_prefixes" not in tool.__doc__

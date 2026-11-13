@@ -13,7 +13,7 @@ Built with Python 3.10+ (the image uses Python 3.14), FastMCP from the MCP Pytho
 - **Many clusters, one server**: standalone servers, Redis Cluster and Sentinel-managed primaries side by side.
   Every tool that works on Redis takes a `cluster` parameter whose enum lists exactly the clusters the tool may run
   on. When only one cluster is configured, the parameter is optional.
-- **60 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
+- **61 tools in 6 toolsets**: `core`, `data`, `json`, `search`, `pubsub`, `docs`.
 - **Read-only in the example config**: `readOnly: true` hides every write tool (one sandbox cluster opts back in),
   and `disableDestructive: true` hides the delete/pop/remove tools.
 - **Passwords stay out of the config**: each cluster's password comes from a mounted Secret file
@@ -256,7 +256,7 @@ clusters:
 | `readOnly` | boolean | `false` | `true` hides every write tool on clusters that do not override it with their own `readOnly`. |
 | `disableDestructive` | boolean | `false` | `true` hides the destructive tools (`delete`, `hdel`, `lpop`, `rpop`, `lrem`, `srem`, `zrem`, `xdel`, `xgroup_destroy`, `json_del`) on every cluster. It is global only and does not affect the other write tools. |
 | `toolsets` | list of strings | `[core]` | Toolsets to enable, which also sets the order of `tools/list`. An unknown name stops the server at startup; an empty or duplicate entry is an invalid config. |
-| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 60 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
+| `excludeTools` | list of strings | `[]` | Tools that are never listed, whatever their toolset, `readOnly` or cluster (e.g. `[scan_all_keys]`). A name that is not one of the 61 tools stops the server at startup; an empty or duplicate entry is an invalid config. The server instructions and the timeout error name `clusters_list` only while it is listed. |
 | `passwordsDir` | path | `/etc/redis-mcp/passwords` | Directory of the `<name>_pass` password files (see [Passwords](#passwords)). |
 | `clusters` | list | (required) | The Redis deployments. At least one is required, and names must be unique. |
 
@@ -463,6 +463,7 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
   `set`/`delete` fail with `this user has no permissions to run the 'set' command`; `mcp-writer` can also run
   `set`, `delete`, `expire`, `rename` and the stream group commands, but not `FLUSHALL`, `FLUSHDB`, `KEYS`,
   `CONFIG` or `SHUTDOWN`.
+- `key_prefixes` needs `SCAN` and `DBSIZE`, both in `@read`.
 - `memory_usage` and `big_keys` need `MEMORY USAGE`, `OBJECT ENCODING`, `TYPE`, `TTL`, `SCAN`, `DBSIZE` and the
   length commands (`STRLEN`, `HLEN`, `LLEN`, `SCARD`, `ZCARD`, `XLEN`). All of them are in `@read` and none is in
   `@dangerous` (`MEMORY USAGE` is the only `MEMORY` subcommand in `@read`). A user that lacks one of them gets
@@ -483,7 +484,7 @@ ACL SETUSER mcp-writer on >REPLACE_ME ~* &* +@read +@write +@connection -@danger
 
 | Toolset | Tools | What it covers | Available on |
 |---|---:|---|---|
-| `core` (enabled by default) | 16 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`), key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`), key sizes (`memory_usage`, `big_keys`) and what the Sentinels see (`sentinel_status`, `sentinel_replicas`, `sentinel_masters`) | Every cluster; the three Sentinel tools only on clusters with `mode: sentinel`. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
+| `core` (enabled by default) | 17 | The cluster list with a connection check, the nodes of a cluster (`cluster_nodes`), server information (`info`, `dbsize`, `client_list`), key operations (`type`, `scan_keys`, `scan_all_keys`, `expire`, `rename`, `delete`), key sizes (`memory_usage`, `big_keys`), the key prefixes in a sample (`key_prefixes`) and what the Sentinels see (`sentinel_status`, `sentinel_replicas`, `sentinel_masters`) | Every cluster; the three Sentinel tools only on clusters with `mode: sentinel`. `clusters_list` takes an optional `cluster` (all clusters when omitted) and `check` (default `true`: connect and report status, latency, Redis version, role and, for a Redis Cluster, the number of primaries). |
 | `data` | 29 | Strings, hashes (including vectors stored as binary fields), lists, sets, sorted sets, and streams with consumer groups | Every cluster |
 | `json` | 3 | RedisJSON documents: get, set and delete at a path | Clusters with `modules: [json]` |
 | `search` | 6 | Redis Query Engine: indexes, index information, indexed key count, vector index creation on hashes, vector (KNN) and hybrid search | Clusters with `modules: [search]` |
@@ -504,11 +505,11 @@ one is done. The example config lists no `scan_all_keys` (`excludeTools`), so ke
 
 ### Scans name their node
 
-`scan_keys` and `big_keys` scan one server per call. On a standalone or Sentinel cluster that is the cluster's
-server. A Redis Cluster has several, so there the call must say which one: `node`, the `host:port` of a primary
+`scan_keys`, `big_keys` and `key_prefixes` scan one server per call. On a standalone or Sentinel cluster that is
+the cluster's server. A Redis Cluster has several, so there the call must say which one: `node`, the `host:port` of a primary
 or of a replica. A scan never spreads over the nodes of a Redis Cluster on its own, and with several clusters
 configured `cluster` is required as well, so a call scans exactly the cluster and the node it names. The
-descriptions of both tools tell the model to ask the user when either is missing, and not to try the clusters
+descriptions of these tools tell the model to ask the user when either is missing, and not to try the clusters
 or the nodes one after another.
 
 - The keys of a Redis Cluster are spread over its primaries, so one node shows only its share of the keys with a
@@ -534,6 +535,45 @@ or the nodes one after another.
   pipeline with `READONLY`, without which a replica redirects the commands on its keys to its primary; on a
   primary it changes nothing.
 
+### Scans need a whole key prefix
+
+A scan that pages through keys takes a pattern that starts with a **whole key prefix**: before its first glob
+character (`*`, `?`, `[`) come the characters of a key name up to a separator, any character that is not a
+letter or a digit. `session:*`, `user:42*`, `cache:*:html` and `Florya_Session_*` have one; a pattern without
+glob characters names one key and counts as well. `*`, `s*`, `sess*` and `*:123` have none: they could match
+most of a keyspace, and a model could go through a database with `a*`, `b*`, `c*`. The prefix is the user's to
+give: the descriptions tell the model to ask for it and not to make one up.
+
+- **`big_keys`** has no default `pattern` and rejects one without a whole prefix: `Error: pattern must start with
+  a whole key prefix, up to a separator, for example session:* (it is 's*'). Ask the user which prefix to
+  measure.`
+- **`scan_keys`** pages only with a whole prefix. Any other pattern, the default `*` included, returns **one
+  sample page**: the keys of one `SCAN` step, `sample: true` in place of the `cursor`, and nothing to continue
+  with. A call that passes a cursor with such a pattern is rejected (`Error: pattern '*' does not start with a
+  whole key prefix, so it returns one sample page and cannot be continued. ...`). A sample that reaches the end
+  of a small database comes back as a finished scan (`cursor: 0`, `scan_complete: true`).
+- **`count`** of `scan_keys` is at most 1000 (`Error: count must be between 1 and 1000`). One `SCAN` command
+  walks that many slots of the keyspace and the server answers nobody else until it is done. Measured on Redis
+  7.0 with 820,000 keys: 0.07 ms for a count of 100, 0.7 ms for 1000, 7 ms for 10,000 and 77 ms for 100,000. A
+  whole walk of that keyspace took about 0.6 s of the server's time whatever the count, in steps between which
+  it serves other clients: a second client that read a key every millisecond during a walk with a count of 1000
+  saw its p99 go from 0.5 ms to 0.9 ms.
+- **`key_prefixes`** answers which prefixes a server has without a scan of the keyspace: it runs one `SCAN` step
+  with a count of 1000 (about 1000 keys, 0.7 ms of the server's time, once) and groups the names inside this
+  server. It returns the patterns with the number of sampled keys in each, such as `spring:session:sessions:*`
+  490, and never a key name, so ids that are part of key names (customer numbers) stay out of the model's
+  context. It takes no cursor: the sample is the same on every call, so it cannot walk the keyspace either.
+
+How `key_prefixes` reads a key name: the name is split into parts that end at `:`, `_`, `/`, `.` or `|`. A part
+with a digit (a UUID, a number, a date) or with bytes that are not UTF-8 is variable and shown as `*`; so is a
+place where more than 200 different parts follow (user names, e-mail addresses), except a part that holds 5% of
+the keys there, which stays a name. `user:1:profile` and `user:2:profile` come back as `user:*:profile`,
+`customerSolutionsWithEligibility::30962005140` as `customerSolutionsWithEligibility::*`. Glob characters of a
+name are escaped, so a pattern can be passed to `scan_keys` or `big_keys` as it is. `keys` counts sampled keys:
+divide by `sampledKeys` for the share of a prefix (the keys of one step are a fair sample, since names are
+hashed into the keyspace). A rare prefix can be missing: one that a key in a thousand has is absent from about a
+third of such samples. With `scanComplete: true` the sample is every key of the server and the numbers are exact.
+
 ### Key sizes
 
 `memory_usage` and `big_keys` tell how large keys are without reading a value. `get`, `hgetall` and `smembers`
@@ -552,13 +592,10 @@ return a value whole, however large, so these two are the way to look first.
   `min_bytes`. `keysScanned` is the number of keys the call measured and `dbsize` the number of keys on the
   scanned server, whatever the pattern.
 
-**`big_keys` takes a key prefix.** `pattern` has no default, so a call cannot leave it out, and it must start
-with the literal characters of a prefix (`session:*`, `user:42:*`, `cache:*:html`). A pattern that starts with
-`*`, `?` or `[`, or an empty one, is turned down with `Error: pattern must start with a key prefix, for example
-session:* (it is '*'). Ask the user which prefix to measure.`, and the tool's description tells the model to ask
-for the prefix instead of guessing one. So the tool cannot measure a whole database in one sweep; for that, run
-`redis-cli --memkeys` against a replica. `top` does not change what a scan costs (a whole scan of 300,000 keys
-took 2.9 s with `top: 10` and 3.0 s with `top: 100`); the number of keys that are measured does.
+**`big_keys` takes a whole key prefix** (see [Scans need a whole key prefix](#scans-need-a-whole-key-prefix)), so
+it cannot measure a whole database in one sweep; for that, run `redis-cli --memkeys` against a replica. `top`
+does not change what a scan costs (a whole scan of 300,000 keys took 2.9 s with `top: 10` and 3.0 s with
+`top: 100`); the number of keys that are measured does.
 
 **`bytes` of a large collection is an estimate, marked `estimated: true`.** For a hash, list, set, sorted set or
 stream, `MEMORY USAGE` measures `samples` elements and scales their size to the number of elements. It takes the
@@ -693,7 +730,7 @@ cluster is rejected by schema validation (`Input should be 'cbsbxrds'`). With tw
 one cluster (a one-cluster config file or the [single-cluster mode](#single-cluster-mode)), `cluster` is optional
 and comes last, described as `Cluster name (default: the only configured cluster)`: a call without it runs on that
 cluster. `clusters_list` always takes an optional `cluster` (all clusters when omitted), and `read_messages`,
-`unsubscribe` and `search_redis_documents` take none. With the example config, 32 of the 60 tools are listed.
+`unsubscribe` and `search_redis_documents` take none. With the example config, 33 of the 61 tools are listed.
 For example:
 
 | Tool | `cluster` enum |
@@ -717,15 +754,15 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 
 | Toolset | Tools | Read | Write | Destructive |
 |---|---:|---:|---:|---:|
-| [core](#core-16-tools) | 16 | 13 | 2 | 1 |
+| [core](#core-17-tools) | 17 | 14 | 2 | 1 |
 | [data](#data-29-tools) | 29 | 10 | 11 | 8 |
 | [json](#json-3-tools) | 3 | 1 | 1 | 1 |
 | [search](#search-6-tools) | 6 | 5 | 1 | 0 |
 | [pubsub](#pubsub-5-tools) | 5 | 4 | 1 | 0 |
 | [docs](#docs-1-tool) | 1 | 1 | 0 | 0 |
-| **Total** | **60** | **34** | **16** | **10** |
+| **Total** | **61** | **35** | **16** | **10** |
 
-### core (16 tools)
+### core (17 tools)
 
 | Tool | Kind | Needs | Description |
 |---|---|---|---|
@@ -735,10 +772,11 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 | `type` | read | — | Returns the string representation of the type of the value stored at key |
 | `expire` | write | — | Set an expiration time for a Redis key |
 | `rename` | write | — | Renames a Redis key from old_key to new_key |
-| `scan_keys` | read | `node` on a Redis Cluster | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
+| `scan_keys` | read | `node` on a Redis Cluster; a whole key prefix in `pattern` to page | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
 | `scan_all_keys` | read | — | Scan and return ALL keys matching a pattern using multiple SCAN iterations |
 | `memory_usage` | read | — | How large a key is, without reading its value: the bytes it takes in memory (MEMORY USAGE), its type, length, encoding and TTL. Use it before reading a value that may be large |
-| `big_keys` | read | a key prefix in `pattern`; `node` on a Redis Cluster | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
+| `big_keys` | read | a whole key prefix in `pattern`; `node` on a Redis Cluster | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
+| `key_prefixes` | read | `node` on a Redis Cluster | List the key prefixes found in a sample of about 1000 keys of a server, such as "session:*" 490: one SCAN step, whose key names are grouped by their fixed parts inside this server. No value is read and no key name is returned |
 | `dbsize` | read | — | Get the number of keys stored in the Redis database |
 | `info` | read | — | Get Redis server information and statistics |
 | `client_list` | read | — | Get a list of connected clients to the Redis server |
@@ -1297,7 +1335,9 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `Error: cluster <name> is a Redis Cluster: node is required, the one node to scan. Its nodes, as host:port: ...` | `scan_keys` and `big_keys` scan one node of a Redis Cluster per call. Pass `node`, one of the listed addresses: a primary, or one of its replicas to keep the load off the primary (see [Scans name their node](#scans-name-their-node)). |
 | `Error: node <host:port> is not a node of the Redis Cluster <name>. Its nodes, as host:port: ...` | The address is not one the cluster gives its nodes, and its host name does not resolve to exactly one of them. Use an address from the list; a node that has just joined, or a replica that has replicated nothing yet, is not listed by `CLUSTER SLOTS`. |
 | `Error: cluster <name> is not a Redis Cluster (mode <mode>): it has one server, so leave node out` | `node` belongs to `mode: cluster`. A standalone or Sentinel cluster is scanned on its one server. |
-| `Error: pattern must start with a key prefix, for example session:* (it is '*'). Ask the user which prefix to measure.` | `big_keys` measures the keys with one prefix: pass a pattern that starts with it (`session:*`), not one that starts with `*`, `?` or `[` (see [Key sizes](#key-sizes)). |
+| `Error: pattern must start with a whole key prefix, up to a separator, for example session:* (it is 's*'). Ask the user which prefix to measure.` | `big_keys` measures the keys with one prefix: pass a pattern whose start is a key prefix up to a separator (`session:*`), not `*`, `s*` or `sess*` (see [Scans need a whole key prefix](#scans-need-a-whole-key-prefix)). `key_prefixes` shows which prefixes a server has. |
+| `Error: pattern '*' does not start with a whole key prefix, so it returns one sample page and cannot be continued. ...` | `scan_keys` was given a cursor with a pattern that has no whole prefix. Such a pattern returns one sample page (`sample: true`, no `cursor`); to page, pass a pattern such as `session:*`. |
+| `Error: count must be between 1 and 1000` | `count` of `scan_keys` is limited, because one `SCAN` command with a large count keeps the server from answering other clients until it is done. |
 | `big_keys` never reaches `scanComplete: true`, or needs very many calls | A call scans for 5 s and the database is large: `SCAN` walks every key, and every key with the prefix is measured. Use a longer prefix, take the calls so far as a sample, or run `redis-cli --memkeys` against a replica (see [Key sizes](#key-sizes)). |
 | `status: timeout` in `clusters_list` | The cluster's check did not finish within 13 s, for example two or more Redis Cluster startup nodes that accept connections but do not answer, or a slow DNS lookup. See the `Tool did not finish within 15 s` row. |
 | `Redis Cluster cannot be connected ...` again at once, right after the cluster was fixed | A failed Redis Cluster connection is remembered for 5 s (see [Redis clients](#redis-clients)). The first call after that tries again. |

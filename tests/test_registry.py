@@ -52,6 +52,7 @@ CORE_READ = {
     "scan_all_keys",
     "memory_usage",
     "big_keys",
+    "key_prefixes",
     "dbsize",
     "info",
     "client_list",
@@ -82,7 +83,7 @@ DESTRUCTIVE_TOOLS = {
     "xgroup_destroy",
 }
 NO_CLUSTER_TOOLS = {"search_redis_documents", "read_messages", "unsubscribe"}
-REAL_TOOL_COUNT = 60
+REAL_TOOL_COUNT = 61
 # listed only for clusters in mode sentinel
 SENTINEL_TOOLS = {"sentinel_status", "sentinel_replicas", "sentinel_masters"}
 ONLY_CLUSTER_DESCRIPTION = "Cluster name (default: the only configured cluster)"
