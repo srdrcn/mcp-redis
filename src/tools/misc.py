@@ -417,26 +417,33 @@ def _sizes(
 
 @redis_tool("core")
 async def big_keys(
-    pattern: str = "*",
+    pattern: str,
     cursor: Union[int, str] = 0,
     top: int = 10,
     min_bytes: int = 0,
 ) -> Union[str, Dict[str, Any]]:
     """
-    Find the keys that take the most memory: SCAN the keyspace and measure every key with MEMORY USAGE, without
-    reading values (non-blocking, as redis-cli --memkeys does).
+    Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every
+    key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys
+    does).
+
+    ⚠️  A KEY PREFIX IS REQUIRED: pattern must start with one, e.g. "session:*". If the user has not named the
+    prefix to measure, ask them for it before calling. Do not guess a prefix, and do not try a pattern that
+    matches every key: a pattern that starts with *, ? or [ is rejected.
 
     ⚠️  IMPORTANT: One call scans for about 5 s and returns PARTIAL results: the largest keys among those it
     scanned, and a cursor. Call it again with the returned cursor until cursor becomes 0 (scanComplete is true),
-    and keep the largest keys of every call. On a database with millions of keys a complete scan takes many
-    calls: narrow the pattern, or stop after a few calls and treat the result as a sample.
+    and keep the largest keys of every call. SCAN walks the whole keyspace whatever the pattern (the prefix
+    saves measuring the other keys), so on a database with many millions of keys a scan still takes several
+    calls.
 
     The keys are ranked by a quick estimate (5 elements of a hash, list, set, sorted set or stream, scaled to
     its length), so a key whose size lies in a few very large elements among many small ones can be ranked too
     low and missed. The keys that are listed are measured again with 1000 elements.
 
     Args:
-        pattern: Pattern of the keys to measure (default is "*" for all keys), e.g. "session:*".
+        pattern: Pattern of the keys to measure. Required; it starts with the literal characters of a key
+                 prefix and may go on with glob characters: "session:*", "user:42:*", "cache:*:html".
         cursor: 0 to start from the beginning. To continue scanning, pass the cursor value returned from the
                 previous call unchanged (on a Redis Cluster it is text that holds the position on each primary).
         top: How many of the largest keys to return (default 10, at most 100).
@@ -459,6 +466,11 @@ async def big_keys(
     A key name that is not UTF-8 is shown with \\xNN for those bytes and marked 'nonUtf8Key'; the other tools
     cannot read such a key by name.
     """
+    if not pattern or pattern[0] in "*?[":
+        return (
+            f"Error: pattern must start with a key prefix, for example session:* (it is {pattern!r})."
+            " Ask the user which prefix to measure."
+        )
     if not 1 <= top <= MAX_BIG_KEYS:
         return f"Error: top must be between 1 and {MAX_BIG_KEYS}"
     if min_bytes < 0:

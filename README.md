@@ -520,12 +520,21 @@ return a value whole, however large, so these two are the way to look first.
   `members` of a set or sorted set, `entries` of a stream; left out for any other type, such as a module's),
   `encoding` (`OBJECT ENCODING`) and `ttl`. A key that does not exist comes back as
   `{"key": "<key>", "type": "none"}`.
-- `big_keys` finds the largest keys: it walks the keyspace with `SCAN` (`MATCH <pattern>`, `COUNT 1000`) and
-  sends `TYPE` and `MEMORY USAGE` for the keys of each step in one pipeline. It returns `keys`, the `top` largest
-  keys it measured (default 10, at most 100, largest first, without those under `min_bytes`) with their `type`,
-  `bytes`, `length`, `lengthUnit` and `encoding`, and `byType`: for each type, the number of keys it measured and
-  their bytes in total, whatever `top` and `min_bytes`. `keysScanned` is the number of keys the call measured and
-  `dbsize` the number of keys in the database, whatever the pattern.
+- `big_keys` finds the largest keys among those with a prefix: it walks the keyspace with `SCAN`
+  (`MATCH <pattern>`, `COUNT 1000`) and sends `TYPE` and `MEMORY USAGE` for the matching keys of each step in one
+  pipeline. It returns `keys`, the `top` largest keys it measured (default 10, at most 100, largest first,
+  without those under `min_bytes`) with their `type`, `bytes`, `length`, `lengthUnit` and `encoding`, and
+  `byType`: for each type, the number of keys it measured and their bytes in total, whatever `top` and
+  `min_bytes`. `keysScanned` is the number of keys the call measured and `dbsize` the number of keys in the
+  database, whatever the pattern.
+
+**`big_keys` takes a key prefix.** `pattern` has no default, so a call cannot leave it out, and it must start
+with the literal characters of a prefix (`session:*`, `user:42:*`, `cache:*:html`). A pattern that starts with
+`*`, `?` or `[`, or an empty one, is turned down with `Error: pattern must start with a key prefix, for example
+session:* (it is '*'). Ask the user which prefix to measure.`, and the tool's description tells the model to ask
+for the prefix instead of guessing one. So the tool cannot measure a whole database in one sweep; for that, run
+`redis-cli --memkeys` against a replica. `top` does not change what a scan costs (a whole scan of 300,000 keys
+took 2.9 s with `top: 10` and 3.0 s with `top: 100`); the number of keys that are measured does.
 
 **`bytes` of a large collection is an estimate, marked `estimated: true`.** For a hash, list, set, sorted set or
 stream, `MEMORY USAGE` measures `samples` elements and scales their size to the number of elements. It takes the
@@ -570,13 +579,24 @@ call reports the largest keys of that call only, so the caller keeps the largest
 `byType`. A key can be counted twice when `SCAN` returns it twice (it may, while the keyspace grows or shrinks),
 and a key that expired between `SCAN` and `MEMORY USAGE` is left out.
 
-Measured on a local Redis 7.0 with 1,000,000 keys (strings, three-field hashes and short lists): the scan took
-two calls, about 105,000 keys per second. A `SCAN` step took 0.7 ms and the 2 × 1000 commands of its pipeline
-about 1.1 ms, so the server spent about a fifth of its time on the scan while a call ran, and no command reached
-the slow log (10 ms). A second client that read a key every millisecond saw its p99 go from 0.3 ms to 1.0 ms and
-its slowest reply from 2.3 ms to 4.1 ms. Over a network a call measures fewer keys. A database with tens of
-millions of keys needs dozens of calls: narrow the `pattern` (`session:*`), take a few calls as a sample, or run
-`redis-cli --memkeys` against a replica instead.
+Measured on a local Redis 7.0 with 1,000,000 keys (strings, three-field hashes and short lists), a whole scan
+by the share of the keys that have the prefix:
+
+| Keys with the prefix | Calls | Time | Server busy |
+|---|---:|---:|---:|
+| 100% (1,000,000 keys) | 2 | 9.6 s | 1.8 s |
+| 60% | 2 | 5.8 s | 1.2 s |
+| 30% | 1 | 3.6 s | 1.0 s |
+| 9% | 1 | 1.8 s | 0.7 s |
+| 1% | 1 | 0.8 s | 0.6 s |
+
+`SCAN` walks the whole keyspace whatever the pattern: 1000 steps of about 0.6 ms each here, the 0.6 s that
+remain in the last row. The prefix saves measuring the other keys, which is most of the time of a call. With
+every key measured, the 2 × 1000 commands of a step's pipeline took about 1.1 ms, no command reached the slow log
+(10 ms), and a second client that read a key every millisecond saw its p99 go from 0.3 ms to 1.0 ms and its
+slowest reply from 2.3 ms to 4.1 ms. Over a network a call measures fewer keys. A database with tens of millions
+of keys takes several calls even for a prefix that few keys have, and more the more keys have it: use a longer
+prefix, or take a few calls as a sample.
 
 ### Sentinel tools
 
@@ -696,7 +716,7 @@ and *destructive* tools are hidden by `readOnly` or `disableDestructive`. **Need
 | `scan_keys` | read | — | Scan keys in the Redis database using the SCAN command (non-blocking, production-safe) |
 | `scan_all_keys` | read | — | Scan and return ALL keys matching a pattern using multiple SCAN iterations |
 | `memory_usage` | read | — | How large a key is, without reading its value: the bytes it takes in memory (MEMORY USAGE), its type, length, encoding and TTL. Use it before reading a value that may be large |
-| `big_keys` | read | — | Find the keys that take the most memory: SCAN the keyspace and measure every key with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
+| `big_keys` | read | a key prefix in `pattern` | Find the keys that take the most memory among the keys with a prefix: SCAN the keyspace and measure every key that matches the pattern with MEMORY USAGE, without reading values (non-blocking, as redis-cli --memkeys does) |
 | `dbsize` | read | — | Get the number of keys stored in the Redis database |
 | `info` | read | — | Get Redis server information and statistics |
 | `client_list` | read | — | Get a list of connected clients to the Redis server |
@@ -1253,7 +1273,8 @@ one to report `status` (`ok`, `error` or `timeout`), `latencyMs`, `redisVersion`
 | `Tool did not finish within 15 s (timeout). The cluster may be slow or unreachable (check clusters_list), or the request too large (narrow the pattern or count).` | Run `clusters_list`. If the cluster shows `status: timeout` or an error, the cluster or the path to it is the cause: Redis Cluster startup nodes that do not answer cost one timeout each and can add up to more than 15 s, and so can more than 8 simultaneous calls to a cluster that hangs, or a slow DNS lookup (see [Time limits, retries and concurrency](#time-limits-retries-and-concurrency)); fix `hosts`, the network or DNS, or lower the timeouts in `options`. If the cluster is fine, the request is too large: `scan_all_keys` walks the whole keyspace in one call, whatever the `pattern`. On large databases use `scan_keys` and page through the keys with the `cursor` it returns (on a Redis Cluster too, see [Toolsets](#toolsets)), or use a more specific tool. Without `clusters_list` listed, the message has no `(check clusters_list)`. |
 | `Error: invalid cursor: pass the cursor returned by the previous scan_keys call unchanged, or 0 to start` (or `... previous big_keys call ...`) | Pass the `cursor` of the previous `scan_keys` or `big_keys` call as it is: a number on standalone and Sentinel clusters, text such as `10.0.0.1:6379=1536,10.0.0.2:6379=96` on a Redis Cluster. |
 | `Error: node <host:port> of the cursor is not a primary of this Redis Cluster ...` | A failover or resharding changed the primaries while `scan_keys` or `big_keys` was paging. Start again with cursor 0. |
-| `big_keys` never reaches `scanComplete: true`, or needs very many calls | A call scans for 5 s and the database is large (compare `keysScanned` with `dbsize`). Narrow the `pattern`, take the calls so far as a sample, or run `redis-cli --memkeys` against a replica (see [Key sizes](#key-sizes)). |
+| `Error: pattern must start with a key prefix, for example session:* (it is '*'). Ask the user which prefix to measure.` | `big_keys` measures the keys with one prefix: pass a pattern that starts with it (`session:*`), not one that starts with `*`, `?` or `[` (see [Key sizes](#key-sizes)). |
+| `big_keys` never reaches `scanComplete: true`, or needs very many calls | A call scans for 5 s and the database is large: `SCAN` walks every key, and every key with the prefix is measured. Use a longer prefix, take the calls so far as a sample, or run `redis-cli --memkeys` against a replica (see [Key sizes](#key-sizes)). |
 | `status: timeout` in `clusters_list` | The cluster's check did not finish within 13 s, for example two or more Redis Cluster startup nodes that accept connections but do not answer, or a slow DNS lookup. See the `Tool did not finish within 15 s` row. |
 | `Redis Cluster cannot be connected ...` again at once, right after the cluster was fixed | A failed Redis Cluster connection is remembered for 5 s (see [Redis clients](#redis-clients)). The first call after that tries again. |
 | A call fails once with `Error while reading from <host>:<port> : (104, 'Connection reset by peer')`, `Connection closed by server.` or `Timeout reading from socket`, and the next call works | The connection broke while the command was in flight, typically during a restart or a failover. The server sends no command twice, so a write in such a call may or may not have been applied: check before you repeat it. |

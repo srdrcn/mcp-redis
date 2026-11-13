@@ -825,7 +825,7 @@ async def test_big_keys_scans_until_the_scan_is_complete(mock_redis_connection_m
     ]
     mock_redis.dbsize.return_value = 40
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
     assert result == {
         "cursor": 0,
@@ -841,8 +841,8 @@ async def test_big_keys_scans_until_the_scan_is_complete(mock_redis_connection_m
     }
     assert list(result["byType"]) == ["list", "hash", "string"]
     assert [c.kwargs for c in mock_redis.scan.call_args_list] == [
-        {"cursor": 0, "match": "*", "count": misc.BIG_KEYS_SCAN_COUNT},
-        {"cursor": 17, "match": "*", "count": misc.BIG_KEYS_SCAN_COUNT},
+        {"cursor": 0, "match": "app:*", "count": misc.BIG_KEYS_SCAN_COUNT},
+        {"cursor": 17, "match": "app:*", "count": misc.BIG_KEYS_SCAN_COUNT},
     ]
     # every key is measured with the 5 samples of the scan
     assert commands[:8] == [
@@ -887,7 +887,7 @@ async def test_big_keys_measures_the_listed_keys_again(mock_redis_connection_man
     mock_redis.scan.return_value = (0, list(keys))
     mock_redis.dbsize.return_value = 4
 
-    result = await misc.big_keys("*", top=3)
+    result = await misc.big_keys("app:*", top=3)
 
     assert [(k["key"], k["bytes"]) for k in result["keys"]] == [
         ("unlucky", 3_000_000),
@@ -915,7 +915,7 @@ async def test_big_keys_measures_the_listed_keys_ten_at_a_time(
     mock_redis.scan.return_value = (0, list(keys))
     mock_redis.dbsize.return_value = 25
 
-    result = await misc.big_keys("*", top=25)
+    result = await misc.big_keys("app:*", top=25)
 
     assert len(result["keys"]) == 25
     # the scan step (TYPE and MEMORY USAGE of 25 keys), then 10, 10 and 5 keys with three commands each
@@ -937,7 +937,7 @@ async def test_big_keys_returns_the_cursor_when_its_time_is_up(
     # started at 100; the first step ends in time, the second after the 5 s
     _clock(monkeypatch, 100.0, 104.9, 105.0)
 
-    first = await misc.big_keys("*")
+    first = await misc.big_keys("app:*")
 
     assert first["cursor"] == 33
     assert first["scanComplete"] is False
@@ -946,7 +946,7 @@ async def test_big_keys_returns_the_cursor_when_its_time_is_up(
     assert mock_redis.scan.call_count == 2
 
     _clock(monkeypatch, 200.0, 200.1)
-    last = await misc.big_keys("*", cursor=first["cursor"])
+    last = await misc.big_keys("app:*", cursor=first["cursor"])
 
     assert (last["cursor"], last["scanComplete"], last["keysScanned"]) == (0, True, 1)
     assert mock_redis.scan.call_args.kwargs["cursor"] == 33
@@ -959,9 +959,9 @@ async def test_big_keys_top_and_min_bytes(mock_redis_connection_manager):
     mock_redis.scan.return_value = (0, list(KEYS))
     mock_redis.dbsize.return_value = 4
 
-    top = await misc.big_keys("*", top=2)
-    large = await misc.big_keys("*", min_bytes=7000)
-    none = await misc.big_keys("*", min_bytes=90001)
+    top = await misc.big_keys("app:*", top=2)
+    large = await misc.big_keys("app:*", min_bytes=7000)
+    none = await misc.big_keys("app:*", min_bytes=90001)
 
     assert [k["key"] for k in top["keys"]] == ["queue", "session:2"]
     assert [k["key"] for k in large["keys"]] == ["queue", "session:2"]
@@ -985,7 +985,7 @@ async def test_big_keys_min_bytes_applies_to_the_size_it_lists(
     mock_redis.scan.return_value = (0, list(keys))
     mock_redis.dbsize.return_value = 2
 
-    result = await misc.big_keys("*", min_bytes=5000)
+    result = await misc.big_keys("app:*", min_bytes=5000)
 
     assert [(k["key"], k["bytes"]) for k in result["keys"]] == [("stays", 8000)]
 
@@ -1012,7 +1012,7 @@ async def test_big_keys_skips_a_key_that_is_gone(mock_redis_connection_manager):
     mock_redis.scan.return_value = (0, [b"expired", b"cache:1"])
     mock_redis.dbsize.return_value = 1
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
     assert result["keysScanned"] == 1
     assert result["keys"] == [CACHE_1]
@@ -1032,7 +1032,7 @@ async def test_big_keys_leaves_out_a_key_that_is_gone_when_measured_again(
     mock_redis.scan.return_value = (0, list(keys))
     mock_redis.dbsize.return_value = 1
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
     assert [k["key"] for k in result["keys"]] == ["stays"]
     # it was there when the scan measured it
@@ -1047,7 +1047,7 @@ async def test_big_keys_lists_a_key_once(mock_redis_connection_manager):
     mock_redis.scan.side_effect = [(9, [b"queue", b"cache:1"]), (0, [b"queue"])]
     mock_redis.dbsize.return_value = 2
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
     assert [k["key"] for k in result["keys"]] == ["queue", "cache:1"]
 
@@ -1059,7 +1059,7 @@ async def test_big_keys_on_an_empty_database(mock_redis_connection_manager):
     mock_redis.scan.return_value = (0, [])
     mock_redis.dbsize.return_value = 0
 
-    assert await misc.big_keys() == {
+    assert await misc.big_keys("app:*") == {
         "cursor": 0,
         "scanComplete": True,
         "keysScanned": 0,
@@ -1086,7 +1086,7 @@ async def test_big_keys_marks_a_key_name_that_is_not_utf8(
     mock_redis.scan.return_value = (0, [b"odd:\x8e", b"plain"])
     mock_redis.dbsize.return_value = 2
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
     plain = {
         "key": "plain",
@@ -1114,8 +1114,56 @@ async def test_big_keys_marks_a_key_name_that_is_not_utf8(
 async def test_big_keys_rejects_values_out_of_range(
     mock_redis_connection_manager, arguments, error
 ):
-    assert await misc.big_keys("*", **arguments) == error
+    assert await misc.big_keys("app:*", **arguments) == error
     mock_redis_connection_manager.scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pattern", ["*", "", "*session", "*:session:*", "?ession:*", "[st]ession:*"]
+)
+async def test_big_keys_rejects_a_pattern_without_a_prefix(
+    mock_redis_connection_manager, pattern
+):
+    """A pattern that starts with a glob character has no prefix: it could match every key."""
+    result = await misc.big_keys(pattern)
+
+    assert result == (
+        f"Error: pattern must start with a key prefix, for example session:* (it is {pattern!r})."
+        " Ask the user which prefix to measure."
+    )
+    mock_redis_connection_manager.scan.assert_not_called()
+    mock_redis_connection_manager.pipeline.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pattern",
+    ["session:*", "s*", "user:42:*", "cache:*:html", "one-key", "\\*starred*"],
+)
+async def test_big_keys_accepts_a_pattern_that_starts_with_a_prefix(
+    mock_redis_connection_manager, pattern
+):
+    mock_redis = mock_redis_connection_manager
+    _holding(mock_redis, {})
+    mock_redis.scan.return_value = (0, [])
+    mock_redis.dbsize.return_value = 0
+
+    result = await misc.big_keys(pattern)
+
+    assert result["scanComplete"] is True
+    assert mock_redis.scan.call_args.kwargs["match"] == pattern
+
+
+def test_big_keys_has_no_default_pattern():
+    """The schema marks pattern as required, so a call cannot leave it out."""
+    import inspect
+
+    parameters = inspect.signature(misc.big_keys).parameters
+
+    assert parameters["pattern"].default is inspect.Parameter.empty
+    assert "A KEY PREFIX IS REQUIRED" in misc.big_keys.__doc__
+    assert "ask them for it before calling" in misc.big_keys.__doc__
 
 
 @pytest.mark.asyncio
@@ -1125,7 +1173,7 @@ async def test_big_keys_accepts_a_cursor_given_as_text(mock_redis_connection_man
     mock_redis.scan.return_value = (0, [])
     mock_redis.dbsize.return_value = 0
 
-    result = await misc.big_keys("*", cursor="1234")
+    result = await misc.big_keys("app:*", cursor="1234")
 
     assert result["scanComplete"] is True
     assert mock_redis.scan.call_args.kwargs["cursor"] == 1234
@@ -1136,7 +1184,7 @@ async def test_big_keys_accepts_a_cursor_given_as_text(mock_redis_connection_man
 async def test_big_keys_rejects_a_cursor_that_is_not_a_number(
     mock_redis_connection_manager, cursor
 ):
-    result = await misc.big_keys("*", cursor=cursor)
+    result = await misc.big_keys("app:*", cursor=cursor)
 
     assert result == (
         "Error: invalid cursor: pass the cursor returned by the previous big_keys call unchanged, or 0 to"
@@ -1166,9 +1214,9 @@ async def test_big_keys_reports_a_command_the_user_may_not_run(
     mock_redis.scan.return_value = (0, [b"cache:1"])
     mock_redis.pipeline.return_value.execute.side_effect = denied
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
-    assert result == f"Error measuring keys with pattern '*': {denied}"
+    assert result == f"Error measuring keys with pattern 'app:*': {denied}"
 
 
 @pytest.mark.asyncio
@@ -1188,8 +1236,8 @@ async def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(
     _holding(mock_redis_cluster, KEYS)
     mock_redis_cluster.dbsize.return_value = 4
 
-    first = await misc.big_keys("*")
-    last = await misc.big_keys("*", cursor=first["cursor"])
+    first = await misc.big_keys("app:*")
+    last = await misc.big_keys("app:*", cursor=first["cursor"])
 
     assert first["cursor"] == "n1:7000=12"
     assert first["scanComplete"] is False
@@ -1221,7 +1269,7 @@ async def test_big_keys_on_a_redis_cluster_scans_every_primary_until_done(
     _holding(mock_redis_cluster, KEYS)
     mock_redis_cluster.dbsize.return_value = 3
 
-    result = await misc.big_keys("*")
+    result = await misc.big_keys("app:*")
 
     assert (result["cursor"], result["scanComplete"], result["keysScanned"]) == (
         0,
@@ -1258,7 +1306,7 @@ async def test_big_keys_on_a_redis_cluster_rejects_an_invalid_cursor(
 ):
     _primaries(mock_redis_cluster, {})
 
-    assert await misc.big_keys("*", cursor=cursor) == error
+    assert await misc.big_keys("app:*", cursor=cursor) == error
     mock_redis_cluster.scan.assert_not_called()
 
 

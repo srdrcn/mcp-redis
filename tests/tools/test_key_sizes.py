@@ -6,6 +6,7 @@ import shlex
 from pathlib import Path
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 import src.tools.misc as misc
 from src.common.config_loader import parse_config, resolve_passwords, set_config
@@ -186,37 +187,51 @@ def test_big_keys_agrees_with_memory_usage(mcp):
     assert entry == {k: single[k] for k in entry}
 
 
-def test_big_keys_measures_the_whole_database(mcp):
-    result = _call(mcp, "big_keys", top=100)
+def test_big_keys_measures_every_key_with_the_prefix(mcp):
+    """s*: the small:* strings, the set and the stream."""
+    result = _call(mcp, "big_keys", pattern="s*", top=100)
 
     assert result["scanComplete"] is True
-    assert result["keysScanned"] == result["dbsize"] == ALL_KEYS == len(result["keys"])
+    assert result["keysScanned"] == SMALL_KEYS + 2 == len(result["keys"])
+    assert result["dbsize"] == ALL_KEYS
     assert {t: totals["keys"] for t, totals in result["byType"].items()} == {
-        "string": SMALL_KEYS + 3,
-        "hash": 2,
-        "list": 1,
+        "string": SMALL_KEYS,
         "set": 1,
-        "zset": 1,
         "stream": 1,
     }
     sizes = [entry["bytes"] for entry in result["keys"]]
     assert sizes == sorted(sizes, reverse=True)
-    # measured again, the uneven hash is the largest key; the scan seldom ranks it there
-    assert result["keys"][0]["key"] == "uneven"
+    # nothing here is an estimate, so the sizes of the scan add up to those of the list
+    assert sum(sizes) == sum(totals["bytes"] for totals in result["byType"].values())
     assert list(result["byType"].values()) == sorted(
         result["byType"].values(), key=lambda totals: totals["bytes"], reverse=True
     )
 
 
+def test_big_keys_requires_a_prefix(mcp):
+    """pattern has no default, and a pattern that could match every key is turned down."""
+    (tool,) = [t for t in asyncio.run(mcp.list_tools()) if t.name == "big_keys"]
+    assert tool.inputSchema["required"] == ["pattern"]
+    assert "default" not in tool.inputSchema["properties"]["pattern"]
+
+    with pytest.raises(ToolError, match="pattern"):
+        asyncio.run(mcp.call_tool("big_keys", {}))
+    for pattern in ("*", "*:string", "?ig:*", "[b]ig:*", ""):
+        assert _call(mcp, "big_keys", pattern=pattern) == (
+            f"Error: pattern must start with a key prefix, for example session:* (it is {pattern!r})."
+            " Ask the user which prefix to measure."
+        )
+
+
 def test_big_keys_top_and_min_bytes(mcp):
     top = _call(mcp, "big_keys", pattern="big:*", top=1)
-    large = _call(mcp, "big_keys", pattern="*i*", min_bytes=200_000)
+    large = _call(mcp, "big_keys", pattern="big:*", min_bytes=200_000)
     small = _call(mcp, "big_keys", pattern="small:*", top=3)
 
     assert [entry["key"] for entry in top["keys"]] == ["big:string"]
-    # also matches big:hash, list and expiring, which are smaller
+    # also matches big:hash, which is smaller
     assert [entry["key"] for entry in large["keys"]] == ["big:string"]
-    assert large["keysScanned"] == 4
+    assert large["keysScanned"] == 2
     assert small["keysScanned"] == SMALL_KEYS
     assert len(small["keys"]) == 3
     assert small["byType"]["string"]["keys"] == SMALL_KEYS
@@ -238,7 +253,7 @@ def test_big_keys_marks_a_key_name_that_is_not_utf8(mcp):
 
 
 def test_big_keys_rejects_an_invalid_cursor(mcp):
-    assert _call(mcp, "big_keys", cursor="abc") == (
+    assert _call(mcp, "big_keys", pattern="big:*", cursor="abc") == (
         "Error: invalid cursor: pass the cursor returned by the previous big_keys call unchanged, or 0 to"
         " start"
     )
@@ -265,20 +280,17 @@ def short_calls(monkeypatch):
 
 
 def test_big_keys_pages_with_the_cursor(mcp, short_calls):
-    pages = _all_pages(mcp, top=2)
+    pages = _all_pages(mcp, pattern="small:*", top=2)
 
     assert len(pages) > 2
     assert all(isinstance(page["cursor"], int) for page in pages)
     assert all(page["cursor"] != 0 for page in pages[:-1])
     assert pages[-1]["cursor"] == 0
     assert all(len(page["keys"]) <= 2 for page in pages)
-    # every key is measured once: the keyspace does not change during the scan
-    assert sum(page["keysScanned"] for page in pages) == ALL_KEYS
-    largest = max(
-        (entry for page in pages for entry in page["keys"]),
-        key=lambda entry: entry["bytes"] if entry["key"] != "uneven" else 0,
-    )
-    assert largest["key"] == "big:string"
+    # every key with the prefix is measured once: the keyspace does not change during the scan
+    assert sum(page["keysScanned"] for page in pages) == SMALL_KEYS
+    listed = [entry["key"] for page in pages for entry in page["keys"]]
+    assert listed and all(key.startswith("small:") for key in listed)
 
 
 def _readme_acl_rule(user):
@@ -380,20 +392,31 @@ def test_memory_usage_on_a_redis_cluster(cluster_mcp, redis_cluster):
     }
 
 
-def test_big_keys_on_a_redis_cluster_measures_every_primary(cluster_mcp):
-    result = _call(cluster_mcp, "big_keys", top=2)
+def test_big_keys_on_a_redis_cluster_measures_every_primary(cluster_mcp, redis_cluster):
+    small = [f"small:{i}" for i in range(CLUSTER_KEYS - 2)]
+    assert len({redis_cluster.node_for_key(key).port for key in small}) == 3
+
+    result = _call(cluster_mcp, "big_keys", pattern="small:*", top=100)
+    big = _call(cluster_mcp, "big_keys", pattern="big:*")
 
     assert (result["cursor"], result["scanComplete"]) == (0, True)
-    assert result["keysScanned"] == result["dbsize"] == CLUSTER_KEYS
-    assert [(e["key"], e["length"]) for e in result["keys"]] == [
+    assert result["keysScanned"] == CLUSTER_KEYS - 2
+    assert result["dbsize"] == CLUSTER_KEYS
+    assert sorted(entry["key"] for entry in result["keys"]) == sorted(small)
+    assert result["byType"] == {
+        "string": {
+            "keys": CLUSTER_KEYS - 2,
+            "bytes": sum(entry["bytes"] for entry in result["keys"]),
+        }
+    }
+    assert [(e["key"], e["length"]) for e in big["keys"]] == [
         ("big:string", 300_000),
         ("big:hash", 2000),
     ]
-    assert result["byType"]["string"]["keys"] == CLUSTER_KEYS - 1
 
 
 def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(cluster_mcp, short_calls):
-    pages = _all_pages(cluster_mcp, top=1)
+    pages = _all_pages(cluster_mcp, pattern="small:*", top=1)
 
     assert len(pages) > 1
     # text that holds the position of every primary that has not finished
@@ -401,8 +424,6 @@ def test_big_keys_on_a_redis_cluster_pages_with_the_cursor(cluster_mcp, short_ca
         isinstance(page["cursor"], str) and "=" in page["cursor"] for page in pages[:-1]
     )
     assert pages[-1]["cursor"] == 0
-    assert sum(page["keysScanned"] for page in pages) == CLUSTER_KEYS
-    assert max(
-        (entry for page in pages for entry in page["keys"]),
-        key=lambda entry: entry["bytes"],
-    )["key"] == ("big:string")
+    assert sum(page["keysScanned"] for page in pages) == CLUSTER_KEYS - 2
+    listed = [entry["key"] for page in pages for entry in page["keys"]]
+    assert listed and all(key.startswith("small:") for key in listed)
